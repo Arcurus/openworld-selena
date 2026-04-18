@@ -1,0 +1,28 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080
+  },
+  "world": {
+    "name": "The Realm of Shadows",
+    "description": "A mysterious realm where shadows hold ancient secrets"
+  },
+  "llm": {
+    "provider": "minimax-portal",
+    "model": "MiniMax-M2.7-highspeed",
+    "api_url": "https://api.minimax.io/anthropic",
+    "api_key_name": "MINIMAX_API_KEY",
+    "max_output_tokens": 50000,
+    "llm_timeout_secs": 180
+  },
+  "security": {
+    "password_var_name": "WEB_PASSWORD",
+    "cookie_name": "openworld_auth",
+    "cookie_duration_secs": 3600
+  },
+  "ui": {
+    "title": "Open World - Dynamic Evolving World",
+    "map_size": { "width": 800, "height": 600 },
+    "default_radius": 50.0
+  }
+}

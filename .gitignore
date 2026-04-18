@@ -1,0 +1,28 @@
+# Environment and secrets
+.env
+
+# Build artifacts
+/target/
+
+# Runtime data (at project root only)
+/world_data/
+/logs/
+*.owbl
+*.bak
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Rust

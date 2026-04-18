@@ -1,0 +1,37 @@
+[package]
+name = "open_world"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+futures = "0.3"
+
+# UUID for entity IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# HTTP client for LLM calls (using rustls for TLS)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# For vector search later (commented out for now)
+# meilisearch-sdk = "0.27"
+# pinecone = "0.5"
+
+[dev-dependencies]
