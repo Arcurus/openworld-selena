@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
+use crate::world_data::time_system::EntityTimePreferences;
+
 /// Represents a single property value that can be int, float, or string
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -47,6 +49,10 @@ pub struct WorldEntity {
     /// Description of the entity
     pub description: String,
     
+    /// Long description - detailed history/background
+    #[serde(default)]
+    pub long_description: String,
+    
     /// Position in the world
     pub x: f64,
     pub y: f64,
@@ -84,6 +90,10 @@ pub struct WorldEntity {
     
     /// Last update timestamp
     pub updated_at: DateTime<Utc>,
+    
+    /// Time preferences for this entity
+    #[serde(default)]
+    pub time_preferences: EntityTimePreferences,
 }
 
 impl WorldEntity {
@@ -95,6 +105,7 @@ impl WorldEntity {
             entity_type: entity_type.to_string(),
             name: name.to_string(),
             description: String::new(),
+            long_description: String::new(),
             x,
             y,
             properties_int: HashMap::new(),
@@ -108,6 +119,7 @@ impl WorldEntity {
             last_action_at: None,
             created_at: now,
             updated_at: now,
+            time_preferences: EntityTimePreferences::new(),
         }
     }
     
@@ -196,6 +208,53 @@ impl WorldEntity {
             + self.get_int("black_mana").unwrap_or(0) as f64 * 1.5
             + self.get_int("white_mana").unwrap_or(0) as f64 * 1.5
             + self.get_float("mana").unwrap_or(0.0)
+    }
+    
+    /// Get unspent power (total - spent)
+    pub fn unspent_power(&self) -> f64 {
+        let total = self.power_score();
+        let spent = self.get_int("power_spent").unwrap_or(0) as f64
+            + self.get_float("power_spent").unwrap_or(0.0);
+        (total - spent).max(0.0)
+    }
+    
+    /// Get unspent wealth (total - spent)
+    pub fn unspent_wealth(&self) -> f64 {
+        let total = self.wealth_score();
+        let spent = self.get_int("wealth_spent").unwrap_or(0) as f64
+            + self.get_float("wealth_spent").unwrap_or(0.0);
+        (total - spent).max(0.0)
+    }
+    
+    /// Get unspent mana (total - spent)
+    pub fn unspent_mana(&self) -> f64 {
+        let total = self.mana_score();
+        let spent = self.get_int("mana_spent").unwrap_or(0) as f64
+            + self.get_float("mana_spent").unwrap_or(0.0);
+        (total - spent).max(0.0)
+    }
+    
+    /// Calculate hours since last action
+    pub fn hours_since_last_action(&self) -> f64 {
+        if let Some(last_action) = self.last_action_at {
+            let now = Utc::now();
+            let duration = now - last_action;
+            duration.num_minutes() as f64 / 60.0
+        } else {
+            // Never acted - return high value to prioritize new entities
+            1000.0
+        }
+    }
+    
+    /// Calculate action selection score for this entity
+    /// Formula: unspent_power * unspent_wealth * unspent_mana * time_since_last_action
+    pub fn action_selection_score(&self) -> f64 {
+        let power = self.unspent_power().max(1.0);  // At least 1 to avoid zero
+        let wealth = self.unspent_wealth().max(1.0);
+        let mana = self.unspent_mana().max(1.0);
+        let time_factor = self.hours_since_last_action().max(1.0);
+        
+        power * wealth * mana * time_factor
     }
 }
 

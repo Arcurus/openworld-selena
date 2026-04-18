@@ -121,12 +121,15 @@ impl BinaryPersistence {
         }
 
         // Settings
-        Self::write_f64(world.settings.actions_per_hour as f64, &mut data);
+        Self::write_f64(world.settings.actions_per_year as f64, &mut data);
+        Self::write_bool(world.settings.tick_action_enabled, &mut data);
         Self::write_f64(world.settings.time_weight_factor, &mut data);
         Self::write_f64(world.settings.proximity_weight_factor, &mut data);
         Self::write_f64(world.settings.power_weight_factor, &mut data);
         Self::write_f64(world.settings.resource_weight_factor, &mut data);
         Self::write_u64(world.settings.auto_save_interval_secs as u64, &mut data);
+        Self::write_f64(world.settings.history_entries_fully_displayed as f64, &mut data);
+        Self::write_f64(world.settings.history_entries_shortened as f64, &mut data);
 
         // Last world action
         Self::write_option_datetime(world.last_world_action, &mut data);
@@ -264,6 +267,11 @@ impl BinaryPersistence {
         data.extend_from_slice(&val.to_le_bytes());
     }
 
+    /// Write bool as single byte (0 or 1)
+    fn write_bool(val: bool, data: &mut Vec<u8>) {
+        data.push(if val { 1 } else { 0 });
+    }
+
     /// Write DateTime
     fn write_datetime(dt: &chrono::DateTime<chrono::Utc>, data: &mut Vec<u8>) {
         let timestamp = dt.timestamp();
@@ -374,12 +382,15 @@ impl BinaryPersistence {
 
         use super::WorldSettings;
         let settings = WorldSettings {
-            actions_per_hour: Self::read_f64(data, &mut pos) as u32,
+            actions_per_year: Self::read_f64(data, &mut pos) as u32,
+            tick_action_enabled: Self::read_bool(data, &mut pos),
             time_weight_factor: Self::read_f64(data, &mut pos),
             proximity_weight_factor: Self::read_f64(data, &mut pos),
             power_weight_factor: Self::read_f64(data, &mut pos),
             resource_weight_factor: Self::read_f64(data, &mut pos),
             auto_save_interval_secs: Self::read_u64(data, &mut pos),
+            history_entries_fully_displayed: Self::read_f64(data, &mut pos) as u32,
+            history_entries_shortened: Self::read_f64(data, &mut pos) as u32,
         };
 
         let last_world_action = Self::read_option_datetime(data, &mut pos);
@@ -401,6 +412,7 @@ impl BinaryPersistence {
             properties_string,
             last_world_action,
             action_count,
+            world_time: crate::world_data::time_system::WorldTime::new(),
         };
 
         Ok(world)
@@ -421,6 +433,7 @@ impl BinaryPersistence {
             entity_type,
             name,
             description,
+            long_description: String::new(),  // Default empty, can be updated later
             x,
             y,
             properties_int: HashMap::new(),
@@ -434,6 +447,7 @@ impl BinaryPersistence {
             last_action_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            time_preferences: crate::world_data::time_system::EntityTimePreferences::new(),
         };
 
         // Properties int
@@ -566,6 +580,13 @@ impl BinaryPersistence {
         let bytes: [u8; 8] = data[*pos..*pos + 8].try_into().unwrap();
         *pos += 8;
         f64::from_le_bytes(bytes)
+    }
+
+    /// Read bool (single byte, 0 = false, 1 = true)
+    fn read_bool(data: &[u8], pos: &mut usize) -> bool {
+        let val = data[*pos];
+        *pos += 1;
+        val != 0
     }
 
     /// Read DateTime

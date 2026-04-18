@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+use crate::world_data::time_system::WorldTime;
+
+/// Special entity type for world clock
+const CLOCK_ENTITY_TYPE: &str = "world_clock";
+
+/// Get the fixed UUID for world clock entity
+fn clock_entity_id() -> Uuid {
+    Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+}
+
 /// The world state - holds all entities and world metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct World {
@@ -43,6 +53,10 @@ pub struct World {
     /// Number of world actions performed
     #[serde(default)]
     pub action_count: u64,
+    
+    /// World time tracking (days, hours, time of day)
+    #[serde(default)]
+    pub world_time: WorldTime,
 }
 
 /// Statistics for a property across entities of a specific type
@@ -218,7 +232,7 @@ pub struct Path {
 impl World {
     /// Create a new empty world
     pub fn new(name: &str) -> Self {
-        Self {
+        let mut world = Self {
             name: name.to_string(),
             description: String::new(),
             entities: HashMap::new(),
@@ -229,6 +243,72 @@ impl World {
             properties_string: HashMap::new(),
             last_world_action: None,
             action_count: 0,
+            world_time: WorldTime::new(),
+        };
+        // Create the world clock entity
+        world.create_clock_entity();
+        world
+    }
+    
+    /// Create the world clock entity if it doesn't exist
+    pub fn create_clock_entity(&mut self) {
+        if !self.entities.contains_key(&clock_entity_id()) {
+            let mut clock = WorldEntity::new(CLOCK_ENTITY_TYPE, "World Clock", 0.0, 0.0);
+            clock.id = clock_entity_id();
+            clock.description = "The world clock entity that tracks time in ticks".to_string();
+            clock.tags.push("meta".to_string());
+            
+            // Initialize time properties
+            clock.properties_int.insert("day".to_string(), 0);
+            clock.properties_int.insert("hour".to_string(), 8);
+            clock.properties_int.insert("actions_today".to_string(), 0);
+            clock.properties_float.insert("total_years".to_string(), 0.0);
+            clock.properties_string.insert("last_real_time".to_string(), Utc::now().to_rfc3339());
+            
+            self.entities.insert(clock_entity_id(), clock);
+        }
+    }
+    
+    /// Get the world clock entity (creates if not exists)
+    pub fn get_clock_entity_mut(&mut self) -> Option<&mut WorldEntity> {
+        if !self.entities.contains_key(&clock_entity_id()) {
+            self.create_clock_entity();
+        }
+        self.entities.get_mut(&clock_entity_id())
+    }
+    
+    /// Get the world clock entity (immutable)
+    pub fn get_clock_entity(&self) -> Option<&WorldEntity> {
+        self.entities.get(&clock_entity_id())
+    }
+    
+    /// Sync world_time from the clock entity
+    pub fn sync_time_from_clock(&mut self) {
+        if let Some(clock) = self.entities.get(&clock_entity_id()) {
+            self.world_time.day = clock.get_int("day").unwrap_or(0) as u32;
+            self.world_time.hour = clock.get_int("hour").unwrap_or(8) as u8;
+            self.world_time.actions_today = clock.get_int("actions_today").unwrap_or(0) as u32;
+            self.world_time.total_years = clock.get_float("total_years").unwrap_or(0.0);
+            
+            if let Some(last_time_str) = clock.get_string("last_real_time") {
+                if let Ok(last_time) = chrono::DateTime::parse_from_rfc3339(last_time_str) {
+                    self.world_time.last_real_time = Some(last_time.with_timezone(&Utc));
+                }
+            }
+        }
+    }
+    
+    /// Sync world_time to the clock entity
+    pub fn sync_time_to_clock(&mut self) {
+        if let Some(clock) = self.entities.get_mut(&clock_entity_id()) {
+            clock.properties_int.insert("day".to_string(), self.world_time.day as i64);
+            clock.properties_int.insert("hour".to_string(), self.world_time.hour as i64);
+            clock.properties_int.insert("actions_today".to_string(), self.world_time.actions_today as i64);
+            clock.properties_float.insert("total_years".to_string(), self.world_time.total_years);
+            
+            if let Some(last_time) = self.world_time.last_real_time {
+                clock.properties_string.insert("last_real_time".to_string(), last_time.to_rfc3339());
+            }
         }
     }
     
@@ -381,6 +461,56 @@ impl World {
         // Otherwise use Euclidean distance
         Some(from.distance_to(to))
     }
+    
+    /// Select the next entity for action based on action selection score
+    /// Formula: unspent_power * unspent_wealth * unspent_mana * time_since_last_action
+    /// 
+    /// Returns the entity with the highest score, or None if no eligible entities.
+    /// Optionally filter by entity types.
+    pub fn select_next_entity(&self, entity_types: Option<&[&str]>) -> Option<&WorldEntity> {
+        let mut best_entity: Option<&WorldEntity> = None;
+        let mut best_score: f64 = f64::MIN;
+        
+        for entity in self.entities.values() {
+            // Filter by entity types if specified
+            if let Some(types) = entity_types {
+                if !types.contains(&entity.entity_type.as_str()) {
+                    continue;
+                }
+            }
+            
+            let score = entity.action_selection_score();
+            
+            if score > best_score {
+                best_score = score;
+                best_entity = Some(entity);
+            }
+        }
+        
+        best_entity
+    }
+    
+    /// Select top N entities for actions, sorted by action selection score
+    pub fn select_top_entities(&self, n: usize, entity_types: Option<&[&str]>) -> Vec<&WorldEntity> {
+        let mut entities: Vec<&WorldEntity> = self.entities.values()
+            .filter(|e| {
+                if let Some(types) = entity_types {
+                    types.contains(&e.entity_type.as_str())
+                } else {
+                    true
+                }
+            })
+            .collect();
+        
+        // Sort by action selection score (descending)
+        entities.sort_by(|a, b| {
+            let score_a = b.action_selection_score();
+            let score_b = a.action_selection_score();
+            score_a.partial_cmp(&score_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        entities.into_iter().take(n).collect()
+    }
 }
 
 impl Path {
@@ -401,8 +531,11 @@ impl Path {
 /// World settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldSettings {
-    /// Number of world actions per hour
-    pub actions_per_hour: u32,
+    /// Number of world actions per game year (tick-based: 1 year = 1 real minute)
+    /// With 20% allocation of 4500 actions per 5h budget, that's ~3 actions per year
+    pub actions_per_year: u32,
+    /// Whether tick-based action processing is enabled
+    pub tick_action_enabled: bool,
     /// Base time multiplier for entity selection (hours since last action)
     pub time_weight_factor: f64,
     /// Proximity weight factor
@@ -413,17 +546,24 @@ pub struct WorldSettings {
     pub resource_weight_factor: f64,
     /// Auto-save interval in seconds
     pub auto_save_interval_secs: u64,
+    /// History entries to display fully in LLM context
+    pub history_entries_fully_displayed: u32,
+    /// History entries to show in shortened form
+    pub history_entries_shortened: u32,
 }
 
 impl Default for WorldSettings {
     fn default() -> Self {
         Self {
-            actions_per_hour: 10,
+            actions_per_year: 3,  // ~900 actions per 5h (20% of 4500 budget)
+            tick_action_enabled: false,  // Disabled by default until fully implemented
             time_weight_factor: 1.0,
             proximity_weight_factor: 1.0,
             power_weight_factor: 1.0,
             resource_weight_factor: 1.0,
             auto_save_interval_secs: 300,
+            history_entries_fully_displayed: 5,
+            history_entries_shortened: 10,
         }
     }
 }

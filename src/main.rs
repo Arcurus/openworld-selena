@@ -2485,11 +2485,22 @@ async fn main() {
     let logger = Arc::new(std::sync::Mutex::new(DailyLogger::new(log_dir.clone())));
     
     // Load world from save file or create new
-    let world = if BinaryPersistence::save_exists(&save_path) {
+    let mut world = if BinaryPersistence::save_exists(&save_path) {
         println!("📂 Loading world from save file...");
         match BinaryPersistence::load_world(&save_path) {
-            Ok(w) => {
+            Ok(mut w) => {
+                // Ensure clock entity exists (for old save files)
+                w.create_clock_entity();
+                // Sync time from clock entity to world_time
+                w.sync_time_from_clock();
+                // Advance time based on real elapsed time since last save
+                let old_time = w.world_time.detailed_time();
+                w.world_time.update_from_real_time();
+                let new_time = w.world_time.detailed_time();
+                // Sync advanced time back to clock entity
+                w.sync_time_to_clock();
                 println!("✅ World loaded: {} ({} entities)", w.name, w.entity_count());
+                println!("⏰ Time: {} → {}", old_time, new_time);
                 w
             }
             Err(e) => {
