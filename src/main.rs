@@ -1,4 +1,5 @@
 mod world_data;
+use crate::world_data::default_true;
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,7 +11,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, post, put, delete},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -368,6 +369,26 @@ struct UpdateWorldRequest {
     properties_string: std::collections::HashMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AddWorldEventRequest {
+    name: String,
+    description: String,
+    #[serde(default)]
+    influence: String,
+    #[serde(default = "default_true")]
+    active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateWorldEventRequest {
+    name: Option<String>,
+    description: Option<String>,
+    #[serde(default)]
+    influence: Option<String>,
+    #[serde(default)]
+    active: Option<bool>,
+}
+
 async fn update_world_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -422,6 +443,122 @@ async fn get_world_stats(State(state): State<AppState>) -> Response {
         "success": true,
         "stats": stats
     })).into_response()
+}
+
+// ============================================================================
+// World Events endpoints
+// ============================================================================
+
+// Get all world events
+async fn get_world_events(State(state): State<AppState>) -> Response {
+    let world = state.world.read().await;
+    
+    success_json(serde_json::json!({
+        "success": true,
+        "events": world.active_events
+    })).into_response()
+}
+
+// Add a new world event
+async fn add_world_event(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<AddWorldEventRequest>,
+) -> Response {
+    // Require authentication
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie")
+        .and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    
+    let mut world = state.world.write().await;
+    
+    let event = crate::world_data::WorldEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: req.name,
+        description: req.description,
+        influence: req.influence,
+        active: req.active,
+    };
+    
+    world.active_events.push(event.clone());
+    
+    success_json(serde_json::json!({
+        "success": true,
+        "event": event
+    })).into_response()
+}
+
+// Update a world event
+async fn update_world_event(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(event_id): axum::extract::Path<String>,
+    Json(req): Json<UpdateWorldEventRequest>,
+) -> Response {
+    // Require authentication
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie")
+        .and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    
+    let mut world = state.world.write().await;
+    
+    // Find the event
+    if let Some(event) = world.active_events.iter_mut().find(|e| e.id == event_id) {
+        if let Some(name) = req.name {
+            event.name = name;
+        }
+        if let Some(description) = req.description {
+            event.description = description;
+        }
+        if let Some(influence) = req.influence {
+            event.influence = influence;
+        }
+        if let Some(active) = req.active {
+            event.active = active;
+        }
+        
+        success_json(serde_json::json!({
+            "success": true,
+            "event": event.clone()
+        })).into_response()
+    } else {
+        error_json(StatusCode::NOT_FOUND, "World event not found")
+    }
+}
+
+// Delete a world event
+async fn delete_world_event(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(event_id): axum::extract::Path<String>,
+) -> Response {
+    // Require authentication
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie")
+        .and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    
+    let mut world = state.world.write().await;
+    
+    // Find and remove the event
+    if let Some(pos) = world.active_events.iter().position(|e| e.id == event_id) {
+        world.active_events.remove(pos);
+        
+        success_json(serde_json::json!({
+            "success": true,
+            "message": "World event deleted"
+        })).into_response()
+    } else {
+        error_json(StatusCode::NOT_FOUND, "World event not found")
+    }
 }
 
 // ============================================================================
@@ -643,6 +780,23 @@ async fn action_context_handler(
         prop_context.push_str(&format!("  - {}: {:.2}\n", key, value));
     }
     
+    // Build world events context
+    let world_events_str = if world.active_events.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("## Active World Events\n\n");
+        for event in &world.active_events {
+            if event.active {
+                s.push_str(&format!("### {}\n{}", event.name, event.description));
+                if !event.influence.is_empty() {
+                    s.push_str(&format!("\n**How this affects entities:** {}", event.influence));
+                }
+                s.push_str("\n\n");
+            }
+        }
+        s
+    };
+    
     // Read the AI template
     let template = match tokio::fs::read_to_string("ai_templates/EntityAction.md").await {
         Ok(t) => t,
@@ -658,7 +812,8 @@ async fn action_context_handler(
         .replace("{tags}", &entity.tags.join(", "))
         .replace("{x}", &format!("{:.1}", entity.x))
         .replace("{y}", &format!("{:.1}", entity.y))
-        .replace("{property_context}", &prop_context);
+        .replace("{property_context}", &prop_context)
+        .replace("{world_events}", &world_events_str);
     
     // Check if LLM is configured
     let api_key = read_env_var(&state.env_path, &state.settings.llm.api_key_name);
@@ -672,6 +827,7 @@ async fn action_context_handler(
         "description": entity.description,
         "properties": entity.properties_int,
         "property_context": prop_context,
+        "world_events": world_events_str,
         "prompt": prompt,
         "llm_configured": llm_configured
     })).into_response()
@@ -982,6 +1138,23 @@ async fn entity_action(
         prop_context.push_str(&format!("  - {}: {:.2}\n", key, value));
     }
     
+    // Build world events context
+    let world_events_str = if world.active_events.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from("## Active World Events\n\n");
+        for event in &world.active_events {
+            if event.active {
+                s.push_str(&format!("### {}\n{}", event.name, event.description));
+                if !event.influence.is_empty() {
+                    s.push_str(&format!("\n**How this affects entities:** {}", event.influence));
+                }
+                s.push_str("\n\n");
+            }
+        }
+        s
+    };
+    
     // Read the AI template
     let template = match tokio::fs::read_to_string("ai_templates/EntityAction.md").await {
         Ok(t) => t,
@@ -997,7 +1170,8 @@ async fn entity_action(
         .replace("{tags}", &entity.tags.join(", "))
         .replace("{x}", &format!("{:.1}", entity.x))
         .replace("{y}", &format!("{:.1}", entity.y))
-        .replace("{property_context}", &prop_context);
+        .replace("{property_context}", &prop_context)
+        .replace("{world_events}", &world_events_str);
     
     // Check if LLM is configured
     let api_key = read_env_var(&state.env_path, &state.settings.llm.api_key_name);
@@ -2562,6 +2736,11 @@ async fn main() {
         .route("/api/world", get(get_world))
         .route("/api/world", put(update_world_handler))
         .route("/api/world/stats", get(get_world_stats))
+        // World events endpoints
+        .route("/api/world/events", get(get_world_events))
+        .route("/api/world/events", post(add_world_event))
+        .route("/api/world/events/:id", put(update_world_event))
+        .route("/api/world/events/:id", delete(delete_world_event))
         // .env / security endpoints
         .route("/api/env/status", get(env_status_handler))
         .route("/api/env/configure", post(configure_env_handler))

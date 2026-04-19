@@ -413,6 +413,7 @@ impl BinaryPersistence {
             last_world_action,
             action_count,
             world_time: crate::world_data::time_system::WorldTime::new(),
+            active_events: Vec::new(), // Legacy - active_events not in old saves
         };
 
         Ok(world)

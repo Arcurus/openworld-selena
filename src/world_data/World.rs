@@ -9,6 +9,25 @@ use crate::world_data::time_system::WorldTime;
 /// Special entity type for world clock
 const CLOCK_ENTITY_TYPE: &str = "world_clock";
 
+/// Represents an active world event that influences entity actions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldEvent {
+    /// Unique identifier for the event
+    pub id: String,
+    /// Name/title of the event
+    pub name: String,
+    /// Detailed description of the event
+    pub description: String,
+    /// How this event affects entity behaviors
+    #[serde(default)]
+    pub influence: String,
+    /// Whether this event is currently active
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+pub fn default_true() -> bool { true }
+
 /// Get the fixed UUID for world clock entity
 fn clock_entity_id() -> Uuid {
     Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
@@ -57,6 +76,10 @@ pub struct World {
     /// World time tracking (days, hours, time of day)
     #[serde(default)]
     pub world_time: WorldTime,
+    
+    /// Active world events that influence entity actions
+    #[serde(default)]
+    pub active_events: Vec<WorldEvent>,
 }
 
 /// Statistics for a property across entities of a specific type
@@ -244,6 +267,7 @@ impl World {
             last_world_action: None,
             action_count: 0,
             world_time: WorldTime::new(),
+            active_events: Vec::new(),
         };
         // Create the world clock entity
         world.create_clock_entity();

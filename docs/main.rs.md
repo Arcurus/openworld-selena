@@ -79,6 +79,27 @@ Loaded from `settings.json`. Key sections:
 |--------|----------|-------------|
 | GET | `/api/world/stats` | Statistics by entity type |
 
+### World Events
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/world/events` | List all world events |
+| POST | `/api/world/events` | Add a new world event |
+| PUT | `/api/world/events/:id` | Update a world event |
+| DELETE | `/api/world/events/:id` | Delete a world event |
+
+#### WorldEvent Structure
+```json
+{
+  "id": "uuid",
+  "name": "The Shadow Awakens",
+  "description": "Ancient darkness stirs in the north...",
+  "influence": "Entities become more paranoid and militaristic",
+  "active": true
+}
+```
+
+**Note:** Active world events are automatically included in LLM action prompts, influencing entity decisions and behaviors based on the event's influence description.
+
 ### Backup
 | Method | Endpoint | Description |
 |--------|----------|-------------|

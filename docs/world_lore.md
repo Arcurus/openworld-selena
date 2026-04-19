@@ -405,6 +405,37 @@ When the Shadow Awakens is active, all entity actions have additional context:
 - **Shadow Ridge Camp:** Opportunistic, waiting to see who falls so they can rise
 - **Mira:** Information-hungry, trading in secrets about the Shadow
 
+### Activating World Events (Game Master Guide)
+
+World events are the canonical way to introduce major story shifts that affect all entity behaviors. The WorldEvent system is integrated into the LLM action prompts, so when a world event is active, the LLM considers its influence when generating entity actions.
+
+**To activate a world event:**
+
+1. **Use the API** to add the world event:
+   ```bash
+   curl -X POST /api/world/events \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "The Shadow Awakens",
+       "description": "Ancient darkness stirs in the north. Shadows stretch longer, whispers fill the Whisperwood, and animals flee southward.",
+       "influence": "All entities become more paranoid and militaristic. Silverstream Keep is on high alert. Ironforge Clan rushes to complete their secret forge before darkness falls.",
+       "active": true
+     }'
+   ```
+
+2. **Monitor the effects** - Watch as entities react to the world event through their actions
+
+3. **Deactivate or replace** world events as the story evolves:
+   ```bash
+   # Deactivate
+   curl -X PUT /api/world/events/:id -d '{"active": false}'
+   
+   # Update influence as the event progresses
+   curl -X PUT /api/world/events/:id -d '{"influence": "The darkness has arrived. All factions are in crisis mode."}'
+   ```
+
+**Key principle:** The `influence` field describes how entities should behave differently because of the world event. This influence is included in every LLM action prompt, ensuring consistent world-wide narrative effects.
+
 ---
 
 ## How to Use This Lore

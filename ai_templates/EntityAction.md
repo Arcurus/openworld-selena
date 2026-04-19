@@ -9,6 +9,10 @@ Location: ({x}, {y})
 Properties (relative to other {entity_type} entities in the world):
 {property_context}
 
+{world_events}
+
+Generate ONE specific action this entity could realistically take based on its nature, properties, situation, and the world events above.
+
 Generate ONE specific action this entity could realistically take based on its nature, properties, and situation.
 Respond ONLY with valid JSON (no other text before or after).
 
