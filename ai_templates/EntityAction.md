@@ -5,6 +5,7 @@ Entity: {entity_name} ({entity_type})
 Description: {description}
 Tags: {tags}
 Location: ({x}, {y})
+Power Tier: {power_tier}
 
 Properties (relative to other {entity_type} entities in the world):
 {property_context}
@@ -16,7 +17,7 @@ Nearby Entities:
 
 {world_events}
 
-Generate ONE specific action this entity could realistically take based on its nature, properties, situation, nearby entities, and the world events above.
+Generate ONE specific action this entity could realistically take based on its nature, power tier, properties, situation, nearby entities, and the world events above.
 
 Generate ONE specific action this entity could realistically take based on its nature, properties, and situation.
 Respond ONLY with valid JSON (no other text before or after).

@@ -808,6 +808,36 @@ async fn action_context_handler(
         s
     };
     
+    // Build power tier context - calculate based on key power properties
+    let power_tier_str = {
+        // Calculate total power from key properties
+        let power_keys = ["power", "strength", "army_size", "wealth", "influence"];
+        let mut total_power = 0i64;
+        for key in &power_keys {
+            if let Some(v) = entity.properties_int.get(*key) {
+                total_power += v;
+            }
+        }
+        // Add float properties that represent power
+        for (_, v) in &entity.properties_float {
+            if *v > 0.0 {
+                total_power += *v as i64;
+            }
+        }
+        // Determine tier based on total power
+        if total_power >= 1000 {
+            format!("Legendary (Power: {}) - Among the most powerful beings in the world", total_power)
+        } else if total_power >= 500 {
+            format!("Epic (Power: {}) - A formidable force to be reckoned with", total_power)
+        } else if total_power >= 200 {
+            format!("Rare (Power: {}) - Above average strength and influence", total_power)
+        } else if total_power >= 50 {
+            format!("Uncommon (Power: {}) - A competent and capable individual", total_power)
+        } else {
+            format!("Common (Power: {}) - An ordinary entity in the world", total_power)
+        }
+    };
+    
     // Build world events context
     let world_events_str = if world.active_events.is_empty() {
         String::new()
@@ -841,6 +871,7 @@ async fn action_context_handler(
         .replace("{x}", &format!("{:.1}", entity.x))
         .replace("{y}", &format!("{:.1}", entity.y))
         .replace("{property_context}", &prop_context)
+        .replace("{power_tier}", &power_tier_str)
         .replace("{entity_history}", &entity_history_str)
         .replace("{nearby_entities}", &nearby_entities_str)
         .replace("{world_events}", &world_events_str);
@@ -1196,6 +1227,36 @@ async fn entity_action(
         s
     };
     
+    // Build power tier context - calculate based on key power properties
+    let power_tier_str = {
+        // Calculate total power from key properties
+        let power_keys = ["power", "strength", "army_size", "wealth", "influence"];
+        let mut total_power = 0i64;
+        for key in &power_keys {
+            if let Some(v) = entity.properties_int.get(*key) {
+                total_power += v;
+            }
+        }
+        // Add float properties that represent power
+        for (_, v) in &entity.properties_float {
+            if *v > 0.0 {
+                total_power += *v as i64;
+            }
+        }
+        // Determine tier based on total power
+        if total_power >= 1000 {
+            format!("Legendary (Power: {}) - Among the most powerful beings in the world", total_power)
+        } else if total_power >= 500 {
+            format!("Epic (Power: {}) - A formidable force to be reckoned with", total_power)
+        } else if total_power >= 200 {
+            format!("Rare (Power: {}) - Above average strength and influence", total_power)
+        } else if total_power >= 50 {
+            format!("Uncommon (Power: {}) - A competent and capable individual", total_power)
+        } else {
+            format!("Common (Power: {}) - An ordinary entity in the world", total_power)
+        }
+    };
+    
     // Build world events context
     let world_events_str = if world.active_events.is_empty() {
         String::new()
@@ -1229,6 +1290,7 @@ async fn entity_action(
         .replace("{x}", &format!("{:.1}", entity.x))
         .replace("{y}", &format!("{:.1}", entity.y))
         .replace("{property_context}", &prop_context)
+        .replace("{power_tier}", &power_tier_str)
         .replace("{entity_history}", &entity_history_str)
         .replace("{nearby_entities}", &nearby_entities_str)
         .replace("{world_events}", &world_events_str);
