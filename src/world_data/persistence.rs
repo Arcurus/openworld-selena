@@ -15,7 +15,8 @@ use std::io::{Read, Write, BufReader, BufWriter};
 /// [N bytes: binary data]
 
 const MAGIC: &[u8; 4] = b"OWBL"; // Open World Binary
-const VERSION: u32 = 1;
+const VERSION: u32 = 2; // Increment when world format changes
+const ENTITY_VERSION: u32 = 1; // Increment when entity format changes
 
 pub struct BinaryPersistence;
 
@@ -89,8 +90,8 @@ impl BinaryPersistence {
         let mut data = vec![0u8; data_len];
         reader.read_exact(&mut data).map_err(|e| format!("Failed to read data: {}", e))?;
 
-        // Deserialize world
-        Self::deserialize_world(&data, &class_name)
+        // Deserialize world (pass version for backward compatibility handling)
+        Self::deserialize_world(&data, &class_name, version)
     }
 
     /// Check if save file exists
@@ -107,6 +108,9 @@ impl BinaryPersistence {
 
         // Entity count
         Self::write_u32(world.entities.len() as u32, &mut data);
+
+        // Entity format version (for backward compatibility when reading entities)
+        Self::write_u32(ENTITY_VERSION, &mut data);
 
         // Each entity
         for (id, entity) in &world.entities {
@@ -151,6 +155,7 @@ impl BinaryPersistence {
 
     /// Serialize entity to binary
     fn write_entity(entity: &WorldEntity, data: &mut Vec<u8>) {
+        // Note: entity version is stored globally in the world header, not per-entity
         Self::write_string(&entity.entity_type, data);
         Self::write_string(&entity.name, data);
         Self::write_string(&entity.description, data);
@@ -360,16 +365,26 @@ impl BinaryPersistence {
     }
 
     /// Deserialize world from binary
-    fn deserialize_world(data: &[u8], class_name: &str) -> Result<World, String> {
+    /// version: the world file format version (1 = old, 2+ = new with entity_version field)
+    fn deserialize_world(data: &[u8], class_name: &str, version: u32) -> Result<World, String> {
         let mut pos = 0;
         
         let name = Self::read_string(data, &mut pos);
         let entity_count = Self::read_u32(data, &mut pos) as usize;
 
+        // Read entity format version (for backward compatibility)
+        // Version 1 saves don't have this field - entity format is implicit v1
+        // Version 2+ saves have entity_version field after entity_count
+        let entity_version = if version >= 2 {
+            Self::read_u32(data, &mut pos)
+        } else {
+            1 // Default to version 1 for old saves
+        };
+
         let mut entities = HashMap::new();
         for _ in 0..entity_count {
             let id = Self::read_uuid(data, &mut pos);
-            let entity = Self::read_entity(data, &mut pos, id)?;
+            let entity = Self::read_entity(data, &mut pos, id, entity_version)?;
             entities.insert(id, entity);
         }
 
@@ -420,7 +435,8 @@ impl BinaryPersistence {
     }
 
     /// Read entity from binary
-    fn read_entity(data: &[u8], pos: &mut usize, id: uuid::Uuid) -> Result<WorldEntity, String> {
+    /// entity_version: the entity format version (1 = current, 2+ = future with additional fields)
+    fn read_entity(data: &[u8], pos: &mut usize, id: uuid::Uuid, entity_version: u32) -> Result<WorldEntity, String> {
         use chrono::Utc;
 
         let entity_type = Self::read_string(data, pos);
