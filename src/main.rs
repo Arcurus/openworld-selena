@@ -19,7 +19,7 @@ use tower_http::services::ServeDir;
 use tracing_subscriber;
 use uuid::Uuid;
 
-use world_data::{World, WorldEntity, persistence::BinaryPersistence};
+use world_data::{World, WorldEntity, persistence::BinaryPersistence, entity_history::format_history_for_llm};
 
 // ============================================================================
 // Logger (daily rotating logs for errors and LLM calls)
@@ -780,6 +780,34 @@ async fn action_context_handler(
         prop_context.push_str(&format!("  - {}: {:.2}\n", key, value));
     }
     
+    // Build entity history context
+    let entity_history_str = format_history_for_llm(&entity, &world.settings);
+    
+    // Build nearby entities context
+    let nearby_entities = world.get_entities_in_radius(entity.x, entity.y, 150.0);
+    let nearby_entities: Vec<_> = nearby_entities.iter().filter(|e| e.id != entity.id).collect();
+    let nearby_entities_str = if nearby_entities.is_empty() {
+        String::from("No other entities nearby.")
+    } else {
+        let mut s = String::new();
+        for other in &nearby_entities {
+            let dist = ((other.x - entity.x).powi(2) + (other.y - entity.y).powi(2)).sqrt();
+            s.push_str(&format!("- **{}** ({}) - Distance: {:.1}\n", other.name, other.entity_type, dist));
+            if !other.description.is_empty() {
+                s.push_str(&format!("  {}\n", other.description));
+            }
+            // Show a few key properties
+            let key_props: Vec<String> = other.properties_int.iter()
+                .take(3)
+                .map(|(k, v)| format!("{}: {}", k, v))
+                .collect();
+            if !key_props.is_empty() {
+                s.push_str(&format!("  Properties: {}\n", key_props.join(", ")));
+            }
+        }
+        s
+    };
+    
     // Build world events context
     let world_events_str = if world.active_events.is_empty() {
         String::new()
@@ -813,6 +841,8 @@ async fn action_context_handler(
         .replace("{x}", &format!("{:.1}", entity.x))
         .replace("{y}", &format!("{:.1}", entity.y))
         .replace("{property_context}", &prop_context)
+        .replace("{entity_history}", &entity_history_str)
+        .replace("{nearby_entities}", &nearby_entities_str)
         .replace("{world_events}", &world_events_str);
     
     // Check if LLM is configured
@@ -1138,6 +1168,34 @@ async fn entity_action(
         prop_context.push_str(&format!("  - {}: {:.2}\n", key, value));
     }
     
+    // Build entity history context
+    let entity_history_str = format_history_for_llm(&entity, &world.settings);
+    
+    // Build nearby entities context
+    let nearby_entities = world.get_entities_in_radius(entity.x, entity.y, 150.0);
+    let nearby_entities: Vec<_> = nearby_entities.iter().filter(|e| e.id != entity.id).collect();
+    let nearby_entities_str = if nearby_entities.is_empty() {
+        String::from("No other entities nearby.")
+    } else {
+        let mut s = String::new();
+        for other in &nearby_entities {
+            let dist = ((other.x - entity.x).powi(2) + (other.y - entity.y).powi(2)).sqrt();
+            s.push_str(&format!("- **{}** ({}) - Distance: {:.1}\n", other.name, other.entity_type, dist));
+            if !other.description.is_empty() {
+                s.push_str(&format!("  {}\n", other.description));
+            }
+            // Show a few key properties
+            let key_props: Vec<String> = other.properties_int.iter()
+                .take(3)
+                .map(|(k, v)| format!("{}: {}", k, v))
+                .collect();
+            if !key_props.is_empty() {
+                s.push_str(&format!("  Properties: {}\n", key_props.join(", ")));
+            }
+        }
+        s
+    };
+    
     // Build world events context
     let world_events_str = if world.active_events.is_empty() {
         String::new()
@@ -1171,6 +1229,8 @@ async fn entity_action(
         .replace("{x}", &format!("{:.1}", entity.x))
         .replace("{y}", &format!("{:.1}", entity.y))
         .replace("{property_context}", &prop_context)
+        .replace("{entity_history}", &entity_history_str)
+        .replace("{nearby_entities}", &nearby_entities_str)
         .replace("{world_events}", &world_events_str);
     
     // Check if LLM is configured
