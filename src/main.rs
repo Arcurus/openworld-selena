@@ -1616,6 +1616,16 @@ async fn process_action_handler(
                     );
                 }
                 
+                // Persist world after applying LLM action effects.
+                // Without this, all LLM-driven state changes are lost on restart
+                // (only manual update_world / update_entity / save_world persisted).
+                if let Err(save_err) = BinaryPersistence::save_world(&world, &state.save_path) {
+                    eprintln!("[process_action] auto-save failed: {}", save_err);
+                    if let Ok(mut logger) = state.logger.lock() {
+                        logger.log_error(&format!("auto-save after process_action failed: {}", save_err));
+                    }
+                }
+
                 let response_json = serde_json::json!({
                     "success": true,
                     "action": action_data.action,
@@ -1625,7 +1635,7 @@ async fn process_action_handler(
                     "narrative": action_data.narrative,
                     "warnings": warnings,
                 });
-                
+
                 success_json(response_json).into_response()
             } else {
                 error_json(StatusCode::NOT_FOUND, "Entity not found")
