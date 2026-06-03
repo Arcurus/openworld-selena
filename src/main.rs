@@ -551,10 +551,31 @@ fn enforce_llm_rate_limit(
 // World endpoints
 // ============================================================================
 
+/// Snapshot the current save.owbl to `world_data/backups/save-<label>-<TS>.owbl`.
+/// Returns the path of the new snapshot (relative to the project root).
+///
+/// `label` is short tag like "auto" or "manual" or "pre-restore".
+/// Called by:
+///   - POST /api/world/backup         (auth, manual on-demand)
+///   - create_world_handler          (auto, before overwriting)
+///   - anywhere we want a safety net
+fn snapshot_save(label: &str) -> Result<std::path::PathBuf, String> {
+    let save_path = std::path::Path::new("world_data/save.owbl");
+    if !save_path.exists() {
+        return Err("no save file to snapshot".to_string());
+    }
+    let backup_dir = std::path::Path::new("world_data/backups");
+    std::fs::create_dir_all(backup_dir).map_err(|e| format!("mkdir: {}", e))?;
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let dest = backup_dir.join(format!("save-{}-{}.owbl", label, ts));
+    std::fs::copy(save_path, &dest).map_err(|e| format!("copy: {}", e))?;
+    Ok(dest)
+}
+
 async fn get_world(State(state): State<AppState>) -> impl IntoResponse {
     let world = state.world.read().await;
     let stats = world.calculate_stats();
-    
+
     success_json(serde_json::json!({
         "success": true,
         "data": {
@@ -2683,6 +2704,9 @@ async fn create_world_handler(
     if !verify_auth_cookie(cookies, cookie_name) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
+
+    // Safety net: snapshot the existing save before we overwrite it.
+    let pre_snapshot = snapshot_save("pre-create");
     let mut world = World::new(&req.name);
     
     // Generate sample entities if requested
@@ -2757,15 +2781,84 @@ async fn create_world_handler(
             let mut w = state.world.write().await;
             *w = world;
             drop(w); // Release write lock
-            
+
             success_json(serde_json::json!({
                 "success": true,
                 "message": "World created successfully",
-                "entity_count": entity_count
+                "entity_count": entity_count,
+                "pre_create_snapshot": pre_snapshot
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "(none - first create)".to_string()),
             })).into_response()
         }
         Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &e),
     }
+}
+
+/// POST /api/world/backup  (auth required)
+///
+/// Manually snapshot the current save.owbl into world_data/backups/.
+async fn backup_world_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    match snapshot_save("manual") {
+        Ok(path) => success_json(serde_json::json!({
+            "success": true,
+            "message": "World snapshot created",
+            "snapshot_path": path.display().to_string(),
+            "size_bytes": std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        })).into_response(),
+        Err(e) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+}
+
+/// GET /api/world/backups  (auth required)
+///
+/// List all snapshots in world_data/backups/ with size + mtime.
+async fn list_backups_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    let dir = std::path::Path::new("world_data/backups");
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if let Ok(meta) = entry.metadata() {
+                let modified = meta.modified().ok().map(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.to_rfc3339()
+                });
+                entries.push(serde_json::json!({
+                    "name": path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                    "size_bytes": meta.len(),
+                    "modified": modified,
+                }));
+            }
+        }
+    }
+    entries.sort_by(|a, b| {
+        let am = a.get("modified").and_then(|v| v.as_str()).unwrap_or("");
+        let bm = b.get("modified").and_then(|v| v.as_str()).unwrap_or("");
+        bm.cmp(am)
+    });
+    success_json(serde_json::json!({
+        "success": true,
+        "count": entries.len(),
+        "snapshots": entries,
+    })).into_response()
 }
 
 // ============================================================================
@@ -3216,6 +3309,8 @@ async fn main() {
         .route("/api/files", get(get_files_handler))
         // World management endpoints
         .route("/api/world/save", post(save_world_handler))
+        .route("/api/world/backup", post(backup_world_handler))
+        .route("/api/world/backups", get(list_backups_handler))
         .route("/api/world/status", get(world_status_handler))
         .route("/api/world/create", post(create_world_handler))
         .route("/api/world/load", post(load_world_handler))
