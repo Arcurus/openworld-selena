@@ -20,7 +20,7 @@ use tower_http::services::ServeDir;
 use tracing_subscriber;
 use uuid::Uuid;
 
-use world_data::{World, WorldEntity, persistence::BinaryPersistence, entity_history::format_history_for_llm, action_history_log::{self, ActionHistoryEntry}};
+use world_data::{World, WorldEntity, persistence::BinaryPersistence, context_builder, action_history_log::{self, ActionHistoryEntry}};
 
 /// Append an entry to world_data/action_history.jsonl.  Used by
 /// process_action_handler to keep a durable, append-only record of
@@ -1153,102 +1153,8 @@ async fn action_context_handler(
         None => return error_json(StatusCode::NOT_FOUND, "Entity not found"),
     };
     
-    // Get world stats for relative descriptions
-    let stats = world.calculate_stats();
-    let type_stats = stats.by_type.get(&entity.entity_type);
-    
-    // Build property context with relative descriptions
-    let mut prop_context = String::new();
-    for (key, value) in &entity.properties_int {
-        let relative = if let Some(ts) = type_stats {
-            if let Some(stat) = ts.properties_int.get(key) {
-                World::get_relative_value(*value as f64, stat.min, stat.max, stat.avg)
-            } else {
-                "unknown"
-            }
-        } else {
-            "unknown"
-        };
-        prop_context.push_str(&format!("  - {}: {} ({})\n", key, value, relative));
-    }
-    for (key, value) in &entity.properties_float {
-        prop_context.push_str(&format!("  - {}: {:.2}\n", key, value));
-    }
-    
-    // Build entity history context
-    let entity_history_str = format_history_for_llm(&entity, &world.settings);
-    
-    // Build nearby entities context
-    let nearby_entities = world.get_entities_in_radius(entity.x, entity.y, 150.0);
-    let nearby_entities: Vec<_> = nearby_entities.iter().filter(|e| e.id != entity.id).collect();
-    let nearby_entities_str = if nearby_entities.is_empty() {
-        String::from("No other entities nearby.")
-    } else {
-        let mut s = String::new();
-        for other in &nearby_entities {
-            let dist = ((other.x - entity.x).powi(2) + (other.y - entity.y).powi(2)).sqrt();
-            s.push_str(&format!("- **{}** ({}) - Distance: {:.1}\n", other.name, other.entity_type, dist));
-            if !other.description.is_empty() {
-                s.push_str(&format!("  {}\n", other.description));
-            }
-            // Show a few key properties
-            let key_props: Vec<String> = other.properties_int.iter()
-                .take(3)
-                .map(|(k, v)| format!("{}: {}", k, v))
-                .collect();
-            if !key_props.is_empty() {
-                s.push_str(&format!("  Properties: {}\n", key_props.join(", ")));
-            }
-        }
-        s
-    };
-    
-    // Build power tier context - calculate based on key power properties
-    let power_tier_str = {
-        // Calculate total power from key properties
-        let power_keys = ["power", "strength", "army_size", "wealth", "influence"];
-        let mut total_power = 0i64;
-        for key in &power_keys {
-            if let Some(v) = entity.properties_int.get(*key) {
-                total_power += v;
-            }
-        }
-        // Add float properties that represent power
-        for (_, v) in &entity.properties_float {
-            if *v > 0.0 {
-                total_power += *v as i64;
-            }
-        }
-        // Determine tier based on total power
-        if total_power >= 1000 {
-            format!("Legendary (Power: {}) - Among the most powerful beings in the world", total_power)
-        } else if total_power >= 500 {
-            format!("Epic (Power: {}) - A formidable force to be reckoned with", total_power)
-        } else if total_power >= 200 {
-            format!("Rare (Power: {}) - Above average strength and influence", total_power)
-        } else if total_power >= 50 {
-            format!("Uncommon (Power: {}) - A competent and capable individual", total_power)
-        } else {
-            format!("Common (Power: {}) - An ordinary entity in the world", total_power)
-        }
-    };
-    
-    // Build world events context
-    let world_events_str = if world.active_events.is_empty() {
-        String::new()
-    } else {
-        let mut s = String::from("## Active World Events\n\n");
-        for event in &world.active_events {
-            if event.active {
-                s.push_str(&format!("### {}\n{}", event.name, event.description));
-                if !event.influence.is_empty() {
-                    s.push_str(&format!("\n**How this affects entities:** {}", event.influence));
-                }
-                s.push_str("\n\n");
-            }
-        }
-        s
-    };
+    // Build the full action context (DRY helper shared with entity_action)
+    let ctx = context_builder::build_action_context(&world, entity);
     
     // Read the AI template
     let template = match tokio::fs::read_to_string("ai_templates/EntityAction.md").await {
@@ -1256,20 +1162,9 @@ async fn action_context_handler(
         Err(_) => "".to_string(),
     };
     
-    // Build the prompt
-    let prompt = template
-        .replace("{world_name}", &state.world.read().await.name)
-        .replace("{entity_name}", &entity.name)
-        .replace("{entity_type}", &entity.entity_type)
-        .replace("{description}", &entity.description)
-        .replace("{tags}", &entity.tags.join(", "))
-        .replace("{x}", &format!("{:.1}", entity.x))
-        .replace("{y}", &format!("{:.1}", entity.y))
-        .replace("{property_context}", &prop_context)
-        .replace("{power_tier}", &power_tier_str)
-        .replace("{entity_history}", &entity_history_str)
-        .replace("{nearby_entities}", &nearby_entities_str)
-        .replace("{world_events}", &world_events_str);
+    // Render the prompt
+    let world_name = state.world.read().await.name.clone();
+    let prompt = context_builder::build_action_prompt(&world_name, entity, &ctx, &template);
     
     // Check if LLM is configured
     let api_key = read_env_var(&state.env_path, &state.settings.llm.api_key_name);
@@ -1282,8 +1177,8 @@ async fn action_context_handler(
         "entity_type": entity.entity_type,
         "description": entity.description,
         "properties": entity.properties_int,
-        "property_context": prop_context,
-        "world_events": world_events_str,
+        "property_context": ctx.prop_context,
+        "world_events": ctx.world_events_str,
         "prompt": prompt,
         "llm_configured": llm_configured,
         "llm_rate_limit": llm_rate_limit_status(&state)
@@ -1589,102 +1484,8 @@ async fn entity_action(
         return error_json(StatusCode::BAD_REQUEST, "Use /api/entities/:id/action/process for processing");
     }
     
-    // Get world stats for relative descriptions
-    let stats = world.calculate_stats();
-    let type_stats = stats.by_type.get(&entity.entity_type);
-    
-    // Build property context with relative descriptions
-    let mut prop_context = String::new();
-    for (key, value) in &entity.properties_int {
-        let relative = if let Some(ts) = type_stats {
-            if let Some(stat) = ts.properties_int.get(key) {
-                World::get_relative_value(*value as f64, stat.min, stat.max, stat.avg)
-            } else {
-                "unknown"
-            }
-        } else {
-            "unknown"
-        };
-        prop_context.push_str(&format!("  - {}: {} ({})\n", key, value, relative));
-    }
-    for (key, value) in &entity.properties_float {
-        prop_context.push_str(&format!("  - {}: {:.2}\n", key, value));
-    }
-    
-    // Build entity history context
-    let entity_history_str = format_history_for_llm(&entity, &world.settings);
-    
-    // Build nearby entities context
-    let nearby_entities = world.get_entities_in_radius(entity.x, entity.y, 150.0);
-    let nearby_entities: Vec<_> = nearby_entities.iter().filter(|e| e.id != entity.id).collect();
-    let nearby_entities_str = if nearby_entities.is_empty() {
-        String::from("No other entities nearby.")
-    } else {
-        let mut s = String::new();
-        for other in &nearby_entities {
-            let dist = ((other.x - entity.x).powi(2) + (other.y - entity.y).powi(2)).sqrt();
-            s.push_str(&format!("- **{}** ({}) - Distance: {:.1}\n", other.name, other.entity_type, dist));
-            if !other.description.is_empty() {
-                s.push_str(&format!("  {}\n", other.description));
-            }
-            // Show a few key properties
-            let key_props: Vec<String> = other.properties_int.iter()
-                .take(3)
-                .map(|(k, v)| format!("{}: {}", k, v))
-                .collect();
-            if !key_props.is_empty() {
-                s.push_str(&format!("  Properties: {}\n", key_props.join(", ")));
-            }
-        }
-        s
-    };
-    
-    // Build power tier context - calculate based on key power properties
-    let power_tier_str = {
-        // Calculate total power from key properties
-        let power_keys = ["power", "strength", "army_size", "wealth", "influence"];
-        let mut total_power = 0i64;
-        for key in &power_keys {
-            if let Some(v) = entity.properties_int.get(*key) {
-                total_power += v;
-            }
-        }
-        // Add float properties that represent power
-        for (_, v) in &entity.properties_float {
-            if *v > 0.0 {
-                total_power += *v as i64;
-            }
-        }
-        // Determine tier based on total power
-        if total_power >= 1000 {
-            format!("Legendary (Power: {}) - Among the most powerful beings in the world", total_power)
-        } else if total_power >= 500 {
-            format!("Epic (Power: {}) - A formidable force to be reckoned with", total_power)
-        } else if total_power >= 200 {
-            format!("Rare (Power: {}) - Above average strength and influence", total_power)
-        } else if total_power >= 50 {
-            format!("Uncommon (Power: {}) - A competent and capable individual", total_power)
-        } else {
-            format!("Common (Power: {}) - An ordinary entity in the world", total_power)
-        }
-    };
-    
-    // Build world events context
-    let world_events_str = if world.active_events.is_empty() {
-        String::new()
-    } else {
-        let mut s = String::from("## Active World Events\n\n");
-        for event in &world.active_events {
-            if event.active {
-                s.push_str(&format!("### {}\n{}", event.name, event.description));
-                if !event.influence.is_empty() {
-                    s.push_str(&format!("\n**How this affects entities:** {}", event.influence));
-                }
-                s.push_str("\n\n");
-            }
-        }
-        s
-    };
+    // Build the full action context (DRY helper shared with action_context_handler)
+    let ctx = context_builder::build_action_context(&world, entity);
     
     // Read the AI template
     let template = match tokio::fs::read_to_string("ai_templates/EntityAction.md").await {
@@ -1692,20 +1493,9 @@ async fn entity_action(
         Err(_) => "".to_string(),
     };
     
-    // Build the prompt
-    let prompt = template
-        .replace("{world_name}", &state.world.read().await.name)
-        .replace("{entity_name}", &entity.name)
-        .replace("{entity_type}", &entity.entity_type)
-        .replace("{description}", &entity.description)
-        .replace("{tags}", &entity.tags.join(", "))
-        .replace("{x}", &format!("{:.1}", entity.x))
-        .replace("{y}", &format!("{:.1}", entity.y))
-        .replace("{property_context}", &prop_context)
-        .replace("{power_tier}", &power_tier_str)
-        .replace("{entity_history}", &entity_history_str)
-        .replace("{nearby_entities}", &nearby_entities_str)
-        .replace("{world_events}", &world_events_str);
+    // Render the prompt
+    let world_name = state.world.read().await.name.clone();
+    let prompt = context_builder::build_action_prompt(&world_name, entity, &ctx, &template);
     
     // Check if LLM is configured
     let api_key = read_env_var(&state.env_path, &state.settings.llm.api_key_name);
@@ -1721,7 +1511,7 @@ async fn entity_action(
                 "entity_name": entity.name,
                 "entity_type": entity.entity_type,
                 "properties": entity.properties_int,
-                "property_context": prop_context,
+                "property_context": ctx.prop_context,
                 "prompt": prompt,
                 "llm_configured": false
             }
