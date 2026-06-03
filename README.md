@@ -46,6 +46,18 @@ On first run, the world is created with 7 sample entities (Oak Valley Village, S
 - Manual save: `POST /api/world/save`
 - Check status: `GET /api/world/status`
 
+### 📜 Action History (durable JSONL log)
+
+Every entity action is appended to a separate, durable, append-only JSONL log:
+
+- File: `world_data/action_history.jsonl` (one JSON object per line)
+- Survives a corrupted or replaced `save.owbl` (independent of the binary save)
+- Cheap to grep / parse / export without loading the whole world
+- Query per-entity: `GET /api/entities/:id/history?limit=N` (most recent first)
+- Schema per line: `entity_id`, `entity_name`, `timestamp`, `action`, `outcome`, `details`, `effects`, `warnings`
+
+Read API lives in `src/world_data/action_history_log.rs` (`append_entry`, `load_for_entity`, `count_for_entity`).
+
 ---
 
 ## Build Commands

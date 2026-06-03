@@ -12,6 +12,8 @@ pub mod entity_history;
 
 pub mod history_persistence;
 
+pub mod action_history_log;
+
 pub mod tick_time;
 
 pub use world_entity::*;

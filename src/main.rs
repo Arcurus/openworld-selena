@@ -20,7 +20,17 @@ use tower_http::services::ServeDir;
 use tracing_subscriber;
 use uuid::Uuid;
 
-use world_data::{World, WorldEntity, persistence::BinaryPersistence, entity_history::format_history_for_llm};
+use world_data::{World, WorldEntity, persistence::BinaryPersistence, entity_history::format_history_for_llm, action_history_log::{self, ActionHistoryEntry}};
+
+/// Append an entry to world_data/action_history.jsonl.  Used by
+/// process_action_handler to keep a durable, append-only record of
+/// every world action independent of save.owbl.  Best-effort: a write
+/// failure logs to stderr but does not block the action response.
+fn append_action_history_jsonl(entry: &ActionHistoryEntry) {
+    if let Err(e) = action_history_log::append_entry(entry) {
+        eprintln!("[history] failed to append action history: {}", e);
+    }
+}
 
 // ============================================================================
 // Logger (daily rotating logs for errors and LLM calls)
@@ -948,7 +958,7 @@ async fn get_entity(
     AxumPath(id): AxumPath<Uuid>,
 ) -> Response {
     let world = state.world.read().await;
-    
+
     match world.get_entity(&id) {
         Some(entity) => success_json(EntityResponse {
             success: true,
@@ -957,6 +967,53 @@ async fn get_entity(
         }).into_response(),
         None => error_json(StatusCode::NOT_FOUND, "Entity not found"),
     }
+}
+
+/// GET /api/entities/:id/history?limit=N
+///
+/// Returns the durable action history for one entity, most recent first.
+/// Merges the in-memory entity.history (fast path) with the append-only
+/// world_data/action_history.jsonl log (durable path that survives
+/// save.owbl replacement) and dedupes by timestamp+action.
+async fn get_entity_history(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    let limit: usize = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50)
+        .min(500);
+
+    // Confirm the entity exists; surface 404 if not.
+    let entity_name = {
+        let world = state.world.read().await;
+        match world.get_entity(&id) {
+            Some(e) => e.name.clone(),
+            None => return error_json(StatusCode::NOT_FOUND, "Entity not found"),
+        }
+    };
+
+    // Read the durable JSONL log (most recent first).
+    let log_entries = action_history_log::load_for_entity(&id.to_string(), limit);
+    let total_in_log = action_history_log::count_for_entity(&id.to_string());
+
+    success_json(serde_json::json!({
+        "success": true,
+        "entity_id": id.to_string(),
+        "entity_name": entity_name,
+        "count": log_entries.len(),
+        "total_in_log": total_in_log,
+        "limit": limit,
+        "entries": log_entries,
+    })).into_response()
 }
 
 async fn create_entity(
@@ -1978,17 +2035,41 @@ async fn process_action_handler(
                         &format!("Effects: {:?}", action_data.effects)
                     );
                 }
-                
-                // Persist world after applying LLM action effects.
-                // Without this, all LLM-driven state changes are lost on restart
-                // (only manual update_world / update_entity / save_world persisted).
-                if let Err(save_err) = BinaryPersistence::save_world(&world, &state.save_path) {
-                    eprintln!("[process_action] auto-save failed: {}", save_err);
-                    if let Ok(mut logger) = state.logger.lock() {
-                        logger.log_error(&format!("auto-save after process_action failed: {}", save_err));
-                    }
-                }
 
+                // Record the action in the entity's in-memory history.
+                // Per Arcurus 2026-06-03 (#openworld): "create new file
+                // saving the history of the world actions for a given
+                // entity and display it in the open world selena web
+                // interface if you open the entity".  Two stores:
+                //   (a) entity.history (in-memory + save.owbl)
+                //   (b) world_data/action_history.jsonl (durable, independent
+                //       of save.owbl, survives save corruption).
+                use world_data::entity_history::add_to_history;
+                let history_timestamp = chrono::Utc::now();
+                add_to_history(
+                    entity,
+                    &action_data.action,
+                    &action_data.narrative,
+                    &action_data.outcome,
+                );
+
+                // Build the durable JSONL entry from data we have.  We
+                // must do this BEFORE releasing the &mut entity borrow
+                // (we need entity.name).
+                let history_entry = ActionHistoryEntry {
+                    entity_id: entity_id.to_string(),
+                    entity_name: entity.name.clone(),
+                    timestamp: history_timestamp,
+                    action: action_data.action.clone(),
+                    outcome: action_data.outcome.clone(),
+                    details: action_data.narrative.clone(),
+                    effects: action_data.effects.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    warnings: warnings.clone(),
+                };
+
+                // Release the borrow by extracting the response payload.
                 let response_json = serde_json::json!({
                     "success": true,
                     "action": action_data.action,
@@ -1998,8 +2079,21 @@ async fn process_action_handler(
                     "narrative": action_data.narrative,
                     "warnings": warnings,
                 });
+                let response = success_json(response_json).into_response();
+                // `entity` and `world` mutable borrows end here.
 
-                success_json(response_json).into_response()
+                // Persist world after applying LLM action effects.
+                if let Err(save_err) = BinaryPersistence::save_world(&world, &state.save_path) {
+                    eprintln!("[process_action] auto-save failed: {}", save_err);
+                    if let Ok(mut logger) = state.logger.lock() {
+                        logger.log_error(&format!("auto-save after process_action failed: {}", save_err));
+                    }
+                }
+
+                // Append to the durable JSONL log.
+                append_action_history_jsonl(&history_entry);
+
+                return response;
             } else {
                 error_json(StatusCode::NOT_FOUND, "Entity not found")
             }
@@ -3285,6 +3379,7 @@ async fn main() {
         .route("/api/entities/:id", get(get_entity))
         .route("/api/entities/:id", put(update_entity))
         .route("/api/entities/:id", axum::routing::delete(delete_entity))
+        .route("/api/entities/:id/history", get(get_entity_history))
         .route("/api/entities/:id/action", post(entity_action))
         .route("/api/entities/:id/action/context", get(action_context_handler))
         .route("/api/entities/:id/action/llm", post(action_llm_handler))
