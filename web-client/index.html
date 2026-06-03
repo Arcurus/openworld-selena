@@ -1840,8 +1840,14 @@
                 });
                 if (!r.ok) {
                     if (r.status === 401) {
+                        // Show inline message AND trigger the password unlock
+                        // dialog so the user can authenticate in-place instead
+                        // of having to click some other action first.
                         listEl.innerHTML = '<div style="color: #fbbf24; font-size: 11px; text-align: center; padding: 12px;">🔒 Auth required to view history</div>';
                         if (countEl) countEl.textContent = '';
+                        if (typeof showPasswordUnlockDialog === 'function') {
+                            showPasswordUnlockDialog(() => loadEntityHistory(entityId));
+                        }
                         return;
                     }
                     throw new Error('HTTP ' + r.status);

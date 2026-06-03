@@ -160,7 +160,15 @@ impl WorldEntity {
     pub fn has_tag(&self, tag: &str) -> bool {
         self.tags.iter().any(|t| t == tag)
     }
-    
+
+    /// True if this is a system (non-LLM-driven) entity. Identified by
+    /// `entity_type == "world_clock"` or any tag of `"meta"`. Property
+    /// writes to such entities are blocked at the LLM-effect layer to
+    /// prevent garbage from corrupting world state (see todo c7f3bc27).
+    pub fn is_system_entity(&self) -> bool {
+        self.entity_type == "world_clock" || self.has_tag("meta")
+    }
+
     /// Add a tag
     pub fn add_tag(&mut self, tag: &str) {
         if !self.has_tag(tag) {
@@ -317,5 +325,26 @@ mod tests {
         let e1 = WorldEntity::new("location", "A", 0.0, 0.0);
         let e2 = WorldEntity::new("location", "B", 3.0, 4.0);
         assert!((e1.distance_to(&e2) - 5.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_is_system_entity() {
+        // world_clock type -> system
+        let mut clock = WorldEntity::new("world_clock", "World Clock", 0.0, 0.0);
+        assert!(clock.is_system_entity());
+
+        // meta tag -> system
+        let mut meta = WorldEntity::new("config", "Meta Config", 0.0, 0.0);
+        meta.add_tag("meta");
+        assert!(meta.is_system_entity());
+
+        // regular entity -> not system
+        let hero = WorldEntity::new("hero", "Kira", 0.0, 0.0);
+        assert!(!hero.is_system_entity());
+
+        // regular entity with non-meta tag -> not system
+        let mut loc = WorldEntity::new("location", "Oak Valley", 0.0, 0.0);
+        loc.add_tag("peaceful");
+        assert!(!loc.is_system_entity());
     }
 }

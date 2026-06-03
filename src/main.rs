@@ -464,6 +464,10 @@ struct SearchQuery {
     near_y: Option<f64>,
     radius: Option<f64>,
     limit: Option<usize>,
+    /// Filter by system entities only (world_clock or meta-tagged)
+    system: Option<bool>,
+    /// Whether to include system entities (default: true)
+    include_system: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -942,6 +946,16 @@ async fn list_entities(
             (dx * dx + dy * dy).sqrt() <= r
         });
     }
+    
+    // System entity filter: system=true returns ONLY system entities;
+    // include_system=false excludes them. System entities are identified
+    // by WorldEntity::is_system_entity() (world_clock type or "meta" tag).
+    if let Some(true) = query.system {
+        entities.retain(|e: &&WorldEntity| e.is_system_entity());
+    } else if let Some(false) = query.include_system {
+        entities.retain(|e: &&WorldEntity| !e.is_system_entity());
+    }
+    // Default (include_system unset or true): return all entities
     
     let limit = query.limit.unwrap_or(100);
     entities.truncate(limit);
@@ -1708,8 +1722,31 @@ async fn process_action_handler(
                 let mut applied_effects = std::collections::HashMap::new();
                 let mut new_values = std::collections::HashMap::new();
                 let mut warnings: Vec<String> = Vec::new();
-                
+
+                // System entities (world_clock, meta-tagged) are protected
+                // from LLM-driven property writes to prevent integer/float
+                // corruption of world state. The action is still recorded
+                // in history and the durable JSONL log, but effects are
+                // rejected with a warning. See todo c7f3bc27.
+                let protected_entity = entity.is_system_entity();
+                if protected_entity {
+                    warnings.push(format!(
+                        "Entity is a system entity (type={}, tags={:?}); LLM effect writes blocked.",
+                        entity.entity_type, entity.tags
+                    ));
+                }
+
                 for (prop_key, change_val) in &action_data.effects {
+                    if protected_entity {
+                        // Skip writing effects on system entities but keep
+                        // tracking the count for the response payload.
+                        warnings.push(format!(
+                            "Skipped effect on system entity: {}={:?}",
+                            prop_key, change_val
+                        ));
+                        continue;
+                    }
+
                     // Determine value type and convert appropriately
                     let (int_val, float_val, string_val) = match change_val {
                         // Bool -> int (true=1, false=0)
