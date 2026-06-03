@@ -1,28 +1,33 @@
 {
+  "llm": {
+    "api_key_name": "MINIMAX_API_KEY",
+    "api_url": "https://api.minimax.io/anthropic",
+    "calls_per_hour_enabled": false,
+    "llm_timeout_secs": 180,
+    "max_calls_per_hour": 0,
+    "max_output_tokens": 50000,
+    "model": "MiniMax-M2.7-highspeed",
+    "provider": "minimax-portal"
+  },
+  "security": {
+    "cookie_duration_secs": 3600,
+    "cookie_name": "openworld_auth",
+    "password_var_name": "WEB_PASSWORD"
+  },
   "server": {
     "host": "0.0.0.0",
     "port": 8081
   },
-  "world": {
-    "name": "The Realm of Shadows",
-    "description": "A mysterious realm where shadows hold ancient secrets"
-  },
-  "llm": {
-    "provider": "minimax-portal",
-    "model": "MiniMax-M2.7-highspeed",
-    "api_url": "https://api.minimax.io/anthropic",
-    "api_key_name": "MINIMAX_API_KEY",
-    "max_output_tokens": 50000,
-    "llm_timeout_secs": 180
-  },
-  "security": {
-    "password_var_name": "WEB_PASSWORD",
-    "cookie_name": "openworld_auth",
-    "cookie_duration_secs": 3600
-  },
   "ui": {
-    "title": "Open World - Dynamic Evolving World",
-    "map_size": { "width": 800, "height": 600 },
-    "default_radius": 50.0
+    "default_radius": 50.0,
+    "map_size": {
+      "height": 600,
+      "width": 800
+    },
+    "title": "Open World - Dynamic Evolving World"
+  },
+  "world": {
+    "description": "A mysterious realm where shadows hold ancient secrets",
+    "name": "The Realm of Shadows"
   }
 }

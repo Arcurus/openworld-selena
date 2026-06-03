@@ -2,10 +2,11 @@ mod world_data;
 use crate::world_data::default_true;
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use std::io::Write;
+use std::collections::VecDeque;
 
 use axum::{
     extract::{Path as AxumPath, Query, State},
@@ -179,6 +180,17 @@ struct LlmSettings {
     max_output_tokens: u32,
     #[serde(default = "default_llm_timeout_secs")]
     llm_timeout_secs: u64,
+    /// Master toggle for LLM calls. When false, no LLM calls are made.
+    /// Default: true (calls allowed, limited by max_calls_per_hour).
+    #[serde(default = "default_llm_calls_enabled")]
+    calls_per_hour_enabled: bool,
+    /// Maximum LLM calls allowed in any rolling 1-hour window.
+    /// 0 means "no calls allowed" (effectively disabled).
+    /// When this limit is reached, no further LLM calls are made
+    /// until the oldest call in the window falls outside the 1-hour mark.
+    /// Default: 0 (deactivated).
+    #[serde(default = "default_max_calls_per_hour")]
+    max_calls_per_hour: u32,
 }
 
 fn default_api_url() -> String {
@@ -195,6 +207,171 @@ fn default_max_output_tokens() -> u32 {
 
 fn default_llm_timeout_secs() -> u64 {
     180 // 3 minutes
+}
+
+fn default_llm_calls_enabled() -> bool {
+    true
+}
+
+fn default_max_calls_per_hour() -> u32 {
+    0
+}
+
+// ============================================================================
+// LLM rate limiter (rolling 1-hour window)
+// ============================================================================
+//
+// Tracks the timestamps of recent LLM calls in a sliding 1-hour window.
+// When the window is full (or calls are globally disabled), try_acquire()
+// returns a `RateLimitDecision` that the handler can convert into a
+// descriptive error response.
+//
+// `max_calls_per_hour == 0` is treated as "no calls allowed" so an
+// unconfigured / zeroed-out limit cleanly disables LLM usage without
+// requiring a separate boolean.
+//
+// `enabled == false` is a master kill-switch that disables calls
+// regardless of the limit value.
+#[derive(Debug)]
+struct LlmRateLimiter {
+    enabled: bool,
+    max_calls_per_hour: u32,
+    /// Timestamps of calls within the current rolling 1-hour window.
+    window: VecDeque<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RateLimitReason {
+    /// Master toggle is off (calls_per_hour_enabled = false).
+    Disabled,
+    /// Limit is set to 0.
+    LimitZero,
+    /// `max_calls_per_hour` calls already happened in the last hour.
+    /// The value is seconds until the oldest call exits the window.
+    LimitReached { retry_after_secs: u64 },
+}
+
+impl RateLimitReason {
+    fn message(&self) -> String {
+        match self {
+            RateLimitReason::Disabled => {
+                "LLM calls are globally disabled (calls_per_hour_enabled = false)".to_string()
+            }
+            RateLimitReason::LimitZero => {
+                "LLM calls are deactivated (max_calls_per_hour = 0)".to_string()
+            }
+            RateLimitReason::LimitReached { retry_after_secs } => {
+                format!(
+                    "LLM rate limit reached. Try again in {}s.",
+                    retry_after_secs
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RateLimitDecision {
+    Allowed,
+    Blocked(RateLimitReason),
+}
+
+impl LlmRateLimiter {
+    fn new(enabled: bool, max_calls_per_hour: u32) -> Self {
+        Self {
+            enabled,
+            max_calls_per_hour,
+            window: VecDeque::new(),
+        }
+    }
+
+    /// Rebuild the limiter when settings change.
+    fn reconfigure(&mut self, enabled: bool, max_calls_per_hour: u32) {
+        self.enabled = enabled;
+        self.max_calls_per_hour = max_calls_per_hour;
+        // Existing window is still meaningful; do not clear it.
+    }
+
+    /// Decide whether the next call is allowed. If allowed, ALSO records it
+    /// in the rolling window. Callers must treat the decision atomically:
+    /// if it says Blocked, no call should be made.
+    fn try_acquire(&mut self) -> RateLimitDecision {
+        if !self.enabled {
+            return RateLimitDecision::Blocked(RateLimitReason::Disabled);
+        }
+        if self.max_calls_per_hour == 0 {
+            return RateLimitDecision::Blocked(RateLimitReason::LimitZero);
+        }
+
+        let now = Instant::now();
+        // Prune anything older than 1 hour.
+        while let Some(&front) = self.window.front() {
+            if now.duration_since(front) >= Duration::from_secs(3600) {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if (self.window.len() as u32) >= self.max_calls_per_hour {
+            // Compute retry_after from the oldest entry.
+            let retry_after = self
+                .window
+                .front()
+                .map(|t| {
+                    let elapsed = now.duration_since(*t);
+                    if elapsed >= Duration::from_secs(3600) {
+                        0
+                    } else {
+                        3600 - elapsed.as_secs()
+                    }
+                })
+                .unwrap_or(0);
+            return RateLimitDecision::Blocked(RateLimitReason::LimitReached {
+                retry_after_secs: retry_after,
+            });
+        }
+
+        self.window.push_back(now);
+        RateLimitDecision::Allowed
+    }
+
+    /// Read-only snapshot for the status endpoint.
+    fn status(&self) -> LlmRateLimitStatus {
+        let now = Instant::now();
+        let mut pruned = self.window.clone();
+        while let Some(&front) = pruned.front() {
+            if now.duration_since(front) >= Duration::from_secs(3600) {
+                pruned.pop_front();
+            } else {
+                break;
+            }
+        }
+        let calls_in_last_hour = pruned.len() as u32;
+        let retry_after_secs = pruned.front().map(|t| {
+            let elapsed = now.duration_since(*t);
+            if elapsed >= Duration::from_secs(3600) {
+                0
+            } else {
+                3600 - elapsed.as_secs()
+            }
+        });
+        LlmRateLimitStatus {
+            enabled: self.enabled,
+            max_calls_per_hour: self.max_calls_per_hour,
+            calls_in_last_hour,
+            retry_after_secs,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct LlmRateLimitStatus {
+    enabled: bool,
+    max_calls_per_hour: u32,
+    calls_in_last_hour: u32,
+    /// Seconds until the oldest call in the window expires (None if window is empty).
+    retry_after_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -232,6 +409,9 @@ struct AppState {
     save_path: String,
     env_path: String,
     logger: Arc<std::sync::Mutex<DailyLogger>>,
+    /// Sliding 1-hour LLM-call limiter. Shared across handlers so all
+    /// LLM-touching endpoints count against the same budget.
+    llm_rate_limiter: Arc<std::sync::Mutex<LlmRateLimiter>>,
 }
 
 // ============================================================================
@@ -330,6 +510,41 @@ fn error_json(status: StatusCode, message: &str) -> Response {
         "error": message
     });
     (status, Json(body)).into_response()
+}
+
+/// Convert a `RateLimitDecision` into either:
+/// - `None` if the call is allowed (and recorded), or
+/// - `Some(response)` if blocked — a 429 JSON response describing why.
+fn enforce_llm_rate_limit(
+    limiter: &std::sync::Mutex<LlmRateLimiter>,
+    context: &str,
+) -> Option<Response> {
+    let mut guard = match limiter.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.try_acquire() {
+        RateLimitDecision::Allowed => None,
+        RateLimitDecision::Blocked(reason) => {
+            let message = reason.message();
+            // Best-effort log; don't block the response on logging.
+            eprintln!("🚫 LLM call blocked ({}): {}", context, message);
+            let body = match reason {
+                RateLimitReason::LimitReached { retry_after_secs } => serde_json::json!({
+                    "success": false,
+                    "error": message,
+                    "rate_limited": true,
+                    "retry_after_secs": retry_after_secs,
+                }),
+                _ => serde_json::json!({
+                    "success": false,
+                    "error": message,
+                    "rate_limited": true,
+                }),
+            };
+            Some((StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response())
+        }
+    }
 }
 
 // ============================================================================
@@ -438,11 +653,113 @@ async fn update_world_handler(
 async fn get_world_stats(State(state): State<AppState>) -> Response {
     let world = state.world.read().await;
     let stats = world.calculate_stats();
-    
+
     success_json(serde_json::json!({
         "success": true,
         "stats": stats
     })).into_response()
+}
+
+// ============================================================================
+// LLM status / config endpoints
+// ============================================================================
+//
+// `GET  /api/llm/status`  — read-only snapshot of the rate limiter.
+// `POST /api/llm/config`  — update enabled / max_calls_per_hour at runtime.
+//                          Persists to settings.json so the new value
+//                          survives a restart.
+//
+// Both endpoints require authentication like other mutating endpoints.
+
+async fn llm_status_handler(State(state): State<AppState>) -> Response {
+    let api_key = read_env_var(&state.env_path, &state.settings.llm.api_key_name);
+    let status = llm_rate_limit_status(&state);
+    let calls_blocked = !status.enabled || status.max_calls_per_hour == 0;
+    let limit_reached = status.calls_in_last_hour >= status.max_calls_per_hour
+        && status.max_calls_per_hour > 0;
+
+    success_json(serde_json::json!({
+        "success": true,
+        "llm_configured": api_key.is_some(),
+        "rate_limit": status,
+        "calls_blocked": calls_blocked,
+        "limit_reached": limit_reached
+    })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmConfigUpdate {
+    #[serde(default)]
+    calls_per_hour_enabled: Option<bool>,
+    #[serde(default)]
+    max_calls_per_hour: Option<u32>,
+}
+
+async fn llm_config_update_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<LlmConfigUpdate>,
+) -> Response {
+    // Require authentication
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+
+    if req.calls_per_hour_enabled.is_none() && req.max_calls_per_hour.is_none() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "Provide calls_per_hour_enabled and/or max_calls_per_hour",
+        );
+    }
+
+    // Mutate the live limiter.
+    {
+        let mut guard = match state.llm_rate_limiter.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let new_enabled = req
+            .calls_per_hour_enabled
+            .unwrap_or(state.settings.llm.calls_per_hour_enabled);
+        let new_max = req
+            .max_calls_per_hour
+            .unwrap_or(state.settings.llm.max_calls_per_hour);
+        guard.reconfigure(new_enabled, new_max);
+    }
+
+    // Persist to settings.json (so the value survives restarts).
+    match persist_llm_settings(&state) {
+        Ok(_) => {
+            let status = llm_rate_limit_status(&state);
+            success_json(serde_json::json!({
+                "success": true,
+                "message": "LLM rate limit updated",
+                "rate_limit": status
+            })).into_response()
+        }
+        Err(e) => error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Updated limiter but failed to persist settings.json: {}", e),
+        ),
+    }
+}
+
+/// Rewrite the `llm` section of settings.json with the values currently
+/// held in AppState. The limiter is the source of truth for the live
+/// process; we mirror it back to disk so a restart picks up the new values.
+fn persist_llm_settings(state: &AppState) -> Result<(), String> {
+    let path = std::path::Path::new("settings.json");
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut root: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let status = llm_rate_limit_status(state);
+    root["llm"]["calls_per_hour_enabled"] = serde_json::json!(status.enabled);
+    root["llm"]["max_calls_per_hour"] = serde_json::json!(status.max_calls_per_hour);
+    let serialized = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(path, serialized).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ============================================================================
@@ -890,8 +1207,17 @@ async fn action_context_handler(
         "property_context": prop_context,
         "world_events": world_events_str,
         "prompt": prompt,
-        "llm_configured": llm_configured
+        "llm_configured": llm_configured,
+        "llm_rate_limit": llm_rate_limit_status(&state)
     })).into_response()
+}
+
+/// Snapshot of the current rate-limit state (no side effects).
+fn llm_rate_limit_status(state: &AppState) -> LlmRateLimitStatus {
+    match state.llm_rate_limiter.lock() {
+        Ok(g) => g.status(),
+        Err(poisoned) => poisoned.into_inner().status(),
+    }
 }
 
 // Call LLM with provided context (Step 2)
@@ -908,7 +1234,15 @@ async fn action_llm_handler(
     if !verify_auth_cookie(cookies, cookie_name) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
-    
+
+    // Rate-limit gate: block if disabled or hourly cap reached.
+    if let Some(resp) = enforce_llm_rate_limit(
+        &state.llm_rate_limiter,
+        &format!("action_llm_handler entity={}", id),
+    ) {
+        return resp;
+    }
+
     // Check if entity exists
     let entity_name = {
         let world = state.world.read().await;
@@ -917,7 +1251,7 @@ async fn action_llm_handler(
             None => return error_json(StatusCode::NOT_FOUND, "Entity not found"),
         }
     };
-    
+
     // Check if LLM is configured
     let api_key = read_env_var(&state.env_path, &state.settings.llm.api_key_name);
     if api_key.is_none() {
@@ -1320,6 +1654,14 @@ async fn entity_action(
     let api_url = &state.settings.llm.api_url;
     let model = &state.settings.llm.model;
     let api_key = api_key.unwrap();
+
+    // Rate-limit gate (covers the legacy /api/entities/:id/action endpoint).
+    if let Some(resp) = enforce_llm_rate_limit(
+        &state.llm_rate_limiter,
+        &format!("entity_action entity={}", id),
+    ) {
+        return resp;
+    }
     
     let client = reqwest::Client::new();
     let llm_request = serde_json::json!({
@@ -2454,6 +2796,8 @@ fn load_settings() -> Settings {
                 api_url: "https://api.minimax.io/anthropic".to_string(),
                 max_output_tokens: 50000,
                 llm_timeout_secs: 180,
+                calls_per_hour_enabled: true,
+                max_calls_per_hour: 0,
             },
             security: SecuritySettings {
                 password_var_name: "WEB_PASSWORD".to_string(),
@@ -2617,7 +2961,8 @@ async fn env_status_handler(
         "has_password": password.is_some(),
         "is_authenticated": is_authenticated,
         "api_key_name": api_key_name,
-        "password_var_name": password_var_name
+        "password_var_name": password_var_name,
+        "llm_rate_limit": llm_rate_limit_status(&state)
     })).into_response()
 }
 
@@ -2825,7 +3170,16 @@ async fn main() {
         save_path,
         env_path,
         logger,
+        llm_rate_limiter: Arc::new(std::sync::Mutex::new(LlmRateLimiter::new(
+            settings.llm.calls_per_hour_enabled,
+            settings.llm.max_calls_per_hour,
+        ))),
     };
+
+    println!(
+        "🌍   LLM rate limit: enabled={}, max_calls_per_hour={}",
+        settings.llm.calls_per_hour_enabled, settings.llm.max_calls_per_hour
+    );
     
     let addr = format!("{}:{}", settings.server.host, settings.server.port);
     
@@ -2873,6 +3227,9 @@ async fn main() {
         .route("/api/world/events", post(add_world_event))
         .route("/api/world/events/:id", put(update_world_event))
         .route("/api/world/events/:id", delete(delete_world_event))
+        // LLM rate-limit endpoints
+        .route("/api/llm/status", get(llm_status_handler))
+        .route("/api/llm/config", post(llm_config_update_handler))
         // .env / security endpoints
         .route("/api/env/status", get(env_status_handler))
         .route("/api/env/configure", post(configure_env_handler))
