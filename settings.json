@@ -2,9 +2,9 @@
   "llm": {
     "api_key_name": "MINIMAX_API_KEY",
     "api_url": "https://api.minimax.io/anthropic",
-    "calls_per_hour_enabled": false,
+    "calls_per_hour_enabled": true,
     "llm_timeout_secs": 180,
-    "max_calls_per_hour": 0,
+    "max_calls_per_hour": 45,
     "max_output_tokens": 50000,
     "model": "MiniMax-M2.7-highspeed",
     "provider": "minimax-portal"
