@@ -28,6 +28,50 @@ pub struct WorldEvent {
 
 pub fn default_true() -> bool { true }
 
+/// The canonical set of lore-based default events for a new world.
+/// Mirrors the five "Shadow Awakening" era events documented in
+/// `docs/world_lore.md` and `docs/world_events.md`. Stable UUIDs are
+/// used so a freshly seeded world is reproducible across runs.
+pub fn default_world_events() -> Vec<WorldEvent> {
+    vec![
+        WorldEvent {
+            id: "e10f8432-2dbe-4b73-9826-2366c7772c9f".to_string(),
+            name: "The Shadow Awakens".to_string(),
+            description: "For centuries dismissed as myth, the Scrolls of the First Age spoke of a darkness that would return when the realm forgot its vigilance. Now the signs are undeniable: shadows in the Northern Pass stretch longer than the mountains themselves, animals flee southward, and the Moonwell at Elder Moonthorn reflects something other than the future. The Prophecy of the Shadow Crown has begun to unfold.".to_string(),
+            influence: "Entities grow suspicious, militaristic, and watchful. Silverstream Keep mobilizes. Ironforge forges weapons day and night. Whisperwood closes its borders. Trade becomes riskier. Trust between factions erodes. Power-hungry actors see opportunity. The realm is tense with approaching doom.".to_string(),
+            active: true,
+        },
+        WorldEvent {
+            id: "c7eca4b6-8dc8-45ba-ba5a-337803de3019".to_string(),
+            name: "Velora Walks Again".to_string(),
+            description: "A knight in corroded silver armor has been sighted on the roads at night. Her helm reflects no light and she leaves no shadow. Velora the Undying, who held the Northern Pass alone for seven days during the Demon Wars, has returned. She seeks the Forgotten Heir mentioned in the prophecy and trades secrets with those brave enough to meet her gaze.".to_string(),
+            influence: "Heroes and knights feel a stirring of destiny. Some seek Velora out for blessings. Others fear her appearance as a sign of the worst. Kira Dawnblade in particular feels the prophecy pulling at her. Mira the Merchant has rare tales to sell. The Silver Wardens of Silverstream Keep sense the return of their founder.".to_string(),
+            active: true,
+        },
+        WorldEvent {
+            id: "a23dac23-4fd1-4936-9696-059cae6ce77d".to_string(),
+            name: "The Shadowmaw Stirs".to_string(),
+            description: "Ironforge miners report tremors deep beneath Frostpeak. The forges have grown hot without fuel. The clan elders whisper of bad dreams — impossible dreams of black wings and a heartbeat that shakes the world. Vaelthrix the Endless, the ancient dragon who slept beneath the Frostpeak Mountains before the First Age, has begun to dream. Her dreams leak into the world as visions and earthquakes.".to_string(),
+            influence: "Dwarves of Ironforge grow fearful but resolute. Miners dig deeper in search of ancient weapons. Mountain-dwelling entities feel the tremors. The wandering bard hears songs about dragons returning. Some interpret the dreams as omens; others as opportunities. The realm feels heavier, charged with waiting.".to_string(),
+            active: true,
+        },
+        WorldEvent {
+            id: "88f129bd-2c08-4f23-9969-4818d3858bfd".to_string(),
+            name: "The Silver Wardens Mobilize".to_string(),
+            description: "The banners of Silverstream Keep fly from every tower. Knights ride out in pairs along the northern roads. A formal decree has been issued: every traveler must declare their business or be turned back. The Silver Wardens — Silverstream Keep's elite order — believe themselves the prophesied defenders of the realm. They have begun recruiting among the common folk, and the cost of admission is a secret they will not share.".to_string(),
+            influence: "Knights and warriors grow bold. Refugees and villagers consider joining. Bandits and outlaws grow more cautious. The Keep itself grows in power, but at the cost of internal suspicion. The mobilization of one faction pressures all others — should they also prepare for war? Trade slows. Tensions rise along every road.".to_string(),
+            active: true,
+        },
+        WorldEvent {
+            id: "46a976d2-c2a7-46b5-903f-1a04ae751058".to_string(),
+            name: "The Bells of the Sunken Temple".to_string(),
+            description: "Travelers near the southern marshlands report hearing bells at dusk. The Sunken Temple — half-submerged since the Second Age and abandoned for a thousand years — has begun to ring. No one has yet dared enter. The Wandering Bard claims to have heard a voice singing along with the bells, in a language no scholar recognizes. Mira the Scribe is taking notes.".to_string(),
+            influence: "Scholars and sages grow curious. Adventurers plan expeditions. Locals avoid the marshlands. Zephyrus the Oracle speaks in riddles about it, which everyone interprets differently. The realm feels as if something is waking that was meant to stay asleep. The Drowned City, said to be the temple sister, has grown quieter — its silence more ominous than its noise.".to_string(),
+            active: true,
+        },
+    ]
+}
+
 /// Get the fixed UUID for world clock entity
 fn clock_entity_id() -> Uuid {
     Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
@@ -271,7 +315,22 @@ impl World {
         };
         // Create the world clock entity
         world.create_clock_entity();
+        // Auto-bootstrap with the canonical lore events so a fresh world
+        // already has narrative momentum (see todo e4cc4203).
+        world.seed_default_events();
         world
+    }
+
+    /// Seed the world with the canonical set of lore-based default events
+    /// (the "Shadow Awakening" era described in `docs/world_lore.md` and
+    /// `docs/world_events.md`). Idempotent: a no-op if the world already
+    /// has any active events. New worlds start with these so the LLM has
+    /// narrative context from the very first entity action.
+    pub fn seed_default_events(&mut self) {
+        if !self.active_events.is_empty() {
+            return;
+        }
+        self.active_events = default_world_events();
     }
     
     /// Create the world clock entity if it doesn't exist
@@ -600,20 +659,103 @@ mod tests {
     fn test_create_world() {
         let world = World::new("Test World");
         assert_eq!(world.name, "Test World");
-        assert_eq!(world.entity_count(), 0);
+        // World::new() always creates the world clock entity, so a
+        // fresh world has 1 entity by default. (This used to assert
+        // 0 — that was a pre-existing bug; the clock has been there
+        // since World::create_clock_entity was introduced.)
+        assert_eq!(world.entity_count(), 1);
+        // New worlds auto-bootstrap with the canonical lore events
+        // (todo e4cc4203). Exactly five, all active.
+        assert_eq!(world.active_events.len(), 5);
+        assert!(world.active_events.iter().all(|e| e.active));
+        let names: Vec<&str> = world
+            .active_events
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(names.contains(&"The Shadow Awakens"));
+        assert!(names.contains(&"Velora Walks Again"));
+        assert!(names.contains(&"The Shadowmaw Stirs"));
+        assert!(names.contains(&"The Silver Wardens Mobilize"));
+        assert!(names.contains(&"The Bells of the Sunken Temple"));
     }
-    
+
+    #[test]
+    fn test_seed_default_events_is_idempotent() {
+        let mut world = World::new("Test");
+        let initial_count = world.active_events.len();
+        assert!(initial_count > 0, "World::new should seed defaults");
+        // Calling again must not duplicate.
+        world.seed_default_events();
+        assert_eq!(world.active_events.len(), initial_count);
+    }
+
+    #[test]
+    fn test_seed_default_events_respects_existing_events() {
+        let mut world = World::new("Test");
+        // User-added custom event after construction.
+        world.active_events.push(WorldEvent {
+            id: "11111111-1111-1111-1111-111111111111".to_string(),
+            name: "Custom Plot".to_string(),
+            description: "Something the players started".to_string(),
+            influence: "Adventurers feel bold".to_string(),
+            active: true,
+        });
+        let count_before = world.active_events.len();
+        world.seed_default_events();
+        assert_eq!(
+            world.active_events.len(),
+            count_before,
+            "seed_default_events must not touch worlds that already have events"
+        );
+        // Custom event preserved.
+        assert!(world
+            .active_events
+            .iter()
+            .any(|e| e.name == "Custom Plot"));
+    }
+
+    #[test]
+    fn test_default_events_have_unique_ids_and_are_active() {
+        let events = default_world_events();
+        assert!(!events.is_empty());
+        let mut ids: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        ids.sort();
+        let original_len = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), original_len, "all event ids must be unique");
+        assert!(events.iter().all(|e| e.active));
+        // Every event has a non-empty name + description + influence,
+        // otherwise the LLM context builder has nothing to render.
+        for e in &events {
+            assert!(!e.name.is_empty(), "event name is empty for {}", e.id);
+            assert!(
+                !e.description.is_empty(),
+                "event description is empty for {}",
+                e.id
+            );
+            assert!(
+                !e.influence.is_empty(),
+                "event influence is empty for {}",
+                e.id
+            );
+        }
+    }
+
     #[test]
     fn test_add_remove_entity() {
         let mut world = World::new("Test");
+        // World::new() ships with the world clock entity (count 1).
+        assert_eq!(world.entity_count(), 1);
         let entity = WorldEntity::new("location", "Village", 0.0, 0.0);
         let id = world.add_entity(entity);
-        
-        assert_eq!(world.entity_count(), 1);
+
+        assert_eq!(world.entity_count(), 2);
         assert!(world.get_entity(&id).is_some());
-        
+
         world.remove_entity(&id);
-        assert_eq!(world.entity_count(), 0);
+        // Clock remains after removing the village.
+        assert_eq!(world.entity_count(), 1);
     }
     
     #[test]

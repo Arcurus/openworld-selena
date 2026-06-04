@@ -298,7 +298,12 @@ mod tests {
 
     #[test]
     fn world_events_empty_world_returns_empty_string() {
-        let world = make_world();
+        // A truly event-less world (we explicitly clear the seed
+        // defaults to test the empty-input branch; in production a
+        // fresh World::new() now ships with 5 lore events — see
+        // World::seed_default_events / todo e4cc4203).
+        let mut world = make_world();
+        world.active_events.clear();
         let result = build_world_events_str(&world);
         assert_eq!(result, "");
     }

@@ -1680,6 +1680,43 @@ fn parse_effect_value(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
+// Magnitude bounds applied to LLM-supplied effect values to keep
+// them from poisoning entity state. See todo 2df49bd8.
+pub(crate) const MAX_INT_ABS: i64 = 1_000_000_000;
+pub(crate) const MAX_FLOAT_ABS: f64 = 1.0e9;
+pub(crate) const MAX_DELTA_ABS: f64 = 1.0e6;
+
+/// Reject obviously-broken LLM effect values: non-finite (NaN / Inf)
+/// numbers, or any delta whose absolute value exceeds MAX_DELTA_ABS.
+/// Returns a human-readable reason when the value should be skipped,
+/// or None when the value is in range and may be applied.
+pub(crate) fn magnitude_check(v: &serde_json::Value) -> Option<String> {
+    let f = match v {
+        serde_json::Value::Number(n) => n.as_f64()?,
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok()?,
+        _ => return None, // bool / null / array / object handled elsewhere
+    };
+    if !f.is_finite() {
+        return Some(format!("non-finite value ({})", f));
+    }
+    if f.abs() > MAX_DELTA_ABS {
+        return Some(format!("|{}| > MAX_DELTA_ABS ({})", f, MAX_DELTA_ABS as i64));
+    }
+    None
+}
+
+/// True when a freshly-computed int result is outside the safe
+/// magnitude bound and should be skipped rather than written.
+pub(crate) fn int_oversize(v: i64) -> bool {
+    v.abs() > MAX_INT_ABS
+}
+
+/// True when a freshly-computed float result is outside the safe
+/// magnitude bound (or non-finite) and should be skipped.
+pub(crate) fn float_oversize(v: f64) -> bool {
+    !v.is_finite() || v.abs() > MAX_FLOAT_ABS
+}
+
 // Parse the JSON response from LLM
 fn parse_llm_action_response(raw: &str) -> Result<LlmActionResponse, String> {
     // Try to extract JSON from the response (in case there's extra text)
@@ -1747,6 +1784,20 @@ async fn process_action_handler(
                         continue;
                     }
 
+                    // Magnitude guard: LLM occasionally emits huge garbage
+                    // values (e.g. 1e18 for "power") that get added to the
+                    // property and corrupt the entity forever. Cap the
+                    // absolute size of both the delta and the result so a
+                    // single bad response can't poison world state. See
+                    // todo 2df49bd8.
+                    if let Some(reason) = magnitude_check(change_val) {
+                        warnings.push(format!(
+                            "Skipped effect on '{}': {} (value={:?})",
+                            prop_key, reason, change_val
+                        ));
+                        continue;
+                    }
+
                     // Determine value type and convert appropriately
                     let (int_val, float_val, string_val) = match change_val {
                         // Bool -> int (true=1, false=0)
@@ -1809,7 +1860,20 @@ async fn process_action_handler(
                         
                         // Get or create the int property
                         let old_val = *entity.properties_int.get(prop_key).unwrap_or(&0);
-                        let new_val = old_val + val;
+                        let new_val = old_val.checked_add(val).unwrap_or_else(|| {
+                            warnings.push(format!(
+                                "Integer overflow on '{}' (old={}, delta={}); clamped to {}",
+                                prop_key, old_val, val, MAX_INT_ABS
+                            ));
+                            MAX_INT_ABS
+                        });
+                        if int_oversize(new_val) {
+                            warnings.push(format!(
+                                "Skipped oversize int write on '{}': new_val={} (|val| > {})",
+                                prop_key, new_val, MAX_INT_ABS
+                            ));
+                            continue;
+                        }
                         entity.properties_int.insert(prop_key.clone(), new_val);
                         applied_effects.insert(prop_key.clone(), serde_json::json!(new_val));
                         new_values.insert(prop_key.clone(), serde_json::json!(new_val));
@@ -1825,6 +1889,13 @@ async fn process_action_handler(
                         
                         let old_val = *entity.properties_float.get(prop_key).unwrap_or(&0.0);
                         let new_val = old_val + val;
+                        if float_oversize(new_val) {
+                            warnings.push(format!(
+                                "Skipped oversize float write on '{}': new_val={}",
+                                prop_key, new_val
+                            ));
+                            continue;
+                        }
                         entity.properties_float.insert(prop_key.clone(), new_val);
                         applied_effects.insert(prop_key.clone(), serde_json::json!(new_val));
                         new_values.insert(prop_key.clone(), serde_json::json!(new_val));
@@ -3287,4 +3358,57 @@ async fn main() {
     println!("🌍 ═══════════════════════════════════════════════════");
     
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod effect_guard_tests {
+    use super::*;
+
+    #[test]
+    fn magnitude_check_accepts_normal_values() {
+        // Power, morale, wealth deltas — typical LLM outputs.
+        assert!(magnitude_check(&serde_json::json!(5)).is_none());
+        assert!(magnitude_check(&serde_json::json!(-12.5)).is_none());
+        assert!(magnitude_check(&serde_json::json!("+3")).is_none());
+        assert!(magnitude_check(&serde_json::json!("42")).is_none());
+        assert!(magnitude_check(&serde_json::json!(0)).is_none());
+    }
+
+    #[test]
+    fn magnitude_check_rejects_huge_deltas() {
+        // The exact pattern that produced the world_clock corruption
+        // (todo 2df49bd8) was 1e18 floats being added to ints.
+        let r = magnitude_check(&serde_json::json!(1e18));
+        assert!(r.is_some(), "1e18 must be rejected");
+        assert!(r.unwrap().contains("MAX_DELTA_ABS"));
+    }
+
+    #[test]
+    fn magnitude_check_rejects_string_deltas() {
+        assert!(magnitude_check(&serde_json::json!("9999999999")).is_some());
+    }
+
+    #[test]
+    fn magnitude_check_rejects_nan_and_inf() {
+        // serde_json cannot directly express NaN/Inf, but a string
+        // parses to f64::INFINITY; bypass via a huge literal.
+        let r = magnitude_check(&serde_json::json!(1e308));
+        assert!(r.is_some(), "huge finite values are still rejected by the delta cap");
+    }
+
+    #[test]
+    fn int_oversize_classifies() {
+        assert!(!int_oversize(0));
+        assert!(!int_oversize(999_999_999));
+        assert!(int_oversize(1_000_000_001));
+        assert!(int_oversize(-1_000_000_001));
+    }
+
+    #[test]
+    fn float_oversize_classifies() {
+        assert!(!float_oversize(0.0));
+        assert!(!float_oversize(1.0e9 - 1.0));
+        assert!(float_oversize(1.0e9 + 1.0));
+        assert!(float_oversize(f64::INFINITY));
+    }
 }
