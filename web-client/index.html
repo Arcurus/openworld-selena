@@ -1923,12 +1923,18 @@
          * max_history_summary_chars; we show the cap in the caption).
          *
          * 2026-06-04: now reads the real cap from the API response
-         * (max_history_summary_chars + max_history_summary_source) and
-         * includes a "Replace…" button that opens the partial-replace
-         * form (old_part + new_part). The replace hits
-         * `POST /api/entities/:id/history-summary/replace`; if the result
-         * is over cap, the server truncates and logs a warning that we
-         * surface in the UI.
+         * (max_history_summary_chars + max_history_summary_source).
+         * The real cap is the entity's max_history_summary_chars
+         * (per-world override or global default), shown in the meta
+         * caption so the user knows the hard limit.
+         *
+         * (Removed 2026-06-04: the in-UI "Replace…" button + modal.
+         * Per Arcurus 2026-06-04 (#openworld), the partial-replace
+         * affordance belongs in the LLM-emit command set
+         * (`history_summary_replace`), not the web UI. The HTTP API
+         * `POST /api/entities/:id/history-summary/replace` and the
+         * `scripts/replace_history_summary.py` CLI are still the
+         * programmatic escape hatches for human-driven fixes.)
          */
         async function loadEntityHistorySummary(entityId) {
             const el = document.getElementById('entityHistorySummary');
@@ -1959,10 +1965,7 @@
                 const capSource = d.max_history_summary_source || '';
                 if (summary && String(summary).trim().length > 0) {
                     el.innerHTML =
-                        '<div id="historySummaryText" style="margin-bottom: 6px;">' + escapeHtml(summary) + '</div>' +
-                        '<div style="display: flex; gap: 6px; margin-top: 4px;">' +
-                            '<button class="btn btn-small" onclick="openHistorySummaryReplaceModal(\'' + escapeAttr(entityId) + '\')" style="padding: 2px 8px; font-size: 10px; background: rgba(99,102,241,0.5);">\u270f\ufe0f Replace\u2026</button>' +
-                        '</div>';
+                        '<div id="historySummaryText">' + escapeHtml(summary) + '</div>';
                     if (metaEl) {
                         const len = String(summary).length;
                         const pct = maxCap > 0 ? Math.round(len / maxCap * 100) : null;
@@ -1977,116 +1980,23 @@
                         ? '0 / ' + maxCap + ' chars \u00b7 ' + capSource + ' cap'
                         : '0 chars';
                 }
-                // Stash the cap on the element so the replace modal can
-                // show it as a soft counter while the user types.
-                el.dataset.maxCap = String(maxCap);
-                el.dataset.capSource = capSource;
+                // (Removed 2026-06-04: dataset.maxCap / dataset.capSource
+                // stash — was only used by the now-removed Replace
+                // modal. The cap is read directly in this function and
+                // rendered into the meta caption, so the dataset is
+                // no longer needed.)
             } catch (e) {
                 el.innerHTML = '<div style="color: #f87171; font-size: 11px; text-align: center; padding: 6px;">Failed to load summary: ' + escapeHtml(String(e)) + '</div>';
             }
         }
 
-        /**
-         * Open the History Summary "Replace\u2026" mini-modal.
-         * Two fields (old_part + new_part), a live char counter against
-         * the entity's max cap, and a "strict" toggle (off = lenient no-op
-         * + warning when old_part is not found; on = 404).
-         * Hits `POST /api/entities/:id/history-summary/replace`.
-         */
-        function openHistorySummaryReplaceModal(entityId) {
-            const el = document.getElementById('entityHistorySummary');
-            const maxCap = parseInt((el && el.dataset.maxCap) || '0', 10);
-            const capSource = (el && el.dataset.capSource) || '';
-            const oldText = document.getElementById('historySummaryText')
-                ? document.getElementById('historySummaryText').textContent || ''
-                : '';
-
-            let html = '<div id="historyReplaceModal" class="modal-overlay" style="display: flex; z-index: 1100;">';
-            html += '<div class="modal-content" style="max-width: 640px;">';
-            html += '<div class="modal-header"><span>\u270f\ufe0f History Summary \u2014 Replace part</span>';
-            html += '<button class="modal-close" onclick="closeHistoryReplaceModal()">&times;</button></div>';
-            html += '<div class="modal-body" style="padding: 16px;">';
-            html += '<div style="color: #94a3b8; font-size: 11px; margin-bottom: 12px;">';
-            html += 'Find <code style="background: rgba(15,30,60,0.6); padding: 1px 4px; border-radius: 3px;">old_part</code> in the current summary and replace it with <code style="background: rgba(15,30,60,0.6); padding: 1px 4px; border-radius: 3px;">new_part</code>. The result is truncated to the cap (' + maxCap + ' chars, ' + escapeHtml(capSource) + ' cap) with a warning if it goes over. The first occurrence is replaced.';
-            html += '</div>';
-            html += '<label style="display: block; color: #cbd5e1; font-size: 11px; margin: 8px 0 4px; text-transform: uppercase;">Old part (find this)</label>';
-            html += '<textarea id="hsReplaceOld" rows="3" style="width: 100%; box-sizing: border-box; background: rgba(15,30,60,0.6); color: #e0e0e0; border: 1px solid rgba(99,102,241,0.3); border-radius: 4px; padding: 8px; font-family: inherit; font-size: 12px; resize: vertical;">' + escapeHtml('') + '</textarea>';
-            html += '<label style="display: block; color: #cbd5e1; font-size: 11px; margin: 12px 0 4px; text-transform: uppercase;">New part (replace with this)</label>';
-            html += '<textarea id="hsReplaceNew" rows="3" style="width: 100%; box-sizing: border-box; background: rgba(15,30,60,0.6); color: #e0e0e0; border: 1px solid rgba(99,102,241,0.3); border-radius: 4px; padding: 8px; font-family: inherit; font-size: 12px; resize: vertical;"></textarea>';
-            html += '<label style="display: flex; align-items: center; gap: 6px; color: #94a3b8; font-size: 11px; margin-top: 12px;">';
-            html += '<input type="checkbox" id="hsReplaceStrict">';
-            html += '<span>Strict mode (return 404 if old_part is not found, instead of warning)</span>';
-            html += '</label>';
-            html += '<div id="hsReplaceCounter" style="color: #94a3b8; font-size: 11px; margin-top: 8px; font-family: monospace;"></div>';
-            html += '<div id="hsReplaceResult" style="margin-top: 8px;"></div>';
-            html += '<div style="display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end;">';
-            html += '<button class="btn btn-secondary" onclick="closeHistoryReplaceModal()" style="padding: 6px 14px; font-size: 12px;">Cancel</button>';
-            html += '<button class="btn btn-primary" onclick="submitHistorySummaryReplace(\'' + escapeAttr(entityId) + '\')" style="padding: 6px 14px; font-size: 12px;">Apply</button>';
-            html += '</div>';
-            html += '</div></div></div>';
-            const wrap = document.createElement('div');
-            wrap.innerHTML = html;
-            document.body.appendChild(wrap.firstChild);
-            // Live counter
-            const onInput = function() {
-                const old = document.getElementById('hsReplaceOld').value;
-                const nu = document.getElementById('hsReplaceNew').value;
-                // Worst-case: the old_part is unique in the current
-                // summary, so net delta = nu.length - old.length. Worst
-                // case length = currentLen + (nu.length - old.length).
-                const cur = oldText.length;
-                const projected = Math.max(0, cur - old.length + nu.length);
-                const counterEl = document.getElementById('hsReplaceCounter');
-                if (counterEl) {
-                    if (maxCap > 0) {
-                        const ok = projected <= maxCap;
-                        counterEl.innerHTML = 'projected length: <b style="color:' + (ok ? '#34d399' : '#f87171') + ';">' + projected + '</b> / ' + maxCap + ' chars' + (ok ? '' : ' (will be truncated)');
-                    } else {
-                        counterEl.textContent = 'projected length: ' + projected + ' chars (cap unknown)';
-                    }
-                }
-            };
-            document.getElementById('hsReplaceOld').addEventListener('input', onInput);
-            document.getElementById('hsReplaceNew').addEventListener('input', onInput);
-            onInput();
-        }
-        function closeHistoryReplaceModal() {
-            const m = document.getElementById('historyReplaceModal');
-            if (m) m.remove();
-        }
-        async function submitHistorySummaryReplace(entityId) {
-            const oldPart = document.getElementById('hsReplaceOld').value;
-            const newPart = document.getElementById('hsReplaceNew').value;
-            const strict = document.getElementById('hsReplaceStrict').checked;
-            const resultEl = document.getElementById('hsReplaceResult');
-            if (!oldPart) {
-                resultEl.innerHTML = '<div style="color: #fbbf24; font-size: 11px; padding: 6px;">old_part is required</div>';
-                return;
-            }
-            resultEl.innerHTML = '<div style="color: #5a7a9a; font-size: 11px; padding: 6px;">Applying\u2026</div>';
-            try {
-                const r = await fetch('api/entities/' + encodeURIComponent(entityId) + '/history-summary/replace', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    credentials: 'include',
-                    body: JSON.stringify({ old_part: oldPart, new_part: newPart, not_found_is_error: strict })
-                });
-                const d = await r.json();
-                if (!r.ok || !d.success) {
-                    resultEl.innerHTML = '<div style="color: #f87171; font-size: 11px; padding: 6px;">' + escapeHtml(d.error || ('HTTP ' + r.status)) + '</div>';
-                    return;
-                }
-                const truncated = d.truncated ? '<div style="color: #fbbf24; font-size: 11px; padding: 4px 0;">\u26a0\ufe0f ' + escapeHtml(d.warning || 'truncated') + '</div>' : '';
-                const warn = (d.warning && !d.truncated) ? '<div style="color: #fbbf24; font-size: 11px; padding: 4px 0;">' + escapeHtml(d.warning) + '</div>' : '';
-                resultEl.innerHTML =
-                    truncated + warn +
-                    '<div style="color: #34d399; font-size: 11px; padding: 4px 0;">\u2713 Replaced. ' + (d.history_summary_chars || 0) + ' chars.</div>';
-                // Refresh the summary card so the new content shows
-                loadEntityHistorySummary(entityId);
-            } catch (e) {
-                resultEl.innerHTML = '<div style="color: #f87171; font-size: 11px; padding: 6px;">Failed: ' + escapeHtml(String(e)) + '</div>';
-            }
-        }
+        // (Removed 2026-06-04: openHistorySummaryReplaceModal,
+        // closeHistoryReplaceModal, submitHistorySummaryReplace. Per
+        // Arcurus 2026-06-04 (#openworld), the partial-replace
+        // affordance is now an LLM-emit command
+        // (`history_summary_replace` in the LLM response), not a
+        // web-UI affordance. Humans use the HTTP API endpoint or
+        // `scripts/replace_history_summary.py` CLI for one-off fixes.)
 
         /**
          * Fetch + render the action history for a given entity.
