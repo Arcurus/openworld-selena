@@ -829,7 +829,10 @@ pub struct WorldSettings {
     /// Max characters the LLM is allowed to use when writing the
     /// per-entity history_summary field. Soft cap — the server
     /// truncates with "…" if the LLM goes over.
-    /// Default 500.
+    /// **0 means "use the global default"** (from
+    /// `settings.json → llm.default_max_history_summary_chars`,
+    /// default 2000). Set to a positive integer to override
+    /// per-world.
     pub max_history_summary_chars: u32,
 }
 
@@ -845,7 +848,7 @@ impl Default for WorldSettings {
             auto_save_interval_secs: 300,
             history_entries_fully_displayed: 10,  // bumped 5→10 for anti-repetition window
             history_entries_shortened: 10,
-            max_history_summary_chars: 500,
+            max_history_summary_chars: 0,  // 0 = use global default from settings.json (currently 2000)
         }
     }
 }

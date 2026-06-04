@@ -25,14 +25,32 @@ pub struct ActionContext {
     /// when none exists yet). Goes into `{history_summary}`.
     pub history_summary_str: String,
     /// Max characters the LLM may use for the summary it returns.
+    /// Resolved effective cap: per-world override if non-zero,
+    /// otherwise the global default from
+    /// `settings.json → llm.default_max_history_summary_chars`.
     /// Goes into `{max_history_summary_chars}`.
     pub max_history_summary_chars: u32,
+}
+
+/// Resolve the effective per-entity history-summary char cap.
+/// Per-world `WorldSettings.max_history_summary_chars` overrides
+/// the global default if non-zero; 0 means "use the global default".
+pub fn resolve_max_history_summary_chars(world: &World, global_default: u32) -> u32 {
+    if world.settings.max_history_summary_chars > 0 {
+        world.settings.max_history_summary_chars
+    } else {
+        global_default
+    }
 }
 
 /// Build the full action context for an entity. Used by both
 /// `action_context_handler` and `entity_action` to keep their
 /// prompt construction in sync.
-pub fn build_action_context(world: &World, entity: &WorldEntity) -> ActionContext {
+pub fn build_action_context(
+    world: &World,
+    entity: &WorldEntity,
+    global_default_max_history_summary_chars: u32,
+) -> ActionContext {
     let stats = world.calculate_stats();
     let type_stats = stats.by_type.get(&entity.entity_type);
 
@@ -44,7 +62,10 @@ pub fn build_action_context(world: &World, entity: &WorldEntity) -> ActionContex
         world_events_str: build_world_events_str(world),
         history_summary_str: entity.history_summary.clone()
             .unwrap_or_else(|| "(no history summary yet)".to_string()),
-        max_history_summary_chars: world.settings.max_history_summary_chars,
+        max_history_summary_chars: resolve_max_history_summary_chars(
+            world,
+            global_default_max_history_summary_chars,
+        ),
     }
 }
 

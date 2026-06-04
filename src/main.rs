@@ -201,6 +201,12 @@ struct LlmSettings {
     /// Default: 0 (deactivated).
     #[serde(default = "default_max_calls_per_hour")]
     max_calls_per_hour: u32,
+    /// Global default for the per-entity `history_summary` cap.
+    /// Per-world `WorldSettings.max_history_summary_chars` may override
+    /// this; a value of 0 in WorldSettings means "use this global default".
+    /// Default: 2000 chars.
+    #[serde(default = "default_max_history_summary_chars")]
+    default_max_history_summary_chars: u32,
 }
 
 fn default_api_url() -> String {
@@ -225,6 +231,10 @@ fn default_llm_calls_enabled() -> bool {
 
 fn default_max_calls_per_hour() -> u32 {
     0
+}
+
+fn default_max_history_summary_chars() -> u32 {
+    2000
 }
 
 // ============================================================================
@@ -1166,9 +1176,13 @@ async fn action_context_handler(
         Some(e) => e,
         None => return error_json(StatusCode::NOT_FOUND, "Entity not found"),
     };
-    
+
     // Build the full action context (DRY helper shared with entity_action)
-    let ctx = context_builder::build_action_context(&world, entity);
+    let ctx = context_builder::build_action_context(
+        &world,
+        entity,
+        state.settings.llm.default_max_history_summary_chars,
+    );
     
     // Read the AI template
     let template = match tokio::fs::read_to_string("ai_templates/EntityAction.md").await {
@@ -1497,9 +1511,13 @@ async fn entity_action(
     if process_only {
         return error_json(StatusCode::BAD_REQUEST, "Use /api/entities/:id/action/process for processing");
     }
-    
+
     // Build the full action context (DRY helper shared with action_context_handler)
-    let ctx = context_builder::build_action_context(&world, entity);
+    let ctx = context_builder::build_action_context(
+        &world,
+        entity,
+        state.settings.llm.default_max_history_summary_chars,
+    );
     
     // Read the AI template
     let template = match tokio::fs::read_to_string("ai_templates/EntityAction.md").await {
@@ -1765,8 +1783,13 @@ async fn process_action_handler(
             // Capture the history-summary cap BEFORE taking a mutable
             // borrow of the entity (Rust borrow checker: we can't
             // immutably borrow `world.settings` while `entity` is
-            // borrowed mutably).
-            let max_summary_chars = world.settings.max_history_summary_chars as usize;
+            // borrowed mutably). Resolved effective cap: per-world
+            // override (if non-zero) or the global default from
+            // `settings.json → llm.default_max_history_summary_chars`.
+            let max_summary_chars = context_builder::resolve_max_history_summary_chars(
+                &world,
+                state.settings.llm.default_max_history_summary_chars,
+            ) as usize;
             if let Some(entity) = world.entities.get_mut(&entity_id) {
                 let mut applied_effects = std::collections::HashMap::new();
                 let mut new_values = std::collections::HashMap::new();
@@ -2931,6 +2954,7 @@ fn load_settings() -> Settings {
                 llm_timeout_secs: 180,
                 calls_per_hour_enabled: true,
                 max_calls_per_hour: 0,
+                default_max_history_summary_chars: default_max_history_summary_chars(),
             },
             security: SecuritySettings {
                 password_var_name: "WEB_PASSWORD".to_string(),

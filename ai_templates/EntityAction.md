@@ -23,7 +23,7 @@ Nearby Entities:
 ---
 
 **Anti-repetition guidance — read carefully:**
-The "History of {entity_name}" block above lists your most recent actions in full. Do NOT pick an action that's semantically the same as any of them. Vary the verb, target, or context — even if the high-level goal is the same, the surface action should be fresh. If the recent history shows a ritual loop (e.g. "temple bells ring" 5 times in a row), break out of it with something new: investigate a rumor, confront a rival, change location, take a risk.
+Don't repeat your actions — be creative!
 
 ---
 
@@ -51,6 +51,7 @@ Respond ONLY with valid JSON (no other text before or after). Required fields:
 **`history_summary` rules (always include, every turn):**
 - ≤ {max_history_summary_chars} characters total (hard cap; will be truncated server-side if exceeded).
 - A rolling one-paragraph arc: what this entity has been doing recently, why, and where it's heading.
+- Your summary can reference any past action if it matters for narrative continuity. Space is limited, so the impact of very old actions may be dropped if it won't fit in the summary. You decide what to keep.
 - Update it to reflect the new action you're taking. Don't just repeat the prior summary.
 - Mention the count or cadence of any dominant pattern you notice (e.g. "5th temple bell toll this week — leaning into ritual").
 - Keep it forward-looking: the next call's LLM will read this to plan the next action.

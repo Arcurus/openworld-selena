@@ -401,8 +401,17 @@ impl BinaryPersistence {
         // v3 added max_history_summary_chars to WorldSettings. For
         // older saves (v1/v2) we fall back to the default so a
         // downgrade is graceful.
+        //
+        // The v3 field's semantics have since changed: 0 now means
+        // "use the global default from settings.json". A v3 save that
+        // predates this change typically stored 500 (the old default).
+        // Per Arcurus 2026-06-04: "make sure world uses defaults" — so
+        // we deliberately reset existing v3 saves to 0 on load. The
+        // bytes are read to keep the cursor in sync with the file
+        // layout; the value is then discarded.
         let max_history_summary_chars = if version >= 3 {
-            Self::read_u64(data, &mut pos) as u32
+            let _stored = Self::read_u64(data, &mut pos) as u32;
+            0u32  // v3 stored value no longer meaningful; use global default
         } else {
             WorldSettings::default().max_history_summary_chars
         };
