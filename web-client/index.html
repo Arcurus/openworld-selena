@@ -1026,7 +1026,8 @@
             return html;
         }
         
-        const API_BASE = '/api';
+        // Mount-point-agnostic: relative base URL. The browser resolves 'api/...' against the current page's directory, so this works under /open-world/, at /, or at any other Caddy mount point. Caddy's `uri strip_prefix` rewrites the rest back to the backend. Don't reintroduce a leading slash.
+        const API_BASE = 'api';
         let entities = [];
         let selectedEntity = null;
         let currentEditEntityId = null;
@@ -1394,7 +1395,7 @@
         
         async function checkPasswordAndOpenFiles() {
             try {
-                const res = await fetch('/api/env/status');
+                const res = await fetch('api/env/status');
                 const data = await res.json();
                 
                 if (data.success) {
@@ -1433,8 +1434,8 @@
             try {
                 // Fetch world info and stats
                 const [worldRes, statsRes] = await Promise.all([
-                    fetch('/api/world'),
-                    fetch('/api/world/stats')
+                    fetch('api/world'),
+                    fetch('api/world/stats')
                 ]);
                 const worldData = await worldRes.json();
                 const statsData = await statsRes.json();
@@ -1613,7 +1614,7 @@
             });
             
             try {
-                const res = await fetch('/api/world', {
+                const res = await fetch('api/world', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -1658,7 +1659,7 @@
             }
             
             // Just reload with the new value
-            const res = await fetch('/api/world', {
+            const res = await fetch('api/world', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1673,7 +1674,7 @@
             if (type === 'float') propData['properties_float'] = { [key]: parseFloat(value) || 0 };
             if (type === 'string') propData['properties_string'] = { [key]: value };
             
-            await fetch('/api/world', {
+            await fetch('api/world', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(propData)
@@ -1794,6 +1795,23 @@
             html += '</div>';
             html += '</div>';
 
+            // History Summary Section
+            // Per Arcurus 2026-06-04 (#openworld): the LLM that
+            // processes the world action also writes a rolling
+            // `history_summary` for the entity. We show it here so the
+            // user can spot ritual loops and other patterns at a glance.
+            // The max char cap is a server-side setting; we surface it
+            // as a small caption so the user knows the hard limit.
+            html += '<div style="margin-bottom: 20px;" id="entityHistorySummarySection">';
+            html += '<div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">';
+            html += '<div style="color: #34d399; font-weight: 600; font-size: 12px; text-transform: uppercase; flex: 1;">📋 History Summary</div>';
+            html += '<span id="historySummaryMeta" style="color: #5a7a9a; font-size: 10px;">loading…</span>';
+            html += '</div>';
+            html += '<div id="entityHistorySummary" style="border: 1px solid rgba(52,211,153,0.25); border-radius: 6px; background: rgba(15,30,60,0.4); padding: 10px 12px; color: #cbd5e1; font-size: 12px; line-height: 1.5; min-height: 36px;">';
+            html += '<div style="color: #5a7a9a; font-size: 11px; text-align: center;">Loading summary…</div>';
+            html += '</div>';
+            html += '</div>';
+
             // Action History Section
             // Per Arcurus 2026-06-03 (#openworld): "create new file saving
             // the history of the world actions for a given entity and
@@ -1801,9 +1819,24 @@
             // open the entity".  Loaded async from
             //   GET /api/entities/:id/history?limit=N
             // (the JSONL append-only log + entity.history).
+            //
+            // 2026-06-04: added a configurable limit dropdown
+            // (localStorage-backed, default 10 to match the LLM
+            // anti-repetition window).
             html += '<div style="margin-bottom: 20px;" id="entityHistorySection">';
             html += '<div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">';
             html += '<div style="color: #f59e0b; font-weight: 600; font-size: 12px; text-transform: uppercase; flex: 1;">📜 Action History</div>';
+            html += '<label style="color: #5a7a9a; font-size: 10px; display: flex; align-items: center; gap: 4px;">';
+            html += 'Last';
+            // Inline dropdown; onchange refetches with the new limit.
+            // Default reads from localStorage 'ow_history_limit', fallback 10.
+            html += '<select id="historyLimitSelect" onchange="onHistoryLimitChange(\'' + entity.id + '\')" style="background: rgba(15,30,60,0.8); color: #cbd5e1; border: 1px solid rgba(245,158,11,0.3); border-radius: 4px; padding: 2px 6px; font-size: 11px; cursor: pointer;">';
+            [10, 25, 50, 100, 250, 500].forEach(function(n) {
+                // Selection is applied after render via setHistoryLimitDefault()
+                html += '<option value="' + n + '">' + n + '</option>';
+            });
+            html += '</select>';
+            html += '</label>';
             html += '<span id="historyCount" style="color: #5a7a9a; font-size: 11px;">loading…</span>';
             html += '</div>';
             html += '<div id="entityHistoryList" style="max-height: 280px; overflow-y: auto; border: 1px solid rgba(245,158,11,0.2); border-radius: 6px; background: rgba(15,30,60,0.4); padding: 8px;">';
@@ -1819,9 +1852,90 @@
 
             document.getElementById('entityModalBody').innerHTML = html;
 
-            // Load the history asynchronously so the modal opens quickly.
-            // (history file can grow to thousands of entries; we cap at 50.)
+            // Restore the user's preferred history-limit selection
+            // from localStorage, then load both the history list and
+            // the history summary asynchronously so the modal opens
+            // quickly. (history file can grow to thousands of entries.)
+            setHistoryLimitDefault();
             loadEntityHistory(entity.id);
+            loadEntityHistorySummary(entity.id);
+        }
+
+        /**
+         * History-limit persistence (localStorage).
+         * Key: 'ow_history_limit', allowed: 10/25/50/100/250/500.
+         * Default: 10 (matches the LLM anti-repetition window).
+         */
+        function getHistoryLimit() {
+            try {
+                const raw = localStorage.getItem('ow_history_limit');
+                const n = parseInt(raw, 10);
+                if ([10, 25, 50, 100, 250, 500].indexOf(n) >= 0) return n;
+            } catch (e) { /* localStorage may be unavailable */ }
+            return 10;
+        }
+        function setHistoryLimitDefault() {
+            const sel = document.getElementById('historyLimitSelect');
+            if (sel) sel.value = String(getHistoryLimit());
+        }
+        function onHistoryLimitChange(entityId) {
+            const sel = document.getElementById('historyLimitSelect');
+            if (!sel) return;
+            const n = parseInt(sel.value, 10);
+            if ([10, 25, 50, 100, 250, 500].indexOf(n) >= 0) {
+                try { localStorage.setItem('ow_history_limit', String(n)); } catch (e) {}
+                loadEntityHistory(entityId);
+            }
+        }
+
+        /**
+         * Fetch + render the history_summary card for an entity.
+         * The summary is part of the entity record itself
+         * (entity.history_summary), not the JSONL log. It is updated
+         * by the LLM that processes the world action (server enforces
+         * max_history_summary_chars; we show the cap in the caption).
+         */
+        async function loadEntityHistorySummary(entityId) {
+            const el = document.getElementById('entityHistorySummary');
+            const metaEl = document.getElementById('historySummaryMeta');
+            if (!el) return;  // modal was closed before fetch returned
+            try {
+                const r = await fetch('api/entities/' + encodeURIComponent(entityId), {
+                    credentials: 'include'
+                });
+                if (!r.ok) {
+                    if (r.status === 401) {
+                        el.innerHTML = '<div style="color: #fbbf24; font-size: 11px; text-align: center; padding: 6px;">🔒 Auth required to view summary</div>';
+                        if (metaEl) metaEl.textContent = '';
+                        if (typeof showPasswordUnlockDialog === 'function') {
+                            showPasswordUnlockDialog(() => loadEntityHistorySummary(entityId));
+                        }
+                        return;
+                    }
+                    throw new Error('HTTP ' + r.status);
+                }
+                const d = await r.json();
+                const ent = d.data || d;
+                const summary = ent.history_summary;
+                // The cap is a server setting; we don't have a direct
+                // endpoint to read it, so we just show the actual
+                // character count alongside the summary text and a
+                // "max ≈" hint pulled from the live LLM-context window
+                // default (500) as a soft reference. The real cap is
+                // enforced server-side regardless of what we display.
+                if (summary && String(summary).trim().length > 0) {
+                    el.innerHTML = '<div>' + escapeHtml(summary) + '</div>';
+                    if (metaEl) {
+                        const len = String(summary).length;
+                        metaEl.textContent = len + ' chars \u00b7 max ~500 (server-enforced)';
+                    }
+                } else {
+                    el.innerHTML = '<div style="color: #5a7a9a; font-size: 11px; text-align: center; padding: 6px;">No history summary yet \u2014 the LLM will write one on the next world action.</div>';
+                    if (metaEl) metaEl.textContent = 'max ~500 chars';
+                }
+            } catch (e) {
+                el.innerHTML = '<div style="color: #f87171; font-size: 11px; text-align: center; padding: 6px;">Failed to load summary: ' + escapeHtml(String(e)) + '</div>';
+            }
         }
 
         /**
@@ -1829,13 +1943,15 @@
          * Backed by the JSONL append-only log at
          *   world_data/action_history.jsonl
          * via the OW server's /api/entities/:id/history endpoint.
+         * The limit is read from localStorage (see getHistoryLimit()).
          */
         async function loadEntityHistory(entityId) {
             const listEl = document.getElementById('entityHistoryList');
             const countEl = document.getElementById('historyCount');
             if (!listEl) return;  // modal was closed before fetch returned
+            const limit = getHistoryLimit();
             try {
-                const r = await fetch('/api/entities/' + encodeURIComponent(entityId) + '/history?limit=50', {
+                const r = await fetch('api/entities/' + encodeURIComponent(entityId) + '/history?limit=' + limit, {
                     credentials: 'include'
                 });
                 if (!r.ok) {
@@ -1929,7 +2045,7 @@
             
             // Update basic entity info
             promises.push(
-                fetch('/api/entities/' + entityId, {
+                fetch('api/entities/' + entityId, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name, description, x, y })
@@ -1947,7 +2063,7 @@
             // Update int properties
             Object.entries(intInputs).forEach(([key, value]) => {
                 promises.push(
-                    fetch('/api/entities/' + entityId + '/properties/int/' + encodeURIComponent(key), {
+                    fetch('api/entities/' + entityId + '/properties/int/' + encodeURIComponent(key), {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ value })
@@ -1958,7 +2074,7 @@
             // Update float properties
             Object.entries(floatInputs).forEach(([key, value]) => {
                 promises.push(
-                    fetch('/api/entities/' + entityId + '/properties/float/' + encodeURIComponent(key), {
+                    fetch('api/entities/' + entityId + '/properties/float/' + encodeURIComponent(key), {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ value })
@@ -1969,7 +2085,7 @@
             // Update string properties
             Object.entries(stringInputs).forEach(([key, value]) => {
                 promises.push(
-                    fetch('/api/entities/' + entityId + '/properties/string/' + encodeURIComponent(key), {
+                    fetch('api/entities/' + entityId + '/properties/string/' + encodeURIComponent(key), {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ value })
@@ -2104,7 +2220,7 @@
                         updateStatus('Calling LLM API...', 'status');
                         
                         // Make the LLM call
-                        fetch('/api/entities/' + entityId + '/action?debug=true', { method: 'POST' })
+                        fetch('api/entities/' + entityId + '/action?debug=true', { method: 'POST' })
                             .then(res => {
                                 log('Response status: ' + res.status);
                                 if (res.status === 401) {
@@ -2149,7 +2265,7 @@
                         btn.disabled = true;
                         btn.textContent = 'Processing...';
                         
-                        fetch('/api/entities/' + entityId + '/action/process', {
+                        fetch('api/entities/' + entityId + '/action/process', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({entity_id: entityId, raw_response: rawResponse})
@@ -2180,7 +2296,7 @@
             } else {
                 // Non-debug mode
                 try {
-                    const res = await fetch('/api/entities/' + currentEditEntityId + '/action?debug=false', {
+                    const res = await fetch('api/entities/' + currentEditEntityId + '/action?debug=false', {
                         method: 'POST'
                     });
                     
@@ -2230,7 +2346,7 @@
             
             if (!entity.tags.includes(tag)) {
                 // Update via API
-                fetch('/api/entities/' + entityId, {
+                fetch('api/entities/' + entityId, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ tags: [...entity.tags, tag] })
@@ -2264,7 +2380,7 @@
             
             // Update via API
             const newTags = entity.tags.filter(t => t !== tag);
-            fetch('/api/entities/' + entityId, {
+            fetch('api/entities/' + entityId, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ tags: newTags })
@@ -2295,7 +2411,7 @@
             const val = parseInt(document.getElementById('newIntVal').value);
             if (!key || isNaN(val)) return;
             
-            fetch('/api/entities/' + entityId + '/properties/int/' + key, {
+            fetch('api/entities/' + entityId + '/properties/int/' + key, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ value: val })
@@ -2330,7 +2446,7 @@
             if (!entity) return;
             
             // Delete via API
-            fetch('/api/entities/' + entityId + '/properties/int/' + key, { method: 'DELETE' })
+            fetch('api/entities/' + entityId + '/properties/int/' + key, { method: 'DELETE' })
             .then(res => {
                 if (res.status === 401) {
                     showNotification('Authentication required', 'info');
@@ -2357,7 +2473,7 @@
             const val = parseFloat(document.getElementById('newFloatVal').value);
             if (!key || isNaN(val)) return;
             
-            fetch('/api/entities/' + entityId + '/properties/float/' + key, {
+            fetch('api/entities/' + entityId + '/properties/float/' + key, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ value: val })
@@ -2392,7 +2508,7 @@
             if (!entity) return;
             
             // Delete via API
-            fetch('/api/entities/' + entityId + '/properties/float/' + key, { method: 'DELETE' })
+            fetch('api/entities/' + entityId + '/properties/float/' + key, { method: 'DELETE' })
             .then(res => {
                 if (res.status === 401) {
                     showNotification('Authentication required', 'info');
@@ -2419,7 +2535,7 @@
             const val = document.getElementById('newStringVal').value;
             if (!key) return;
             
-            fetch('/api/entities/' + entityId + '/properties/string/' + key, {
+            fetch('api/entities/' + entityId + '/properties/string/' + key, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ value: val })
@@ -2454,7 +2570,7 @@
             if (!entity) return;
             
             // Delete via API
-            fetch('/api/entities/' + entityId + '/properties/string/' + key, { method: 'DELETE' })
+            fetch('api/entities/' + entityId + '/properties/string/' + key, { method: 'DELETE' })
             .then(res => {
                 if (res.status === 401) {
                     showNotification('Authentication required', 'info');
@@ -2495,7 +2611,7 @@
             const generateSample = document.getElementById('generateSampleEntities').checked;
             
             try {
-                const res = await fetch('/api/world/create', {
+                const res = await fetch('api/world/create', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -2535,7 +2651,7 @@
                 btn.textContent = '💾 Saving...';
                 btn.disabled = true;
                 
-                const res = await fetch('/api/world/save', { method: 'POST' });
+                const res = await fetch('api/world/save', { method: 'POST' });
                 
                 // Check for auth required
                 if (res.status === 401) {
@@ -2566,7 +2682,7 @@
         
         async function loadWorld() {
             // First check if there's a save file
-            const statusRes = await fetch('/api/world/status');
+            const statusRes = await fetch('api/world/status');
             const statusData = await statusRes.json();
             
             if (!statusData.has_save) {
@@ -2582,7 +2698,7 @@
             }
             
             try {
-                const res = await fetch('/api/world/load', { method: 'POST' });
+                const res = await fetch('api/world/load', { method: 'POST' });
                 
                 // Check for auth required
                 if (res.status === 401) {
@@ -2609,9 +2725,9 @@
         async function loadWorldStatus() {
             try {
                 const [statusRes, worldRes, statsRes] = await Promise.all([
-                    fetch('/api/world/status'),
-                    fetch('/api/world'),
-                    fetch('/api/world/stats')
+                    fetch('api/world/status'),
+                    fetch('api/world'),
+                    fetch('api/world/stats')
                 ]);
                 const statusData = await statusRes.json();
                 const worldData = await worldRes.json();
@@ -2677,7 +2793,7 @@
         // Helper function to download files with auth check
         function downloadFile(url) {
             // First check if we're authenticated
-            fetch('/api/env/status')
+            fetch('api/env/status')
                 .then(res => res.json())
                 .then(data => {
                     if (data.has_password && !data.is_authenticated) {
@@ -2731,11 +2847,11 @@
             
             try {
                 // Fetch world save status
-                const worldRes = await fetch('/api/world/status');
+                const worldRes = await fetch('api/world/status');
                 const worldData = await worldRes.json();
                 
                 // Fetch existing backups
-                const backupsRes = await fetch('/api/backups');
+                const backupsRes = await fetch('api/backups');
                 const backupsData = await backupsRes.json();
                 const backups = backupsData.backups || [];
                 
@@ -2744,7 +2860,7 @@
                 // Fetch .env variables if authenticated
                 if (isAuthenticated()) {
                     try {
-                        const envRes = await fetch('/api/env/variables');
+                        const envRes = await fetch('api/env/variables');
                         const envData = await envRes.json();
                         if (envData.success && envData.variables) {
                             html += '<div style="margin-bottom: 15px;">';
@@ -2796,7 +2912,7 @@
                             <div style="font-weight: 600; font-size: 12px; color: #4ade80;">world_data/save.owbl</div>
                             <div style="font-size: 11px; color: #8ab4f8; margin-top: 2px;">${worldData.save_size_mb || '0.00 MB'} • Modified: ${worldData.save_modified || 'Unknown'}</div>
                         </div>
-                        <button class="btn btn-small" onclick="downloadFile('/api/world/save/download')">⬇️ Download</button>
+                        <button class="btn btn-small" onclick="downloadFile('api/world/save/download')">⬇️ Download</button>
                     </div>`;
                     html += `<div style="font-size: 10px; color: #6a8aaa; margin-top: 5px;">📋 Backup: save.owbl.bak (created before each save)</div>`;
                 } else {
@@ -2822,7 +2938,7 @@
                                 <div style="font-size: 11px; color: #8ab4f8; margin-top: 2px;">${backup.size_mb} • Modified: ${backup.modified || 'Unknown'}</div>
                             </div>
                             <div style="display: flex; gap: 8px;">
-                                <button class="btn btn-small" onclick="downloadFile('/api/backups/${backup.name}')">⬇️ Download</button>
+                                <button class="btn btn-small" onclick="downloadFile('api/backups/${backup.name}')">⬇️ Download</button>
                                 ${isLatest ? 
                                     '<button class="btn btn-small" disabled style="opacity: 0.5; cursor: not-allowed;" title="Cannot delete latest backup">🗑️ Delete</button>' :
                                     '<button class="btn btn-small" onclick="deleteBackup(\'' + backup.name + '\')" style="background: rgba(239,68,68,0.3); border-color: rgba(239,68,68,0.5);">🗑️ Delete</button>'
@@ -2834,7 +2950,7 @@
                 html += '</div>';
                 
                 // Source code files - fetch from API
-                const filesRes = await fetch('/api/files');
+                const filesRes = await fetch('api/files');
                 const filesData = await filesRes.json();
                 const files = filesData.files || [];
                 
@@ -2859,7 +2975,7 @@
                                 <span style="font-size: 12px;"><span>${icon}</span> <span>${f.path}</span></span>
                                 <div style="font-size: 10px; color: #5a7a9a;">${f.size_mb} • Modified: ${f.modified || 'Unknown'}</div>
                             </div>
-                            <button class="btn btn-small" onclick="downloadFile('/api/files/${f.path}')">⬇️</button>
+                            <button class="btn btn-small" onclick="downloadFile('api/files/${f.path}')">⬇️</button>
                         </div>`;
                     });
                 }
@@ -2876,7 +2992,7 @@
             content.innerHTML = '<div class="loading">Creating backup...</div>';
             
             try {
-                const res = await fetch('/api/backup/create', { method: 'POST' });
+                const res = await fetch('api/backup/create', { method: 'POST' });
                 
                 // Check for auth required
                 if (res.status === 401) {
@@ -2894,7 +3010,7 @@
                         <div style="color: #8ab4f8; font-size: 12px; margin-top: 5px;">${data.filename}</div>
                         <div style="color: #8ab4f8; font-size: 12px;">Size: ${data.size_mb}</div>
                         <div style="margin-top: 10px;">
-                            <button class="btn" onclick="downloadFile('/api/backups/${data.filename}')">⬇️ Download</button>
+                            <button class="btn" onclick="downloadFile('api/backups/${data.filename}')">⬇️ Download</button>
                             <button class="btn btn-secondary" style="margin-left: 5px;" onclick="loadFileList()">↩️ Refresh List</button>
                         </div>
                         <div style="color: #5a7a9a; font-size: 11px; margin-top: 8px;">Click "Refresh List" to see all backups</div>
@@ -2914,7 +3030,7 @@
             }
             
             try {
-                const res = await fetch('/api/backups/' + encodeURIComponent(filename), {
+                const res = await fetch('api/backups/' + encodeURIComponent(filename), {
                     method: 'DELETE'
                 });
                 
@@ -3003,7 +3119,7 @@
         // Check env status on load
         async function checkEnvStatus() {
             try {
-                const res = await fetch('/api/env/status');
+                const res = await fetch('api/env/status');
                 const data = await res.json();
                 if (data.success && data.needs_config) {
                     showEnvConfigDialog(data);
@@ -3084,7 +3200,7 @@
             }
             
             try {
-                const res = await fetch('/api/env/configure', {
+                const res = await fetch('api/env/configure', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(req)
@@ -3152,7 +3268,7 @@
             }
             
             try {
-                const res = await fetch('/api/env/verify-password', {
+                const res = await fetch('api/env/verify-password', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ password })
@@ -3253,7 +3369,7 @@
             }
             
             try {
-                const res = await fetch('/api/env/variables', {
+                const res = await fetch('api/env/variables', {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ variables })
@@ -3331,7 +3447,7 @@
             body.innerHTML = '<div class="loading">Loading context...</div>';
             
             try {
-                const res = await fetch('/api/entities/' + actionData.entityId + '/action/context');
+                const res = await fetch('api/entities/' + actionData.entityId + '/action/context');
                 if (res.status === 401) {
                     body.innerHTML = '<div class="action-warning">Authentication required. Please login first.</div>';
                     showPasswordUnlockDialog(() => loadActionContext());
@@ -3498,7 +3614,7 @@
             document.getElementById('actionModalTitle').textContent = '⚡ ' + actionData.entityName + ' - Step 2 of 3';
             
             try {
-                const res = await fetch('/api/entities/' + actionData.entityId + '/action/llm', {
+                const res = await fetch('api/entities/' + actionData.entityId + '/action/llm', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ context: actionData.context })
@@ -3646,7 +3762,7 @@
             document.getElementById('actionModalTitle').textContent = '⚡ ' + actionData.entityName + ' - Step 3 of 3';
             
             try {
-                const res = await fetch('/api/entities/' + actionData.entityId + '/action/process', {
+                const res = await fetch('api/entities/' + actionData.entityId + '/action/process', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
