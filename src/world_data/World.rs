@@ -394,7 +394,83 @@ impl World {
             }
         }
     }
-    
+
+    /// Sanitize int properties on system entities (`is_system_entity()`).
+    ///
+    /// Background: before `c7f3bc27` (fix(clock): protect system entities
+    /// from LLM effect writes), the LLM effect writer occasionally emitted
+    /// garbage values (e.g. `day = 2.5e9`, `history_entries = 3.8e18`) on
+    /// the world_clock entity. Those bad values were then auto-saved
+    /// faithfully, so even after the upstream fix, persisted worlds still
+    /// have the corruption visible via `/api/world`.
+    ///
+    /// This method resets any system-entity int property whose magnitude
+    /// exceeds a sane bound for that key. For the well-known clock keys
+    /// (`day`, `hour`, `actions_today`) the value is restored from the
+    /// current `world_time`; for all other system-entity int props the
+    /// value is reset to 0.
+    ///
+    /// Returns `(entity_id, key, old_value, new_value)` for every repair,
+    /// so callers can log the cleanup. Non-system entities are untouched.
+    pub fn sanitize_system_entities(&mut self) -> Vec<(Uuid, String, i64, i64)> {
+        // Sane magnitude bounds per key. Anything beyond these is the LLM
+        // garbage signature, not a realistic world value.
+        //   day:           < 10M (~27k years)
+        //   hour:          0..23
+        //   actions_today: < 1M
+        //   has_history:   0 or 1 (boolean)
+        //   is_recording:  0 or 1 (boolean)
+        //   last_recorded_day: < 10M
+        //   history_entries:   < 1M (count of recorded entries)
+        //   everything else:   < 1M (clock has no big counters)
+        const MAX_DAY: i64 = 10_000_000;
+        const MAX_HOUR: i64 = 23;
+        const MAX_ACTIONS_TODAY: i64 = 1_000_000;
+        const MAX_BOOL: i64 = 1;
+        const MAX_GENERAL: i64 = 1_000_000;
+
+        let mut repairs: Vec<(Uuid, String, i64, i64)> = Vec::new();
+
+        // Collect (id, key, old_val) first to avoid borrowck issues while
+        // mutating the entity map during the loop.
+        let mut to_fix: Vec<(Uuid, String, i64)> = Vec::new();
+        for (id, entity) in &self.entities {
+            if !entity.is_system_entity() {
+                continue;
+            }
+            for (key, val) in &entity.properties_int {
+                let sane_max = match key.as_str() {
+                    "day" => MAX_DAY,
+                    "hour" => MAX_HOUR,
+                    "actions_today" => MAX_ACTIONS_TODAY,
+                    "has_history" | "is_recording" => MAX_BOOL,
+                    "last_recorded_day" | "history_entries" => MAX_GENERAL,
+                    _ => MAX_GENERAL,
+                };
+                // Use unsigned magnitude to avoid i64::MIN.abs() overflow.
+                let magnitude = val.unsigned_abs();
+                if magnitude > sane_max as u64 {
+                    to_fix.push((*id, key.clone(), *val));
+                }
+            }
+        }
+
+        for (id, key, old_val) in to_fix {
+            let new_val: i64 = match key.as_str() {
+                "day" => self.world_time.day as i64,
+                "hour" => self.world_time.hour as i64,
+                "actions_today" => self.world_time.actions_today as i64,
+                _ => 0,
+            };
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.properties_int.insert(key.clone(), new_val);
+            }
+            repairs.push((id, key, old_val, new_val));
+        }
+
+        repairs
+    }
+
     /// Add an entity to the world
     pub fn add_entity(&mut self, entity: WorldEntity) -> Uuid {
         let id = entity.id;
@@ -774,13 +850,98 @@ mod tests {
         let mut world = World::new("Test");
         let king = WorldEntity::new("character", "King", 0.0, 0.0);
         let village = WorldEntity::new("location", "Village", 1.0, 0.0);
-        
+
         let king_id = world.add_entity(king);
         let village_id = world.add_entity(village);
-        
+
         world.transfer_ownership(&village_id, &king_id);
-        
+
         assert!(world.get_entity(&village_id).unwrap().owner_id == Some(king_id));
         assert!(world.get_entity(&king_id).unwrap().owned_entities.contains(&village_id));
+    }
+
+    #[test]
+    fn test_sanitize_system_entities_repairs_garbage_on_clock() {
+        // Reproduces the c7f3bc27 / 2df49bd8 scenario: a world_clock entity
+        // with int properties that have the LLM-garbage signature (values
+        // wildly outside the sane magnitude bounds). The sanitizer must
+        // detect and reset them.
+        let mut world = World::new("Test");
+        let clock_id = clock_entity_id();
+        // Wreck the clock with the exact kind of garbage observed in prod.
+        // (Some values overflow i64 — use i64::MAX/MIN to express the
+        // "definitely LLM garbage" magnitude in the i64 type.)
+        {
+            let clock = world.entities.get_mut(&clock_id).unwrap();
+            clock.set_int("day", 2_520_157_029);
+            clock.set_int("hour", i64::MAX);
+            clock.set_int("actions_today", i64::MIN);
+            clock.set_int("has_history", -4_320_000_000_000_000_000);
+            clock.set_int("history_entries", i64::MAX);
+            clock.set_int("last_recorded_day", 7_778_455_365_021_577_000);
+            clock.set_int("is_recording", 151_918_487);
+            clock.set_int("power", i64::MIN);
+        }
+
+        // world_time default: day=0, hour=8, actions_today=0.
+        let repairs = world.sanitize_system_entities();
+        assert!(
+            repairs.len() >= 6,
+            "expected the sanitizer to flag the garbage clock props, got {} repairs",
+            repairs.len()
+        );
+
+        let clock = world.entities.get(&clock_id).unwrap();
+        // Known clock keys are restored from world_time.
+        assert_eq!(clock.get_int("day").unwrap(), 0);
+        assert_eq!(clock.get_int("hour").unwrap(), 8);
+        assert_eq!(clock.get_int("actions_today").unwrap(), 0);
+        // Other system-entity int props are reset to 0.
+        assert_eq!(clock.get_int("has_history").unwrap(), 0);
+        assert_eq!(clock.get_int("history_entries").unwrap(), 0);
+        assert_eq!(clock.get_int("last_recorded_day").unwrap(), 0);
+        assert_eq!(clock.get_int("is_recording").unwrap(), 0);
+        assert_eq!(clock.get_int("power").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_sanitize_system_entities_leaves_non_system_entities_alone() {
+        // The sanitizer must only touch system entities. A regular
+        // character with a big int property should not be modified.
+        let mut world = World::new("Test");
+        let hero = WorldEntity::new("character", "Garruk the Mighty", 0.0, 0.0);
+        let hero_id = world.add_entity(hero);
+        world.entities.get_mut(&hero_id).unwrap().set_int("power", 5_000_000_000);
+
+        let repairs = world.sanitize_system_entities();
+        assert!(repairs.is_empty(), "non-system entities must not be sanitized");
+        assert_eq!(
+            world.entities.get(&hero_id).unwrap().get_int("power").unwrap(),
+            5_000_000_000,
+            "non-system entity power must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_system_entities_preserves_sane_values() {
+        // A clock with realistic values must not be touched.
+        let mut world = World::new("Test");
+        let clock_id = clock_entity_id();
+        {
+            let clock = world.entities.get_mut(&clock_id).unwrap();
+            clock.set_int("day", 1234);
+            clock.set_int("hour", 14);
+            clock.set_int("actions_today", 42);
+            clock.set_int("has_history", 1);
+        }
+
+        let repairs = world.sanitize_system_entities();
+        assert!(repairs.is_empty(), "sane clock values must not trigger repairs");
+
+        let clock = world.entities.get(&clock_id).unwrap();
+        assert_eq!(clock.get_int("day").unwrap(), 1234);
+        assert_eq!(clock.get_int("hour").unwrap(), 14);
+        assert_eq!(clock.get_int("actions_today").unwrap(), 42);
+        assert_eq!(clock.get_int("has_history").unwrap(), 1);
     }
 }

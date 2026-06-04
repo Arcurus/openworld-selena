@@ -3227,6 +3227,16 @@ async fn main() {
             Ok(mut w) => {
                 // Ensure clock entity exists (for old save files)
                 w.create_clock_entity();
+                // Sanitize int properties on system entities. This cleans
+                // up garbage values that were written by LLM effects before
+                // the c7f3bc27 upstream protection landed (todo 2df49bd8).
+                let repairs = w.sanitize_system_entities();
+                if !repairs.is_empty() {
+                    println!("🧹 Sanitized {} system-entity int property repair(s):", repairs.len());
+                    for (id, key, old, new) in &repairs {
+                        println!("   • {} :: {} :: {} -> {}", id, key, old, new);
+                    }
+                }
                 // Sync time from clock entity to world_time
                 w.sync_time_from_clock();
                 // Advance time based on real elapsed time since last save
