@@ -4272,3 +4272,200 @@ mod effect_guard_tests {
         assert!(float_oversize(f64::INFINITY));
     }
 }
+
+#[cfg(test)]
+mod history_summary_replace_tests {
+    use super::*;
+
+    fn r(old: &str, new: &str) -> HistorySummaryReplace {
+        HistorySummaryReplace {
+            old_part: old.to_string(),
+            new_part: new.to_string(),
+        }
+    }
+
+    // -- matrix row 1: old_part="" + existing summary + non-empty new_part → append --
+    #[test]
+    fn append_to_existing_summary() {
+        let result = apply_history_summary_replaces(
+            Some("hello world"),
+            &[r("", " (appended)")],
+            10_000,
+        );
+        assert_eq!(result.new_summary.as_deref(), Some("hello world (appended)"));
+        assert!(!result.truncated);
+        assert!(result.warnings.is_empty(), "no warning expected, got: {:?}", result.warnings);
+    }
+
+    // -- matrix row 2: old_part="" + None summary + non-empty new_part → new summary --
+    #[test]
+    fn empty_old_part_with_none_summary_creates_new() {
+        let result = apply_history_summary_replaces(
+            None,
+            &[r("", "fresh start")],
+            10_000,
+        );
+        assert_eq!(result.new_summary.as_deref(), Some("fresh start"));
+        assert!(!result.truncated);
+        assert!(result.warnings.is_empty());
+    }
+
+    // -- matrix row 3: old_part="" + non-empty new_part + Some("") summary → new summary --
+    // (Some("") is treated identically to None per the helper's contract)
+    #[test]
+    fn empty_old_part_with_empty_string_summary_creates_new() {
+        let result = apply_history_summary_replaces(
+            Some(""),
+            &[r("", "replacement")],
+            10_000,
+        );
+        assert_eq!(result.new_summary.as_deref(), Some("replacement"));
+    }
+
+    // -- matrix row 4: both old_part and new_part empty → no-op (Some("") result is
+    //    treated as no content, returns None per the empty-as-None rule) --
+    #[test]
+    fn both_empty_is_noop() {
+        let result = apply_history_summary_replaces(
+            Some("existing content"),
+            &[r("", "")],
+            10_000,
+        );
+        assert_eq!(result.new_summary.as_deref(), Some("existing content"));
+        assert!(!result.truncated);
+    }
+
+    // -- matrix row 5: non-empty old_part + found → first-occurrence replace --
+    #[test]
+    fn find_and_replace_works() {
+        let result = apply_history_summary_replaces(
+            Some("foo bar foo"),
+            &[r("foo", "BAZ")],
+            10_000,
+        );
+        // First occurrence replaced; second "foo" remains.
+        assert_eq!(result.new_summary.as_deref(), Some("BAZ bar foo"));
+        assert!(!result.truncated);
+        assert!(result.warnings.is_empty());
+    }
+
+    // -- matrix row 6: non-empty old_part + not found → warning, skip --
+    #[test]
+    fn not_found_logs_warning() {
+        let result = apply_history_summary_replaces(
+            Some("foo bar"),
+            &[r("DOES_NOT_EXIST", "X")],
+            10_000,
+        );
+        // No change to summary.
+        assert_eq!(result.new_summary.as_deref(), Some("foo bar"));
+        // Warning logged.
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("old_part not found"));
+    }
+
+    // -- matrix row 7: non-empty old_part + None summary → warning, skip --
+    #[test]
+    fn non_empty_old_part_with_none_summary_warns_and_skips() {
+        let result = apply_history_summary_replaces(
+            None,
+            &[r("X", "Y")],
+            10_000,
+        );
+        // No change (no summary to start with, can't search).
+        assert_eq!(result.new_summary, None);
+        // Warning logged.
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("current summary is empty"));
+    }
+
+    // -- matrix row 8: multi-replace chain (array) -- both apply in order --
+    #[test]
+    fn chain_of_replaces_applies_in_order() {
+        let result = apply_history_summary_replaces(
+            Some("foo bar"),
+            &[r("foo", "FOO"), r("bar", "BAR")],
+            10_000,
+        );
+        assert_eq!(result.new_summary.as_deref(), Some("FOO BAR"));
+        assert!(result.warnings.is_empty());
+    }
+
+    // -- matrix row 9: chain with one not-found in the middle -- other commands still apply --
+    #[test]
+    fn chain_with_not_found_in_middle_continues_with_rest() {
+        let result = apply_history_summary_replaces(
+            Some("foo bar"),
+            &[
+                r("foo", "FOO"),
+                r("DOES_NOT_EXIST", "X"),  // skipped with warning
+                r("bar", "BAR"),
+            ],
+            10_000,
+        );
+        // First and third still apply; second is skipped.
+        assert_eq!(result.new_summary.as_deref(), Some("FOO BAR"));
+        // One warning for the skipped command.
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("history_summary_replace[1]"));
+    }
+
+    // -- matrix row 10: empty old_part after a successful replace continues from new state --
+    #[test]
+    fn chain_with_empty_old_part_after_replace() {
+        let result = apply_history_summary_replaces(
+            Some("foo"),
+            &[
+                r("foo", "FOO"),           // state: "FOO"
+                r("", " (note)"),          // append: "FOO (note)"
+            ],
+            10_000,
+        );
+        assert_eq!(result.new_summary.as_deref(), Some("FOO (note)"));
+        assert!(result.warnings.is_empty());
+    }
+
+    // -- matrix row 11: truncation when result exceeds cap --
+    #[test]
+    fn truncation_when_over_cap() {
+        // Start with one char, replace with 200. Result is 200 chars.
+        // Cap is 100, so truncate to 99 + "…".
+        let result = apply_history_summary_replaces(
+            Some("x"),
+            &[r("x", &"y".repeat(200))],
+            100,
+        );
+        assert!(result.truncated);
+        assert!(result.warnings.iter().any(|w| w.contains("exceeded")));
+        // Truncated to cap-1 chars + "…".
+        let s = result.new_summary.unwrap();
+        assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), 100);
+    }
+
+    // -- matrix row 12: empty result after a successful "delete everything" is treated
+    //    as None (per the empty-as-None rule) --
+    #[test]
+    fn delete_to_empty_results_in_none() {
+        let result = apply_history_summary_replaces(
+            Some("ONLY_THIS"),
+            &[r("ONLY_THIS", "")],
+            10_000,
+        );
+        assert_eq!(result.new_summary, None);
+    }
+
+    // -- edge: into_vec on Single --
+    #[test]
+    fn one_or_many_into_vec_single() {
+        let one = HistorySummaryReplaceOneOrMany::Single(r("a", "b"));
+        assert_eq!(one.into_vec().len(), 1);
+    }
+
+    // -- edge: into_vec on Many --
+    #[test]
+    fn one_or_many_into_vec_many() {
+        let many = HistorySummaryReplaceOneOrMany::Many(vec![r("a", "b"), r("c", "d")]);
+        assert_eq!(many.into_vec().len(), 2);
+    }
+}
