@@ -1130,31 +1130,50 @@
         async function refreshEntities() {
             if (isLoading) return;
             isLoading = true;
-            
+
             const listEl = document.getElementById('entityList');
-            if (entities.length === 0) {
+            const hadEntities = entities.length > 0;
+            if (!hadEntities) {
                 listEl.innerHTML = '<div class="loading">Loading...</div>';
             }
-            
+
             try {
                 const params = new URLSearchParams();
                 const search = document.getElementById('searchInput').value;
                 const type = document.getElementById('typeFilter').value;
-                
+
                 if (search) params.set('q', search);
                 if (type) params.set('entity_type', type);
                 params.set('limit', '100');
-                
+
                 const data = await fetchAPI('/entities?' + params.toString());
-                entities = data.data || [];
-                
+                const fresh = data && data.data;
+
+                // Defensive: an empty response after the initial load
+                // shouldn't wipe the list.  Treat empty as 'not sure,
+                // keep the old data' and warn — that way the user's
+                // previous view (from before a transient hiccup) is
+                // preserved instead of the UI flashing "No entities
+                // to display" on the map and "No entities found" in
+                // the sidebar.  Only adopt an empty result on the
+                // initial load (when we have no prior data).
+                if (fresh && fresh.length > 0) {
+                    entities = fresh;
+                } else if (fresh && fresh.length === 0 && !hadEntities) {
+                    entities = [];
+                } else if (fresh && fresh.length === 0) {
+                    console.warn('refreshEntities got empty result; keeping last good list');
+                }
+
                 updateStats();
                 renderEntityList();
                 renderMap();
             } catch (e) {
+                console.error('refreshEntities failed:', e);
                 if (entities.length === 0) {
                     listEl.innerHTML = '<div class="error">Failed to load</div>';
                 }
+                // Otherwise keep showing the last successful state.
             } finally {
                 isLoading = false;
             }
@@ -1718,6 +1737,13 @@
         function closeEntityModal() {
             document.getElementById('entityModal').style.display = 'none';
             currentEditEntityId = null;
+            // Defensive re-render: any state drift while the modal was
+            // open (a stale 10s auto-refresh that returned an empty
+            // array, a race with another handler) shouldn't be visible
+            // when the user closes the modal.  Re-render both the list
+            // and the map so they're consistent with the current state.
+            renderEntityList();
+            renderMap();
         }
         
         function openEntityDetails(entityId) {
