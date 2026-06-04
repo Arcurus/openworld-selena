@@ -1218,6 +1218,13 @@ async fn get_entity_history(
 // replace should also cut if the new summary is too long and log a
 // warning."
 //
+// 2026-06-04: empty `old_part` is now an explicit "append" path
+// (`new_part` goes to the END of the current summary, or becomes the new
+// summary if there isn't one yet). No warning logged for append, per the
+// "no no warning just append" rule. This matches the convention used by
+// the LLM-emit `history_summary_replace` command so the API, CLI, and
+// LLM path all have the same affordances.
+//
 // Response shape (success):
 //   { success: true, history_summary, history_summary_chars,
 //     truncated: bool, warning: Option<String> }
@@ -1228,7 +1235,6 @@ async fn get_entity_history(
 //                         (also returned as success with no-op + warning,
 //                          depending on `not_found_is_error`; default is
 //                          warning for ergonomics)
-//   400 BAD_REQUEST     — empty old_part or new_part
 //   401 UNAUTHORIZED    — missing/invalid auth cookie
 #[derive(Debug, Deserialize)]
 struct HistorySummaryReplaceRequest {
@@ -1252,14 +1258,15 @@ async fn history_summary_replace_handler(
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
 
-    // Validate inputs: empty old_part is a no-op-prone footgun; empty
-    // new_part means "remove the old_part" (still a valid op).
-    if req.old_part.is_empty() {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            "old_part must be non-empty (use new_part=\"\u{2026}\" to delete)",
-        );
-    }
+    // 2026-06-04: empty `old_part` is now the explicit "append"
+    // convention — `new_part` is added to the end of the current
+    // summary (or becomes the new summary if there isn't one). Empty
+    // `new_part` is still a valid "delete" op. No warning logged
+    // for the append path; the only warning surfaced is for
+    // truncation, which is handled later in this handler.
+    //
+    // No 400 is returned for either field being empty; both are
+    // valid operations.
 
     let (max_cap, max_source) = {
         let world = state.world.read().await;
@@ -1279,40 +1286,60 @@ async fn history_summary_replace_handler(
 
         let current = entity.history_summary.clone().unwrap_or_default();
 
-        // Find the first occurrence. find() returns a char-boundary
-        // by definition, so the byte index is safe to slice at.
-        let match_byte_idx = current.find(&req.old_part);
-
-        let combined = match match_byte_idx {
-            Some(idx) => {
-                let end = idx + req.old_part.len();
+        // Build the combined string. Two paths:
+        //   1. `old_part` is empty → "append" path. `new_part` is
+        //      added to the end of the current summary (or becomes
+        //      the new summary if `current` is empty). No warning.
+        //   2. `old_part` is non-empty → find-replace path. Locate
+        //      the first occurrence of `old_part` in `current` and
+        //      substitute `new_part`. If not found, fall through to
+        //      the strict/lenient decision.
+        let combined = if req.old_part.is_empty() {
+            // Append convention.
+            if current.is_empty() {
+                // No current summary: new_part IS the new summary.
+                req.new_part.clone()
+            } else {
                 let mut s = String::with_capacity(current.len() + req.new_part.len());
-                s.push_str(&current[..idx]);
+                s.push_str(&current);
                 s.push_str(&req.new_part);
-                s.push_str(&current[end..]);
                 s
             }
-            None => {
-                // Not found. Strict or lenient?
-                if req.not_found_is_error {
-                    return error_json(
-                        StatusCode::NOT_FOUND,
-                        &format!(
-                            "old_part not found in current summary (length {})",
-                            current.len()
-                        ),
-                    );
+        } else {
+            // Find-replace path. find() returns a char-boundary by
+            // definition, so the byte index is safe to slice at.
+            let match_byte_idx = current.find(&req.old_part);
+            match match_byte_idx {
+                Some(idx) => {
+                    let end = idx + req.old_part.len();
+                    let mut s = String::with_capacity(current.len() + req.new_part.len());
+                    s.push_str(&current[..idx]);
+                    s.push_str(&req.new_part);
+                    s.push_str(&current[end..]);
+                    s
                 }
-                // Lenient: no-op, but warn so the caller knows nothing changed.
-                return success_json(serde_json::json!({
-                    "success": true,
-                    "history_summary": entity.history_summary,
-                    "history_summary_chars": current.len(),
-                    "truncated": false,
-                    "warning": "old_part not found in current summary; no change made",
-                    "max_chars": max_cap,
-                    "max_chars_source": max_source,
-                })).into_response();
+                None => {
+                    // Not found. Strict or lenient?
+                    if req.not_found_is_error {
+                        return error_json(
+                            StatusCode::NOT_FOUND,
+                            &format!(
+                                "old_part not found in current summary (length {})",
+                                current.len()
+                            ),
+                        );
+                    }
+                    // Lenient: no-op, but warn so the caller knows nothing changed.
+                    return success_json(serde_json::json!({
+                        "success": true,
+                        "history_summary": entity.history_summary,
+                        "history_summary_chars": current.len(),
+                        "truncated": false,
+                        "warning": "old_part not found in current summary; no change made",
+                        "max_chars": max_cap,
+                        "max_chars_source": max_source,
+                    })).into_response();
+                }
             }
         };
 
