@@ -732,6 +732,7 @@
                 <button class="btn" onclick="loadWorld()">📥 Load</button>
                 <button class="btn" onclick="openDocsModal()">📖 Docs</button>
                 <button class="btn" onclick="openFilesModal()">📁 Files</button>
+                <button class="btn" onclick="openLogsModal()" style="background: linear-gradient(135deg, rgba(99,102,241,0.6) 0%, rgba(79,70,229,0.7) 100%);">📜 Logs</button>
             </div>
         </header>
         
@@ -946,6 +947,32 @@
             </div>
             <div class="modal-body" style="max-height: 70vh; overflow-y: auto;">
                 <div id="filesContent"><div class="loading">Loading files...</div></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Per Arcurus 2026-06-04 (#openworld): "make a button in open world
+         selena where i can view the full world action log". One log file
+         per day (logs/llm-log-YYYY-MM-DD.log + logs/error-log-YYYY-MM-DD.log).
+         Default = today's llm-log, picked automatically. Switch files via
+         the sidebar; tail cap = 400 KB to keep the viewer snappy. -->
+    <div id="logsModal" class="modal-overlay" style="display: none;">
+        <div class="modal-content" style="max-width: 1100px; height: 80vh;">
+            <div class="modal-header">
+                <span>📜 World Action Logs <span id="logsCurrentFile" style="color: #5a7a9a; font-size: 12px; font-weight: 400; margin-left: 8px;"></span></span>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <button class="btn btn-small" onclick="refreshLogsModal()" style="padding: 2px 8px; font-size: 11px;">🔄 Refresh</button>
+                    <button class="modal-close" onclick="closeLogsModal()">&times;</button>
+                </div>
+            </div>
+            <div class="modal-body logs-modal-body" style="display: flex; gap: 12px; height: calc(80vh - 60px); padding: 12px;">
+                <div class="logs-sidebar" style="width: 280px; flex-shrink: 0; border: 1px solid rgba(100,150,255,0.2); border-radius: 6px; padding: 8px; overflow-y: auto; background: rgba(15,30,60,0.4);">
+                    <div style="color: #94a3b8; font-size: 11px; text-transform: uppercase; margin-bottom: 6px; font-weight: 600;">Files</div>
+                    <div id="logsFileList"><div class="loading" style="color: #5a7a9a; font-size: 11px;">Loading…</div></div>
+                </div>
+                <div class="logs-content" style="flex: 1; border: 1px solid rgba(100,150,255,0.2); border-radius: 6px; padding: 8px; overflow: auto; background: rgba(10,15,30,0.6); font-family: 'Menlo', 'Consolas', monospace; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;">
+                    <div id="logsContent" style="color: #cbd5e1;"><div class="loading">Pick a log file from the sidebar to view its contents.</div></div>
+                </div>
             </div>
         </div>
     </div>
@@ -2595,7 +2622,155 @@
         function closeFilesModal() {
             document.getElementById('filesModal').style.display = 'none';
         }
-        
+
+        // ============= Logs modal (per-day LLM call log) =============
+        // Per Arcurus 2026-06-04 (#openworld). Backed by
+        //   GET /api/logs          → list files (newest first)
+        //   GET /api/logs/:name?tail=200&max_bytes=400000 → tail view
+        // The viewer auto-selects today's llm-log on open. Sidebar shows
+        // all log files grouped by kind. Refresh re-pulls the file list
+        // AND the currently-selected file content.
+
+        let logsCurrentSelection = null;  // filename, e.g. "llm-log-2026-06-04.log"
+        let logsAllFiles = [];            // cache from /api/logs
+
+        async function openLogsModal() {
+            document.getElementById('logsModal').style.display = 'flex';
+            await refreshLogsModal();
+        }
+
+        function closeLogsModal() {
+            document.getElementById('logsModal').style.display = 'none';
+        }
+
+        async function refreshLogsModal() {
+            await loadLogsFileList();
+            if (logsCurrentSelection) {
+                await loadLogsFileContent(logsCurrentSelection);
+            }
+        }
+
+        async function loadLogsFileList() {
+            const listEl = document.getElementById('logsFileList');
+            listEl.innerHTML = '<div style="color: #5a7a9a; font-size: 11px;">Loading…</div>';
+            try {
+                const r = await fetch('api/logs', { credentials: 'include' });
+                if (!r.ok) {
+                    if (r.status === 401) {
+                        listEl.innerHTML = '<div style="color: #fbbf24; font-size: 11px; padding: 8px;">🔒 Auth required</div>';
+                        if (typeof showPasswordUnlockDialog === 'function') {
+                            showPasswordUnlockDialog(() => loadLogsFileList());
+                        }
+                        return;
+                    }
+                    throw new Error('HTTP ' + r.status);
+                }
+                const d = await r.json();
+                logsAllFiles = d.logs || [];
+                renderLogsFileList();
+                // If nothing's selected, default to today's llm-log
+                if (!logsCurrentSelection) {
+                    const today = new Date().toISOString().slice(0, 10);
+                    const todayLlm = logsAllFiles.find(f => f.name === 'llm-log-' + today + '.log');
+                    const fallback = todayLlm || logsAllFiles.find(f => f.kind === 'llm') || logsAllFiles[0];
+                    if (fallback) {
+                        logsCurrentSelection = fallback.name;
+                        await loadLogsFileContent(logsCurrentSelection);
+                    }
+                }
+            } catch (e) {
+                listEl.innerHTML = '<div style="color: #f87171; font-size: 11px;">Failed to list logs: ' + escapeHtml(String(e)) + '</div>';
+            }
+        }
+
+        function renderLogsFileList() {
+            const listEl = document.getElementById('logsFileList');
+            if (!logsAllFiles.length) {
+                listEl.innerHTML = '<div style="color: #5a7a9a; font-size: 11px;">No log files found.</div>';
+                return;
+            }
+            // Group by kind, then by date (descending)
+            const byKind = { llm: [], error: [], other: [] };
+            for (const f of logsAllFiles) {
+                (byKind[f.kind] || byKind.other).push(f);
+            }
+            let html = '';
+            for (const kind of ['llm', 'error', 'other']) {
+                const files = byKind[kind];
+                if (!files.length) continue;
+                const label = kind === 'llm' ? '🟦 LLM Call Log' : kind === 'error' ? '🟥 Error Log' : '⬜ Other';
+                html += '<div style="color: #94a3b8; font-size: 10px; text-transform: uppercase; margin: 8px 0 4px; font-weight: 600;">' + escapeHtml(label) + '</div>';
+                for (const f of files) {
+                    const isActive = f.name === logsCurrentSelection;
+                    const sizeKb = (f.size_bytes / 1024).toFixed(1);
+                    const dateMatch = f.name.match(/(\d{4}-\d{2}-\d{2})/);
+                    const dateStr = dateMatch ? dateMatch[1] : '';
+                    html += '<div onclick="selectLogFile(\'' + escapeAttr(f.name) + '\')" style="cursor: pointer; padding: 6px 8px; margin-bottom: 2px; border-radius: 4px; font-size: 11px; ' +
+                        (isActive
+                            ? 'background: rgba(99,102,241,0.25); border-left: 3px solid #6366f1; color: #e0e0e0;'
+                            : 'color: #cbd5e1; border-left: 3px solid transparent;') +
+                        '">';
+                    html += '<div style="font-family: monospace; font-size: 10px;">' + escapeHtml(dateStr || f.name) + '</div>';
+                    html += '<div style="display: flex; justify-content: space-between; color: #6a8aaa; font-size: 10px; margin-top: 2px;">';
+                    html += '<span>' + escapeHtml(f.kind === 'error' ? 'error' : 'llm') + '</span>';
+                    html += '<span>' + sizeKb + ' KB</span>';
+                    html += '</div></div>';
+                }
+            }
+            listEl.innerHTML = html;
+        }
+
+        async function selectLogFile(filename) {
+            logsCurrentSelection = filename;
+            renderLogsFileList();
+            await loadLogsFileContent(filename);
+        }
+
+        async function loadLogsFileContent(filename) {
+            const contentEl = document.getElementById('logsContent');
+            const headerEl = document.getElementById('logsCurrentFile');
+            contentEl.innerHTML = '<div style="color: #5a7a9a; font-size: 11px; padding: 12px;">Loading ' + escapeHtml(filename) + '…</div>';
+            headerEl.textContent = filename;
+            try {
+                // tail=200 lines OR last 400 KB, whichever is smaller
+                const url = 'api/logs/' + encodeURIComponent(filename) + '?tail=200&max_bytes=400000';
+                const r = await fetch(url, { credentials: 'include' });
+                if (!r.ok) {
+                    if (r.status === 401) {
+                        contentEl.innerHTML = '<div style="color: #fbbf24; font-size: 11px; padding: 12px;">🔒 Auth required</div>';
+                        if (typeof showPasswordUnlockDialog === 'function') {
+                            showPasswordUnlockDialog(() => loadLogsFileContent(filename));
+                        }
+                        return;
+                    }
+                    throw new Error('HTTP ' + r.status);
+                }
+                const d = await r.json();
+                const content = d.content || '';
+                const sizeKb = (d.size_bytes / 1024).toFixed(1);
+                let metaLine = sizeKb + ' KB total';
+                if (d.truncated) {
+                    metaLine += ' · showing last ' + (d.truncated_by || 'part') + ' · file is larger';
+                }
+                if (!content) {
+                    contentEl.innerHTML = '<div style="color: #5a7a9a; font-size: 11px; padding: 12px;">(empty log file)</div>';
+                } else {
+                    contentEl.innerHTML =
+                        '<div style="color: #5a7a9a; font-size: 10px; margin-bottom: 6px;">' + escapeHtml(metaLine) + '</div>' +
+                        escapeHtml(content);
+                    // Scroll to bottom (newest entries at the end, since file is append-only)
+                    const wrap = contentEl.parentElement;
+                    if (wrap) wrap.scrollTop = wrap.scrollHeight;
+                }
+            } catch (e) {
+                contentEl.innerHTML = '<div style="color: #f87171; font-size: 11px; padding: 12px;">Failed to load log: ' + escapeHtml(String(e)) + '</div>';
+            }
+        }
+
+        function escapeAttr(s) {
+            return String(s).replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+        }
+
         // New World modal
         function openNewWorldModal() {
             document.getElementById('newWorldModal').style.display = 'flex';

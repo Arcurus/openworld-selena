@@ -33,6 +33,114 @@ fn append_action_history_jsonl(entry: &ActionHistoryEntry) {
 }
 
 // ============================================================================
+// LLM call tracking — report to the central selena-api tracker
+// ============================================================================
+//
+// Open World's process_action_handler makes LLM calls.  We want those
+// calls to show up in the shared call-tracking / budget-alert system
+// (selena-project /api/llm-usage/*), so the per-project / per-provider
+// budget breakdown actually reflects OW's activity.
+//
+// We POST to /api/llm-usage/record with a static bearer token read
+// from the LLM_RECORD_TOKEN env var.  The call is fire-and-forget on
+// a detached tokio task so it never blocks the LLM response.
+//
+// If the selena-api is unreachable (network / 5xx / token mismatch),
+// we log a warning ONCE per process lifetime and continue.  Restart
+// the OW server to re-test the connection.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static LLM_TRACKING_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn tracking_url_and_token() -> (String, String) {
+    let base = std::env::var("SELENA_API_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8765".to_string());
+    let token = std::env::var("LLM_RECORD_TOKEN").unwrap_or_default();
+    (base.trim_end_matches('/').to_string(), token)
+}
+
+/// Fire-and-forget POST to /api/llm-usage/record.  Reads token + URL
+/// from env at call time so a config change doesn't require a recompile.
+fn record_llm_call_async(provider: String, model: String, project: String) {
+    tokio::spawn(async move {
+        let (base, token) = tracking_url_and_token();
+        if token.is_empty() {
+            // No token configured = tracking disabled.  Warn once.
+            if !LLM_TRACKING_WARNED.swap(true, Ordering::SeqCst) {
+                eprintln!(
+                    "[llm_tracking] LLM_RECORD_TOKEN is not set in the OW \
+                     server's env; LLM calls will NOT be reported to \
+                     selena-api. Per-project / per-provider budget \
+                     breakdowns will be inaccurate. Restart the OW server \
+                     after setting the token to re-test. \
+                     (provider={}, project={})",
+                    provider, project
+                );
+            }
+            return;
+        }
+        let url = format!(
+            "{}/api/llm-usage/record?provider={}&model={}&project={}",
+            base,
+            urlencoding::encode(&provider),
+            urlencoding::encode(&model),
+            urlencoding::encode(&project),
+        );
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn_tracking_once(&format!(
+                    "[llm_tracking] failed to build reqwest client: {} \
+                     (provider={}, project={})",
+                    e, provider, project
+                ));
+                return;
+            }
+        };
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                // success — reset the warned flag for future outages
+                LLM_TRACKING_WARNED.store(false, Ordering::SeqCst);
+            }
+            Ok(resp) => {
+                warn_tracking_once(&format!(
+                    "[llm_tracking] selena-api responded with HTTP {} \
+                     (URL: {}); per-project budget breakdown will be \
+                     inaccurate. Will retry on next call. \
+                     (provider={}, project={})",
+                    resp.status(), url, provider, project
+                ));
+            }
+            Err(e) => {
+                warn_tracking_once(&format!(
+                    "[llm_tracking] could not reach selena-api at {}: {}. \
+                     Per-project budget breakdown will be inaccurate until \
+                     the API is reachable. Will retry on next call. \
+                     (provider={}, project={})",
+                    base, e, provider, project
+                ));
+            }
+        }
+    });
+}
+
+fn warn_tracking_once(msg: &str) {
+    if !LLM_TRACKING_WARNED.swap(true, Ordering::SeqCst) {
+        eprintln!("{}", msg);
+    }
+}
+
+// ============================================================================
 // Logger (daily rotating logs for errors and LLM calls)
 // ============================================================================
 
@@ -89,10 +197,11 @@ impl DailyLogger {
 fn chrono_now_date() -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let secs = now.as_secs();
-    let days = secs / 86400;
-    // Unix epoch was Thursday (1970-01-01). Add days and offset to get YYYY-MM-DD.
-    // Using a simple approach: convert to broken-down time
-    let days_since_epoch = secs as i64;
+    // BUGFIX (2026-06-04): the previous version used `secs as i64` as
+    // `days_since_epoch`, which produced garbage years (~4.8M instead of
+    // 2026) and broke the one-log-per-day invariant in `DailyLogger`.
+    // The correct value is seconds divided by seconds-per-day.
+    let days_since_epoch = (secs / 86400) as i64;
     let mut year = 1970;
     let mut month = 1;
     let mut day = 1;
@@ -110,9 +219,15 @@ fn chrono_now_date() -> String {
     let mut dim = days_in_month.to_vec();
     if is_leap { dim[1] = 29; }
     for m in 0..12 {
-        if remaining < dim[m] { break; }
+        if remaining < dim[m] {
+            // We're inside month (m+1) — the remaining days are this month's.
+            // (Previously month was set only after subtraction, so breaking
+            //  on June left month=5=May. Bugfix 2026-06-04.)
+            month = (m + 1) as i64;
+            break;
+        }
         remaining -= dim[m];
-        month = m + 1;
+        month = (m + 1) as i64;
     }
     day = remaining as i64 + 1;
     format!("{:04}-{:02}-{:02}", year, month, day)
@@ -121,7 +236,10 @@ fn chrono_now_date() -> String {
 fn chrono_now_timestamp() -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let secs = now.as_secs();
-    let days_since_epoch = secs as i64;
+    // BUGFIX (2026-06-04): same as chrono_now_date — was using `secs` instead
+    // of `(secs / 86400)` for the day count, producing garbage years in
+    // log line timestamps. The HH:MM:SS part below was already correct.
+    let days_since_epoch = (secs / 86400) as i64;
     let mut year = 1970;
     let mut month = 1;
     let mut day = 1;
@@ -138,9 +256,13 @@ fn chrono_now_timestamp() -> String {
     let mut dim = days_in_month.to_vec();
     if is_leap { dim[1] = 29; }
     for m in 0..12 {
-        if remaining < dim[m] { break; }
+        if remaining < dim[m] {
+            // Same bugfix as chrono_now_date: set month before break.
+            month = (m + 1) as i64;
+            break;
+        }
         remaining -= dim[m];
-        month = m + 1;
+        month = (m + 1) as i64;
     }
     day = remaining as i64 + 1;
     let secs_of_day = secs % 86400;
@@ -1445,6 +1567,15 @@ async fn action_llm_handler(
                     &format!("Reasoning: {:?}", reasoning)
                 );
             }
+
+            // Report this LLM call back to the central selena-api tracker
+            // so per-project / per-provider / per-model budgets reflect OW.
+            // Fire-and-forget; does not block the response.
+            record_llm_call_async(
+                state.settings.llm.provider.clone(),
+                model.clone(),
+                "open-world".to_string(),
+            );
             
             success_json(serde_json::json!({
                 "success": true,
@@ -2871,6 +3002,195 @@ async fn list_backups_handler(
 }
 
 // ============================================================================
+// Log endpoints (LLM call log + error log, one file per day)
+// ============================================================================
+//
+// `DailyLogger` writes to `logs/llm-log-YYYY-MM-DD.log` and
+// `logs/error-log-YYYY-MM-DD.log`, with `ensure_today` rotating at midnight.
+// These endpoints expose that directory over the API so the web client can
+// show a "Logs" panel with a file picker + content viewer.
+//
+// Per Arcurus 2026-06-04 (#openworld): "make a button in open world selena
+// where i can view the full world action log".
+//
+// 2026-06-04 BUGFIX: `chrono_now_date` / `chrono_now_timestamp` were
+// dividing by 365 instead of 86400, producing year ~4.8M in filenames.
+// Fixed at the source; old broken files are still on disk but new writes
+// land in correctly-named per-day files. The endpoints below list both,
+// so the user can see the pre-fix history too.
+
+/// `GET /api/logs` — list all log files in `logs/`, sorted newest-first.
+/// Returns `{ success, count, logs: [{ name, size_bytes, modified,
+/// kind: "llm"|"error" }] }`.
+async fn list_logs_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    let dir = std::path::Path::new("logs");
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = match path.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                None => continue,
+            };
+            // Only show .log files (skip .log.bak, etc.)
+            if !name.ends_with(".log") {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                let modified = meta.modified().ok().map(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.to_rfc3339()
+                });
+                let kind = if name.starts_with("llm-log-") {
+                    "llm"
+                } else if name.starts_with("error-log-") {
+                    "error"
+                } else {
+                    "other"
+                };
+                entries.push(serde_json::json!({
+                    "name": name,
+                    "size_bytes": meta.len(),
+                    "modified": modified,
+                    "kind": kind,
+                }));
+            }
+        }
+    }
+    entries.sort_by(|a, b| {
+        let am = a.get("modified").and_then(|v| v.as_str()).unwrap_or("");
+        let bm = b.get("modified").and_then(|v| v.as_str()).unwrap_or("");
+        bm.cmp(am)
+    });
+    success_json(serde_json::json!({
+        "success": true,
+        "count": entries.len(),
+        "logs": entries,
+    })).into_response()
+}
+
+/// `GET /api/logs/:filename?tail=N&max_bytes=M` — return the content of a
+/// single log file, with optional `tail=N` (last N lines) and
+/// `max_bytes=M` (last M bytes) trimming for big files. Filename is
+/// sanitized: must start with `llm-log-` or `error-log-` and end with
+/// `.log`; no path traversal (`..`, `/`).
+async fn get_log_file_tail_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..")
+        || !(filename.starts_with("llm-log-") || filename.starts_with("error-log-"))
+        || !filename.ends_with(".log")
+    {
+        return error_json(StatusCode::BAD_REQUEST, "Invalid log filename");
+    }
+
+    let tail: Option<usize> = params.get("tail").and_then(|s| s.parse().ok());
+    let max_bytes: Option<usize> = params.get("max_bytes").and_then(|s| s.parse().ok());
+
+    let path = std::path::Path::new("logs").join(&filename);
+    if !path.exists() {
+        return error_json(StatusCode::NOT_FOUND, "Log file not found");
+    }
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) => return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read log: {}", e),
+        ),
+    };
+
+    let (content, truncated) = trim_log_content(&raw, tail, max_bytes);
+    let truncated_by = if truncated {
+        if let Some(t) = tail { format!("tail={}", t) }
+        else if let Some(m) = max_bytes { format!("max_bytes={}", m) }
+        else { "none".to_string() }
+    } else { "none".to_string() };
+
+    success_json(serde_json::json!({
+        "success": true,
+        "name": filename,
+        "size_bytes": raw.len(),
+        "content": content,
+        "truncated": truncated,
+        "truncated_by": truncated_by,
+    })).into_response()
+}
+
+/// Trim log content to the last `tail` lines OR the last `max_bytes`,
+/// whichever is more restrictive. Both are optional. Returns
+/// `(content, was_truncated)`.
+fn trim_log_content(
+    raw: &str,
+    tail: Option<usize>,
+    max_bytes: Option<usize>,
+) -> (String, bool) {
+    let mut out = raw.to_string();
+    let mut truncated = false;
+
+    if let Some(t) = tail {
+        let total_lines = out.matches('\n').count() + 1;
+        if total_lines > t {
+            // Skip the first (total_lines - t) lines.
+            let to_skip = total_lines - t;
+            let mut skipped = 0;
+            let mut start_idx = 0;
+            for (i, ch) in out.char_indices() {
+                if ch == '\n' {
+                    skipped += 1;
+                    if skipped == to_skip {
+                        start_idx = i + 1;
+                        break;
+                    }
+                }
+            }
+            out = out[start_idx..].to_string();
+            truncated = true;
+        }
+    }
+    if let Some(m) = max_bytes {
+        if out.len() > m {
+            // Keep last m bytes, but align to a UTF-8 char boundary.
+            let start = out.len() - m;
+            let aligned = floor_char_boundary(&out, start);
+            out = out[aligned..].to_string();
+            truncated = true;
+        }
+    }
+    (out, truncated)
+}
+
+/// Find the largest char-boundary index <= `idx` in `s`.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -3346,6 +3666,9 @@ async fn main() {
         .route("/api/backup/create", post(create_backup_handler))
         .route("/api/backups", get(get_backups_handler))
         .route("/api/files", get(get_files_handler))
+        // Log endpoints (per-day LLM call log + error log viewer)
+        .route("/api/logs", get(list_logs_handler))
+        .route("/api/logs/:filename", get(get_log_file_tail_handler))
         // World management endpoints
         .route("/api/world/save", post(save_world_handler))
         .route("/api/world/backup", post(backup_world_handler))
