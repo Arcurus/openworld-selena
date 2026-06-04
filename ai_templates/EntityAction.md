@@ -46,6 +46,7 @@ Respond ONLY with valid JSON (no other text before or after). Required fields:
   "effects": {{"property_name": change_value, ...}},
   "narrative": "a story-driven description of the action",
   "history_summary": "rolling summary, max {max_history_summary_chars} chars"
+  "history_summary_replace": {{"old_part": "current text to change", "new_part": "what to change it to"}}
 }}
 
 **`history_summary` rules (always include, every turn):**
@@ -57,5 +58,11 @@ Respond ONLY with valid JSON (no other text before or after). Required fields:
 - **Keep track of relations (1-3 sentences *per relation*):** for each recently-interacted entity, write **1-3 sentences** covering who you met, what you exchanged, how the relationship shifted, and whether it's an ally / rival / debt / unknown. Format as separate short lines per relation (e.g. `→ Mira the Scribe: …`). You may have several relations in the summary; the 1-3-sentence budget applies to *each* one, not the total. Drop stale relations to make room for new ones.
 - Keep it forward-looking: the next call's LLM will read this to plan the next action.
 - Do NOT include the action name of the current turn as if it already happened; write as if it's about to happen or has just been initiated.
+- **`history_summary_replace` (surgical edits, optional):** if you only need to change a small part of the current summary, use this instead of (or in addition to) `history_summary`. Value is one `{old_part, new_part}` object, or an array of such objects. Each pair replaces the first occurrence of `old_part` with `new_part` in the current summary, in order. An empty `old_part` (`""`) means "append `new_part` to the end". Result is truncated to {max_history_summary_chars} chars if needed.
+
+  Examples:
+  - `history_summary_replace: {{"old_part": "met Mira at the gate", "new_part": "reunited with Mira in the capital"}}`
+  - `history_summary_replace: [{{"old_part": "former ally of the elves", "new_part": "open conflict with the elves"}}, {{"old_part": "", "new_part": " (recent: dragon sighted)"}}]`
+  - `history_summary_replace: {{"old_part": "", "new_part": "World Clock ticks. Era continues."}}`
 </content>
 </invoke>
