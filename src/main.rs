@@ -2156,6 +2156,93 @@ pub struct ApplyReplaceResult {
 /// are treated identically (no current content to search or append to).
 ///
 /// See the behavior matrix above for the full semantics.
+///
+/// (Per Arcurus 2026-06-04 #openworld: the strict find() below was
+/// upgraded to use `find_replace_range` so a stray period or run of
+/// extra spaces in old_part does NOT trigger the 'old_part not found'
+/// warning. The warning should fire only when the phrase is truly
+/// absent or meaningfully different.)
+/// Find the byte range in `haystack` that matches `needle`, with light
+/// fuzziness for trivial mismatches:
+///
+///   1. Strict substring match (fast path).
+///   2. Whitespace-normalized match: collapse runs of whitespace to a
+///      single space on both sides, tokenize, and accept if a window of
+///      needle tokens appears as a contiguous subsequence of haystack
+///      tokens. This handles cases like "met  the  dragon" vs
+///      "met the dragon", or "  met the dragon" vs "met the dragon".
+///   3. Trailing-punctuation strip: if the normalized match still
+///      fails, strip trailing `.,;:!?"')` from each side of `needle`
+///      and try the strict match again. This handles "saw a dragon."
+///      vs "saw a dragon", or "scout, ready" vs "scout, ready."
+///
+/// Returns `(start, end)` byte indices in `haystack` (safe to slice on,
+/// since both branches land on token boundaries), or `None` if no
+/// match is found. No warnings are emitted by this helper — the caller
+/// decides what to do with `None`.
+///
+/// Implementation note: we tokenize manually (not via regex) so we
+/// keep the original byte positions for the slice. O(n) in haystack
+/// length, no allocations beyond a small Vec of token slices.
+fn find_replace_range(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    // 1. Strict match (fast path).
+    if let Some(idx) = haystack.find(needle) {
+        return Some((idx, idx + needle.len()));
+    }
+
+    // Tokenize: split on whitespace, keep byte ranges of each token
+    // in the original `s` so we can map back to byte positions.
+    // Free function (not a closure) to avoid lifetime elision issues.
+    fn tokenize(s: &str) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut token_start: Option<usize> = None;
+        for (i, c) in s.char_indices() {
+            if c.is_whitespace() {
+                if let Some(start) = token_start {
+                    out.push((start, i));
+                    token_start = None;
+                }
+            } else if token_start.is_none() {
+                token_start = Some(i);
+            }
+        }
+        if let Some(start) = token_start {
+            out.push((start, s.len()));
+        }
+        out
+    }
+
+    // 2. Whitespace-normalized match.
+    let h_tokens = tokenize(haystack);
+    let n_tokens = tokenize(needle);
+    if n_tokens.is_empty() || h_tokens.len() < n_tokens.len() {
+        // fall through to punctuation strip
+    } else {
+        'outer: for window in h_tokens.windows(n_tokens.len()) {
+            for (h, n) in window.iter().zip(n_tokens.iter()) {
+                if &haystack[h.0..h.1] != &needle[n.0..n.1] {
+                    continue 'outer;
+                }
+            }
+            let start = window.first().unwrap().0;
+            let end = window.last().unwrap().1;
+            return Some((start, end));
+        }
+    }
+
+    // 3. Trailing-punctuation strip on needle, then strict retry.
+    let n_stripped: &str = needle.trim_end_matches(|c: char| {
+        matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | ')')
+    });
+    if n_stripped != needle && !n_stripped.is_empty() {
+        if let Some(idx) = haystack.find(n_stripped) {
+            return Some((idx, idx + n_stripped.len()));
+        }
+    }
+
+    None
+}
+
 pub fn apply_history_summary_replaces(
     current: Option<&str>,
     replaces: &[HistorySummaryReplace],
@@ -2185,11 +2272,10 @@ pub fn apply_history_summary_replaces(
                 ));
                 continue;
             }
-            match state.find(&rep.old_part) {
-                Some(idx) => {
+            match find_replace_range(&state, &rep.old_part) {
+                Some((idx, end)) => {
                     // find() returns a char-boundary by definition,
                     // so the byte index is safe to slice at.
-                    let end = idx + rep.old_part.len();
                     let mut s = String::with_capacity(state.len() + rep.new_part.len());
                     s.push_str(&state[..idx]);
                     s.push_str(&rep.new_part);
@@ -2525,24 +2611,13 @@ async fn process_action_handler(
                         new_values.insert(prop_key.clone(), serde_json::json!(val));
                     }
                 }
-                
-                // Log to LLM log
-                let parsing_outcome = format!(
-                    "Applied {} effects. Warnings: {:?}",
-                    applied_effects.len(),
-                    warnings
-                );
-                if let Ok(mut logger) = state.logger.lock() {
-                    logger.ensure_today(&PathBuf::from("logs"));
-                    logger.log_llm(
-                        &format!("Process action for entity {}: {}", entity_id, action_data.action),
-                        raw_response,
-                        0,
-                        true,
-                        &parsing_outcome,
-                        &format!("Effects: {:?}", action_data.effects)
-                    );
-                }
+
+                // NOTE: log_llm() + history_entry build are deferred
+                // to AFTER the history_summary handling below, so the
+                // `warnings` vec they capture includes "Both" / "Neither"
+                // / truncation warnings. Moved per Arcurus 2026-06-04
+                // (#openworld): the old position logged `Warnings: []`
+                // because history_summary handling hadn't run yet.
 
                 // Record the action in the entity's in-memory history.
                 // Per Arcurus 2026-06-03 (#openworld): "create new file
@@ -2561,21 +2636,12 @@ async fn process_action_handler(
                     &action_data.outcome,
                 );
 
-                // Build the durable JSONL entry from data we have.  We
-                // must do this BEFORE releasing the &mut entity borrow
-                // (we need entity.name).
-                let history_entry = ActionHistoryEntry {
-                    entity_id: entity_id.to_string(),
-                    entity_name: entity.name.clone(),
-                    timestamp: history_timestamp,
-                    action: action_data.action.clone(),
-                    outcome: action_data.outcome.clone(),
-                    details: action_data.narrative.clone(),
-                    effects: action_data.effects.iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                    warnings: warnings.clone(),
-                };
+                // Build the durable JSONL entry. Deferred to AFTER
+                // history_summary handling so its `warnings` field
+                // captures the full set (including the "Both dropped"
+                // / "Neither skipped" / "truncated" warnings from
+                // apply_history_summary_replaces).
+                // see NOTE above — will be built right before log_llm().
 
                 // Apply the LLM-supplied history summary. Three cases
                 // (per Arcurus 2026-06-04 #openworld):
@@ -2656,6 +2722,43 @@ async fn process_action_handler(
                         "LLM history_summary exceeded {} chars; truncated.",
                         max_summary_chars
                     ));
+                }
+
+                // --- Deferred writes (history_entry + log_llm) ---
+                // Now that `warnings` is fully populated (effects
+                // warnings + history_summary "Both"/"Neither"/"truncated"
+                // warnings), build the durable JSONL entry and write
+                // the LLM log. This replaces the old position that
+                // ran BEFORE history_summary handling, where the
+                // logged warnings vec was always empty.
+                // (Per Arcurus 2026-06-04 #openworld.)
+                let history_entry = ActionHistoryEntry {
+                    entity_id: entity_id.to_string(),
+                    entity_name: entity.name.clone(),
+                    timestamp: history_timestamp,
+                    action: action_data.action.clone(),
+                    outcome: action_data.outcome.clone(),
+                    details: action_data.narrative.clone(),
+                    effects: action_data.effects.iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    warnings: warnings.clone(),
+                };
+                let parsing_outcome = format!(
+                    "Applied {} effects. Warnings: {:?}",
+                    applied_effects.len(),
+                    warnings
+                );
+                if let Ok(mut logger) = state.logger.lock() {
+                    logger.ensure_today(&PathBuf::from("logs"));
+                    logger.log_llm(
+                        &format!("Process action for entity {}: {}", entity_id, action_data.action),
+                        raw_response,
+                        0,
+                        true,
+                        &parsing_outcome,
+                        &format!("Effects: {:?}", action_data.effects)
+                    );
                 }
 
                 // Release the borrow by extracting the response payload.
@@ -4467,5 +4570,71 @@ mod history_summary_replace_tests {
     fn one_or_many_into_vec_many() {
         let many = HistorySummaryReplaceOneOrMany::Many(vec![r("a", "b"), r("c", "d")]);
         assert_eq!(many.into_vec().len(), 2);
+    }
+
+    // -- find_replace_range: strict matches --
+    #[test]
+    fn find_replace_range_strict_match() {
+        let h = "the hero met the dragon at dawn";
+        let r = find_replace_range(h, "met the dragon");
+        assert_eq!(r, Some((9, 23)));
+    }
+
+    #[test]
+    fn find_replace_range_strict_no_match() {
+        let h = "the hero met the dragon at dawn";
+        assert_eq!(find_replace_range(h, "killed the dragon"), None);
+    }
+
+    // -- find_replace_range: whitespace fuzziness --
+    #[test]
+    fn find_replace_range_collapses_extra_spaces() {
+        let h = "the hero met  the  dragon at dawn";   // double spaces in haystack
+        let r = find_replace_range(h, "met the dragon");
+        assert!(r.is_some(), "should match despite double spaces");
+        let (s, e) = r.unwrap();
+        assert_eq!(&h[s..e], "met  the  dragon"); // range covers the original
+    }
+
+    #[test]
+    fn find_replace_range_collapses_leading_trailing_spaces() {
+        let h = "met the dragon at dawn";
+        let r = find_replace_range(h, "  met the dragon  ");
+        assert!(r.is_some());
+    }
+
+    // -- find_replace_range: trailing-punctuation fuzziness --
+    #[test]
+    fn find_replace_range_strips_trailing_period() {
+        let h = "met the dragon at dawn";
+        // needle has a trailing period the haystack doesn't
+        let r = find_replace_range(h, "met the dragon.");
+        assert!(r.is_some(), "should match despite trailing period in needle");
+    }
+
+    #[test]
+    fn find_replace_range_strips_trailing_comma() {
+        let h = "scout, ready for orders";
+        let r = find_replace_range(h, "scout, ready,");
+        assert!(r.is_some());
+    }
+
+    // -- find_replace_range: still rejects when truly different --
+    #[test]
+    fn find_replace_range_rejects_meaningful_diff() {
+        let h = "the hero met the dragon at dawn";
+        // different word — should not match
+        assert_eq!(find_replace_range(h, "met a wyvern"), None);
+    }
+
+    // -- find_replace_range: empty needle returns Some(0,0) per Rust's
+    //    str::find semantics; the caller in apply_history_summary_replaces
+    //    already special-cases empty old_part in a separate branch
+    //    (the append path), so find_replace_range never sees "" in
+    //    production. Document the behavior so we don't regress. --
+    #[test]
+    fn find_replace_range_empty_needle_returns_zero_zero() {
+        let h = "the hero met the dragon";
+        assert_eq!(find_replace_range(h, ""), Some((0, 0)));
     }
 }
