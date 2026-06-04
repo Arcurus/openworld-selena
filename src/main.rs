@@ -2771,69 +2771,15 @@ async fn create_world_handler(
     // Safety net: snapshot the existing save before we overwrite it.
     let pre_snapshot = snapshot_save("pre-create");
     let mut world = World::new(&req.name);
-    
-    // Generate sample entities if requested
+
+    // Generate sample entities if requested.
+    // The 7 canonical sample entities (Oak Valley Village, Shadow Ridge
+    // Camp, Elder Moonthorn, Whisperwood Forest, Silverstream Keep,
+    // Ironforge Clan, Mira the Merchant) live in
+    // `World::seed_sample_entities()` — the only place their definitions
+    // should be edited. This endpoint is just a thin caller.
     if req.generate_sample {
-        use world_data::WorldEntity;
-        
-        // Oak Valley Village
-        let mut village = WorldEntity::new("location", "Oak Valley Village", 150.0, 250.0);
-        village.description = "A peaceful farming village.".to_string();
-        village.add_tag("village");
-        village.add_tag("peaceful");
-        village.add_tag("farming");
-        world.add_entity(village);
-        
-        // Shadow Ridge Camp
-        let mut bandit = WorldEntity::new("location", "Shadow Ridge Camp", 280.0, 320.0);
-        bandit.description = "Hidden bandit encampment.".to_string();
-        bandit.add_tag("bandit");
-        bandit.add_tag("dangerous");
-        bandit.add_tag("mountain");
-        bandit.set_int("power", 45);
-        bandit.set_int("wealth", 200);
-        bandit.set_int("black_mana", 80);
-        world.add_entity(bandit);
-        
-        // Elder Moonthorn
-        let mut elder = WorldEntity::new("character", "Elder Moonthorn", 145.0, 245.0);
-        elder.description = "Wise guardian of the forest.".to_string();
-        elder.add_tag("elf");
-        elder.add_tag("wise");
-        elder.add_tag("guardian");
-        world.add_entity(elder);
-        
-        // Whisperwood Forest
-        let mut forest = WorldEntity::new("location", "Whisperwood Forest", 140.0, 220.0);
-        forest.description = "Ancient forest with strange magic.".to_string();
-        forest.add_tag("forest");
-        forest.add_tag("magical");
-        forest.add_tag("ancient");
-        world.add_entity(forest);
-        
-        // Silverstream Keep
-        let mut keep = WorldEntity::new("location", "Silverstream Keep", 320.0, 180.0);
-        keep.description = "Fortified castle overlooking the river.".to_string();
-        keep.add_tag("castle");
-        keep.add_tag("royal");
-        keep.set_int("power", 100);
-        keep.set_int("wealth", 500);
-        world.add_entity(keep);
-        
-        // Ironforge Clan
-        let mut clan = WorldEntity::new("faction", "Ironforge Clan", 420.0, 350.0);
-        clan.description = "Mighty dwarven smiths and warriors.".to_string();
-        clan.add_tag("dwarven");
-        clan.add_tag("clan");
-        clan.add_tag("smiths");
-        world.add_entity(clan);
-        
-        // Mira the Merchant
-        let mut merchant = WorldEntity::new("character", "Mira the Merchant", 200.0, 290.0);
-        merchant.description = "Traveling merchant with exotic goods.".to_string();
-        merchant.add_tag("merchant");
-        merchant.add_tag("trader");
-        world.add_entity(merchant);
+        let _added = world.seed_sample_entities();
     }
     
     // Save the new world

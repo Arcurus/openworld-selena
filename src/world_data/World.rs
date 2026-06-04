@@ -321,6 +321,123 @@ impl World {
         world
     }
 
+    /// Seed the world with the 7 canonical sample entities described in
+    /// the README and `docs/world_entities.md`:
+    ///   Oak Valley Village, Shadow Ridge Camp, Elder Moonthorn,
+    ///   Whisperwood Forest, Silverstream Keep, Ironforge Clan,
+    ///   Mira the Merchant.
+    ///
+    /// **Idempotent**: entities whose (name, entity_type) already exist
+    /// are skipped. Safe to call on a fresh world OR on an existing
+    /// world that's missing one or more of the canonical entities.
+    ///
+    /// **NOT called from `World::new()`** — per Arcurus 2026-06-04,
+    /// fresh worlds start with just the world clock + the canonical
+    /// lore events (no auto-seeded entities). The web UI's
+    /// "Generate sample entities" button (and the
+    /// `POST /api/world/create?generate_sample=true` endpoint) call
+    /// this explicitly.
+    ///
+    /// Returns the number of entities actually added.
+    pub fn seed_sample_entities(&mut self) -> usize {
+        use WorldEntity;
+
+        fn make_location(name: &str, x: f64, y: f64, desc: &str, tags: &[&str]) -> WorldEntity {
+            let mut e = WorldEntity::new("location", name, x, y);
+            e.description = desc.to_string();
+            for t in tags {
+                e.add_tag(t);
+            }
+            e
+        }
+        fn make_character(name: &str, x: f64, y: f64, desc: &str, tags: &[&str]) -> WorldEntity {
+            let mut e = WorldEntity::new("character", name, x, y);
+            e.description = desc.to_string();
+            for t in tags {
+                e.add_tag(t);
+            }
+            e
+        }
+        fn make_faction(name: &str, x: f64, y: f64, desc: &str, tags: &[&str]) -> WorldEntity {
+            let mut e = WorldEntity::new("faction", name, x, y);
+            e.description = desc.to_string();
+            for t in tags {
+                e.add_tag(t);
+            }
+            e
+        }
+
+        // Tiny builders so the per-entity `.with_int(...)` calls read
+        // fluently. Equivalent to `e.set_int("power", 45)`.
+        trait IntInit {
+            fn with_int(self, key: &str, val: i64) -> Self;
+        }
+        impl IntInit for WorldEntity {
+            fn with_int(mut self, key: &str, val: i64) -> Self {
+                self.set_int(key, val);
+                self
+            }
+        }
+
+        let candidates: Vec<WorldEntity> = vec![
+            make_location(
+                "Oak Valley Village", 150.0, 250.0,
+                "A peaceful farming village.",
+                &["village", "peaceful", "farming"],
+            ),
+            make_location(
+                "Shadow Ridge Camp", 280.0, 320.0,
+                "Hidden bandit encampment.",
+                &["bandit", "dangerous", "mountain"],
+            )
+            .with_int("power", 45)
+            .with_int("wealth", 200)
+            .with_int("black_mana", 80),
+            make_character(
+                "Elder Moonthorn", 145.0, 245.0,
+                "Wise guardian of the forest.",
+                &["elf", "wise", "guardian"],
+            ),
+            make_location(
+                "Whisperwood Forest", 140.0, 220.0,
+                "Ancient forest with strange magic.",
+                &["forest", "magical", "ancient"],
+            ),
+            make_location(
+                "Silverstream Keep", 320.0, 180.0,
+                "Fortified castle overlooking the river.",
+                &["castle", "royal"],
+            )
+            .with_int("power", 100)
+            .with_int("wealth", 500),
+            make_faction(
+                "Ironforge Clan", 420.0, 350.0,
+                "Mighty dwarven smiths and warriors.",
+                &["dwarven", "clan", "smiths"],
+            ),
+            make_character(
+                "Mira the Merchant", 200.0, 290.0,
+                "Traveling merchant with exotic goods.",
+                &["merchant", "trader"],
+            ),
+        ];
+
+        let mut added = 0;
+        for ent in candidates {
+            // Skip if a same-named same-type entity already exists.
+            let dup = self.entities.values().any(|e| {
+                e.name.eq_ignore_ascii_case(&ent.name) && e.entity_type == ent.entity_type
+            });
+            if dup {
+                continue;
+            }
+            // Build with a fresh UUID via add_entity.
+            self.add_entity(ent);
+            added += 1;
+        }
+        added
+    }
+
     /// Seed the world with the canonical set of lore-based default events
     /// (the "Shadow Awakening" era described in `docs/world_lore.md` and
     /// `docs/world_events.md`). Idempotent: a no-op if the world already

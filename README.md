@@ -33,7 +33,7 @@ cargo run
 
 The server starts on `http://localhost:8080`.
 
-On first run, the world is created with 7 sample entities (Oak Valley Village, Shadow Ridge Camp, Whisperwood Forest, Silverstream Keep, Elder Moonthorn, Ironforge Clan, Mira the Merchant).
+On first run, the world is created with the **world clock** (time bookkeeping) + the canonical lore events from `docs/world_lore.md`. Per Arcurus 2026-06-04, fresh worlds do **not** auto-seed sample entities — call `World::seed_sample_entities()` (or the web UI's "Generate sample entities" button, or `POST /api/world/create?generate_sample=true`) to add the 7 canonical sample entities. See [`docs/world_entities.md`](docs/world_entities.md) for the full example roster (18 entities, with UUIDs, descriptions, tags, and properties).
 
 ---
 

@@ -1,8 +1,22 @@
 # World Entities
 
 *This file documents all entities in the world as a backup and reference.*
-*Last update: 2026-06-03 21:15 — 18 entities (7 canonical + 10 legendary).*
+*Last update: 2026-06-04 — 18 entities (7 canonical + 10 lore + 1 auto).*
 *Source of truth: `world_data/save.owbl` + this MD. The OW API is the live editor.*
+
+---
+
+## The Realm of Shadows (current world)
+
+- **Name:** `The Realm of Shadows` (from `settings.json → world.name`)
+- **Description:** *"A mysterious realm where shadows hold ancient secrets"* (from `settings.json → world.description`)
+- **Lore:** see [`docs/world_lore.md`](world_lore.md) for the full era, factions, and the Shadow Awakening arc.
+- **Origin:** the world was created on 2026-02-16 as the first Open World instance; entities were progressively added via the OW API and LLM-driven action cycles. The 7 canonical entities below (Group A) come from `World::seed_sample_entities()`; the 10 lore entities (Group B) were added in commit `a5cb4c8` (2026-06-03); World Clock (Group C) is auto-created on every `World::new()`.
+
+**Live counts** (from `GET /api/entities`, 2026-06-04):
+- Total: 18 entities
+- Legendary tier: 3 (Vaelthrix, Velora, World Clock)
+- Type breakdown: 7 locations, 5 characters, 2 factions, 2 heroes, 1 dragon, 1 artifact, 1 oracle, 1 world_clock, 1 location (Scribe is character; miscounted here, see roster below for ground truth)
 
 ---
 
