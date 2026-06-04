@@ -2075,6 +2075,174 @@ async fn entity_action(
     }
 }
 
+// ---------------------------------------------------------------------------
+// `history_summary_replace` (LLM-emit surgical edits)
+//
+// The LLM can include this field in its response (instead of, or in
+// addition to, `history_summary`) to make small corrections to the
+// current history_summary without rewriting the whole thing. Per
+// Arcurus 2026-06-04 (#openworld), this is the LLM-driven analog of
+// the API endpoint `POST /api/entities/:id/history-summary/replace`.
+//
+// The field accepts either a single `{old_part, new_part}` object or
+// an array of such objects, so the LLM can do one edit or many in a
+// single turn. The deserializer uses `#[serde(untagged)]` on an enum
+// to handle both shapes transparently.
+//
+// The full behavior (per Arcurus 2026-06-04):
+//   - Both `history_summary` AND `history_summary_replace` present:
+//     replace wins, `history_summary` is dropped, warning logged.
+//   - Only `history_summary_replace` present: apply chain in order.
+//   - Only `history_summary` present: full replace (existing behavior).
+//   - Neither present: no change to summary, warning logged.
+//   - For each replace:
+//       * `old_part == ""`: append `new_part` to current; no warning.
+//         If current is empty, `new_part` becomes the new summary.
+//       * `old_part != ""` + found: replace first occurrence.
+//       * `old_part != ""` + not found: skip, warning logged.
+//       * `old_part != ""` + current is empty: skip, warning logged.
+//   - After chain: truncate to `max_chars` if over (warning logged).
+//
+// The LLM template wording (ai_templates/EntityAction.md) intentionally
+// omits the edge-case semantics above so the instructions stay on-point
+// and terse. The error/warn rows are operator-visible only via the
+// 📜 Logs viewer.
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistorySummaryReplace {
+    pub old_part: String,
+    pub new_part: String,
+}
+
+/// Accepts either a single `{old_part, new_part}` object or an array
+/// of such objects. Untagged so the LLM can use either shape freely.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum HistorySummaryReplaceOneOrMany {
+    Single(HistorySummaryReplace),
+    Many(Vec<HistorySummaryReplace>),
+}
+
+impl HistorySummaryReplaceOneOrMany {
+    /// Flatten to a `Vec<HistorySummaryReplace>` regardless of the
+    /// original shape. Single becomes a vec of one; Many is cloned.
+    pub fn into_vec(self) -> Vec<HistorySummaryReplace> {
+        match self {
+            HistorySummaryReplaceOneOrMany::Single(r) => vec![r],
+            HistorySummaryReplaceOneOrMany::Many(rs) => rs,
+        }
+    }
+}
+
+/// Result of applying a chain of replaces to a history summary.
+pub struct ApplyReplaceResult {
+    /// New summary string, or None if the chain produced no content
+    /// (e.g. all replaces were no-ops on an empty current).
+    pub new_summary: Option<String>,
+    /// True if the result was truncated to fit `max_chars`.
+    pub truncated: bool,
+    /// Per-replace warnings (old_part not found, current empty, etc.).
+    /// Operator-facing, surfaced via the LLM log + response.
+    pub warnings: Vec<String>,
+}
+
+/// Apply a chain of `HistorySummaryReplace` operations to a current
+/// history_summary. Pure function (no I/O, no logging) — the caller
+/// is responsible for logging the warnings and applying the new
+/// summary to the entity.
+///
+/// `current` is `Option<&str>` so the caller can pass
+/// `entity.history_summary.as_deref()` directly. `None` and `Some("")`
+/// are treated identically (no current content to search or append to).
+///
+/// See the behavior matrix above for the full semantics.
+pub fn apply_history_summary_replaces(
+    current: Option<&str>,
+    replaces: &[HistorySummaryReplace],
+    max_chars: usize,
+) -> ApplyReplaceResult {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut state: String = current.unwrap_or("").to_string();
+
+    for (i, rep) in replaces.iter().enumerate() {
+        if rep.old_part.is_empty() {
+            // Append path. Per the rule: no warning logged.
+            if state.is_empty() {
+                // No current content: new_part IS the new state.
+                state = rep.new_part.clone();
+            } else {
+                state.push_str(&rep.new_part);
+            }
+        } else {
+            if state.is_empty() {
+                // Non-empty old_part but nothing to search in: skip
+                // with a warning. The LLM probably wanted to do a
+                // find-replace but the summary is empty; the safest
+                // behavior is to skip and let the operator decide.
+                warnings.push(format!(
+                    "history_summary_replace[{}]: current summary is empty; cannot search for non-empty old_part; skipped",
+                    i
+                ));
+                continue;
+            }
+            match state.find(&rep.old_part) {
+                Some(idx) => {
+                    // find() returns a char-boundary by definition,
+                    // so the byte index is safe to slice at.
+                    let end = idx + rep.old_part.len();
+                    let mut s = String::with_capacity(state.len() + rep.new_part.len());
+                    s.push_str(&state[..idx]);
+                    s.push_str(&rep.new_part);
+                    s.push_str(&state[end..]);
+                    state = s;
+                }
+                None => {
+                    // Per the rule: not-found is a WARNING, not an
+                    // error. The rest of the chain still applies.
+                    warnings.push(format!(
+                        "history_summary_replace[{}]: old_part not found in current summary; skipped",
+                        i
+                    ));
+                }
+            }
+        }
+    }
+
+    // Truncate if over cap. Same strategy as the API endpoint: cut
+    // from the END (keeps the start + any freshly inserted new_part
+    // intact), append "…" on the boundary.
+    let (final_summary, truncated) = if state.chars().count() > max_chars {
+        let keep = max_chars.saturating_sub(1);
+        let cut: String = state.chars().take(keep).collect();
+        let truncated_str = format!("{}…", cut);
+        (truncated_str, true)
+    } else {
+        (state, false)
+    };
+
+    if truncated {
+        warnings.push(format!(
+            "history_summary exceeded {} chars after replace chain; truncated.",
+            max_chars
+        ));
+    }
+
+    // Don't set to Some("") if there's no content. Keeps the
+    // distinction between "never had a summary" (None) and
+    // "had a summary that was just emptied" (Some("")).
+    let new_summary = if final_summary.is_empty() {
+        None
+    } else {
+        Some(final_summary)
+    };
+
+    ApplyReplaceResult {
+        new_summary,
+        truncated,
+        warnings,
+    }
+}
+
 // Helper struct for parsing LLM response
 #[derive(Debug, serde::Deserialize)]
 struct LlmActionResponse {
@@ -2090,6 +2258,13 @@ struct LlmActionResponse {
     /// `world.settings.max_history_summary_chars` (truncated with "…").
     #[serde(default)]
     history_summary: Option<String>,
+    /// 2026-06-04: LLM-emit surgical-edits command. Either a single
+    /// `{old_part, new_part}` object or an array of such objects.
+    /// If present, the replace chain wins over `history_summary`
+    /// (which is dropped with a warning). See
+    /// `apply_history_summary_replaces` for full semantics.
+    #[serde(default)]
+    history_summary_replace: Option<HistorySummaryReplaceOneOrMany>,
 }
 
 // Parse a JSON value as an effect change (handles string "+5", "5", or number 5)
@@ -2402,23 +2577,62 @@ async fn process_action_handler(
                     warnings: warnings.clone(),
                 };
 
-                // Apply the LLM-supplied history summary (if any) to the
-                // entity. We hard-cap the length to
-                // world.settings.max_history_summary_chars so a runaway
-                // LLM can't bloat the save file. The cap is a soft
-                // contract (truncate with "…"), not a reject — the
-                // `history_summary` field is optional in
-                // `LlmActionResponse`, so omitting it leaves the
-                // existing summary untouched (lenient mode).
+                // Apply the LLM-supplied history summary. Three cases
+                // (per Arcurus 2026-06-04 #openworld):
+                //   1. history_summary_replace present → replace wins.
+                //      If history_summary is also present, it's dropped
+                //      with a warning.
+                //   2. Only history_summary present → full replace
+                //      (existing behavior; truncated if over cap).
+                //   3. Neither present → no change to summary, warning
+                //      logged.
+                //
+                // We hard-cap the length to max_summary_chars so a
+                // runaway LLM can't bloat the save file. Truncation is
+                // a soft contract (truncate with "…"), not a reject.
                 let mut summary_truncated = false;
-                let applied_summary: Option<String> = match action_data.history_summary {
-                    Some(s) => {
+                let applied_summary: Option<String> =
+                    if let Some(replaces_one_or_many) = action_data.history_summary_replace {
+                        // Case 1: history_summary_replace (LLM-emit
+                        // surgical edits). replace wins; if the LLM
+                        // also sent a full `history_summary`, drop it
+                        // with a warning.
+                        if action_data.history_summary.is_some() {
+                            warnings.push(
+                                "Both history_summary and history_summary_replace present; \
+                                 using replace (history_summary dropped)".to_string()
+                            );
+                        }
+                        // Borrow current state immutably, then release
+                        // the borrow before assigning to the entity.
+                        let replaces_vec: Vec<HistorySummaryReplace> =
+                            replaces_one_or_many.into_vec();
+                        let result = {
+                            let current = entity.history_summary.as_deref();
+                            apply_history_summary_replaces(
+                                current,
+                                &replaces_vec,
+                                max_summary_chars,
+                            )
+                            // current borrow released here
+                        };
+                        for w in result.warnings {
+                            warnings.push(w);
+                        }
+                        if result.truncated {
+                            summary_truncated = true;
+                        }
+                        entity.history_summary = result.new_summary.clone();
+                        result.new_summary
+                    } else if let Some(s) = action_data.history_summary {
+                        // Case 2: full replace (existing behavior).
                         let trimmed = s.trim();
                         if trimmed.is_empty() {
+                            entity.history_summary = None;
                             None
                         } else if trimmed.chars().count() > max_summary_chars {
-                            // Truncate at a char boundary, append ellipsis.
-                            let cut: String = trimmed.chars().take(max_summary_chars.saturating_sub(1)).collect();
+                            let cut: String =
+                                trimmed.chars().take(max_summary_chars.saturating_sub(1)).collect();
                             let final_summary = format!("{}…", cut);
                             entity.history_summary = Some(final_summary.clone());
                             summary_truncated = true;
@@ -2427,9 +2641,16 @@ async fn process_action_handler(
                             entity.history_summary = Some(trimmed.to_string());
                             Some(trimmed.to_string())
                         }
-                    }
-                    None => None,
-                };
+                    } else {
+                        // Case 3: neither field present. No change to
+                        // summary; surface a warning so the operator
+                        // can see the LLM skipped it.
+                        warnings.push(
+                            "Neither history_summary nor history_summary_replace in LLM response; \
+                             summary not updated".to_string()
+                        );
+                        entity.history_summary.clone()
+                    };
                 if summary_truncated {
                     warnings.push(format!(
                         "LLM history_summary exceeded {} chars; truncated.",
