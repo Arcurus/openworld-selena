@@ -347,10 +347,13 @@ mod tests {
         entity.properties_int.insert("power".to_string(), 100);
         let id = entity.id;
         world.entities.insert(id, entity.clone());
-        let ctx = build_action_context(&world, &entity);
+        let ctx = build_action_context(&world, &entity, 500);
         assert!(ctx.prop_context.contains("power: 100"));
         assert!(ctx.power_tier_str.starts_with("Uncommon"));
         assert!(!ctx.nearby_entities_str.is_empty());
+        // Default global cap of 500 should be reflected since the test world
+        // has no per-world override (defaults to 0 → use global default).
+        assert_eq!(ctx.max_history_summary_chars, 500);
     }
 
     #[test]
