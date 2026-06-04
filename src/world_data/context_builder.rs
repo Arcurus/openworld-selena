@@ -43,6 +43,22 @@ pub fn resolve_max_history_summary_chars(world: &World, global_default: u32) -> 
     }
 }
 
+/// Same as `resolve_max_history_summary_chars` but also returns the
+/// *source* of the cap ("world" vs "global") so callers (e.g. the
+/// API layer) can tell the client which knob controls the value.
+/// Per Arcurus 2026-06-04: expose the cap on the entity API so the
+/// web client's History Summary card can show the real number.
+pub fn resolve_max_history_summary_chars_with_source(
+    world: &World,
+    global_default: u32,
+) -> (u32, &'static str) {
+    if world.settings.max_history_summary_chars > 0 {
+        (world.settings.max_history_summary_chars, "world")
+    } else {
+        (global_default, "global")
+    }
+}
+
 /// Build the full action context for an entity. Used by both
 /// `action_context_handler` and `entity_action` to keep their
 /// prompt construction in sync.

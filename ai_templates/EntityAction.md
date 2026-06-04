@@ -54,6 +54,7 @@ Respond ONLY with valid JSON (no other text before or after). Required fields:
 - Your summary can reference any past action if it matters for narrative continuity. Space is limited, so the impact of very old actions may be dropped if it won't fit in the summary. You decide what to keep.
 - Update it to reflect the new action you're taking. Don't just repeat the prior summary.
 - Mention the count or cadence of any dominant pattern you notice (e.g. "5th temple bell toll this week — leaning into ritual").
+- **Keep track of relations (1-3 sentences):** also include a short note about the entity's relations with the other entities it has recently interacted with — who you met, what you exchanged, how the relationship shifted, and whether it's an ally / rival / debt / unknown. Drop the relation if it's stale or no longer relevant; only mention interactions that still matter for the next decision.
 - Keep it forward-looking: the next call's LLM will read this to plan the next action.
 - Do NOT include the action name of the current turn as if it already happened; write as if it's about to happen or has just been initiated.
 </content>

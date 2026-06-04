@@ -1,6 +1,28 @@
 mod world_data;
 use crate::world_data::default_true;
 
+// ---------------------------------------------------------------------------
+// History-summary cap helper (shared by entity GET response + process_action)
+// ---------------------------------------------------------------------------
+//
+// `resolve_history_summary_cap_info` returns (effective_max, source) where
+// `source` is "world" (per-world override) or "global" (settings.json
+// default). Kept as a thin wrapper around
+// `context_builder::resolve_max_history_summary_chars_with_source` so the
+// same logic powers the LLM prompt, the process_action truncation, and
+// the entity API response.
+fn resolve_history_summary_cap_info(
+    state: &AppState,
+    world: &World,
+) -> (u32, String) {
+    let (cap, src) = context_builder::resolve_max_history_summary_chars_with_source(
+        world,
+        state.settings.llm.default_max_history_summary_chars,
+    );
+    (cap, src.to_string())
+}
+
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
@@ -326,7 +348,7 @@ struct LlmSettings {
     /// Global default for the per-entity `history_summary` cap.
     /// Per-world `WorldSettings.max_history_summary_chars` may override
     /// this; a value of 0 in WorldSettings means "use this global default".
-    /// Default: 2000 chars.
+    /// Default: 10000 chars.
     #[serde(default = "default_max_history_summary_chars")]
     default_max_history_summary_chars: u32,
 }
@@ -356,7 +378,7 @@ fn default_max_calls_per_hour() -> u32 {
 }
 
 fn default_max_history_summary_chars() -> u32 {
-    2000
+    10000
 }
 
 // ============================================================================
@@ -576,6 +598,19 @@ struct EntityResponse {
     success: bool,
     data: Option<WorldEntity>,
     error: Option<String>,
+    /// Resolved effective cap (per-world override, or global default from
+    /// settings.json). 0 means "use the global default" — clients should
+    /// treat 0 as "unknown" and fall back to the LLM template's value.
+    /// Added 2026-06-04 so the web client can show the real cap on the
+    /// 📋 History Summary card instead of hard-coding "~500".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_history_summary_chars: Option<u32>,
+    /// The source of the cap: "world" (per-world override), "global"
+    /// (settings.json default), or "fallback" (no global, using the
+    /// hard-coded default in code). Helps the UI explain which knob
+    /// controls the cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_history_summary_source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1104,12 +1139,15 @@ async fn get_entity(
     AxumPath(id): AxumPath<Uuid>,
 ) -> Response {
     let world = state.world.read().await;
+    let (max_cap, max_source) = resolve_history_summary_cap_info(&state, &world);
 
     match world.get_entity(&id) {
         Some(entity) => success_json(EntityResponse {
             success: true,
             data: Some(entity.clone()),
             error: None,
+            max_history_summary_chars: Some(max_cap),
+            max_history_summary_source: Some(max_source),
         }).into_response(),
         None => error_json(StatusCode::NOT_FOUND, "Entity not found"),
     }
@@ -1162,6 +1200,191 @@ async fn get_entity_history(
     })).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// History-summary partial replace
+// ---------------------------------------------------------------------------
+//
+// `POST /api/entities/:id/history-summary/replace`
+// Body: { "old_part": "...", "new_part": "..." }
+//
+// Finds `old_part` in the entity's current `history_summary` (the FIRST
+// occurrence, case-sensitive), replaces it with `new_part`, then truncates
+// the result to the effective cap if it goes over. The cap is the same
+// resolved cap as for process_action (per-world override or global
+// default), and a warning is added to the response if truncation happened.
+//
+// Per Arcurus 2026-06-04 (#openworld): "add a way to replace one part of
+// the history with another one instead of replacing the full one. the
+// replace should also cut if the new summary is too long and log a
+// warning."
+//
+// Response shape (success):
+//   { success: true, history_summary, history_summary_chars,
+//     truncated: bool, warning: Option<String> }
+//
+// Errors:
+//   404 NOT_FOUND       — entity doesn't exist
+//   404 NOT_FOUND       — `old_part` not found in current summary
+//                         (also returned as success with no-op + warning,
+//                          depending on `not_found_is_error`; default is
+//                          warning for ergonomics)
+//   400 BAD_REQUEST     — empty old_part or new_part
+//   401 UNAUTHORIZED    — missing/invalid auth cookie
+#[derive(Debug, Deserialize)]
+struct HistorySummaryReplaceRequest {
+    old_part: String,
+    new_part: String,
+    /// If true (default false), `old_part` not in summary returns 404
+    /// instead of warning. Default is warning so the UI can be lenient.
+    #[serde(default)]
+    not_found_is_error: bool,
+}
+
+async fn history_summary_replace_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(req): Json<HistorySummaryReplaceRequest>,
+) -> Response {
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+
+    // Validate inputs: empty old_part is a no-op-prone footgun; empty
+    // new_part means "remove the old_part" (still a valid op).
+    if req.old_part.is_empty() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "old_part must be non-empty (use new_part=\"\u{2026}\" to delete)",
+        );
+    }
+
+    let (max_cap, max_source) = {
+        let world = state.world.read().await;
+        resolve_history_summary_cap_info(&state, &world)
+    };
+
+    let mut world = state.world.write().await;
+
+    // Do all the entity mutations inside a block so the &mut borrow
+    // on `entity` is released before we call save_world(&world) and
+    // log_error (both of which would conflict with the live borrow).
+    let (final_summary, truncated, entity_name_for_log) = {
+        let entity = match world.get_entity_mut(&id) {
+            Some(e) => e,
+            None => return error_json(StatusCode::NOT_FOUND, "Entity not found"),
+        };
+
+        let current = entity.history_summary.clone().unwrap_or_default();
+
+        // Find the first occurrence. find() returns a char-boundary
+        // by definition, so the byte index is safe to slice at.
+        let match_byte_idx = current.find(&req.old_part);
+
+        let combined = match match_byte_idx {
+            Some(idx) => {
+                let end = idx + req.old_part.len();
+                let mut s = String::with_capacity(current.len() + req.new_part.len());
+                s.push_str(&current[..idx]);
+                s.push_str(&req.new_part);
+                s.push_str(&current[end..]);
+                s
+            }
+            None => {
+                // Not found. Strict or lenient?
+                if req.not_found_is_error {
+                    return error_json(
+                        StatusCode::NOT_FOUND,
+                        &format!(
+                            "old_part not found in current summary (length {})",
+                            current.len()
+                        ),
+                    );
+                }
+                // Lenient: no-op, but warn so the caller knows nothing changed.
+                return success_json(serde_json::json!({
+                    "success": true,
+                    "history_summary": entity.history_summary,
+                    "history_summary_chars": current.len(),
+                    "truncated": false,
+                    "warning": "old_part not found in current summary; no change made",
+                    "max_chars": max_cap,
+                    "max_chars_source": max_source,
+                })).into_response();
+            }
+        };
+
+        // Truncate if over cap. Cut from the END (keeps the start + the
+        // freshly inserted new_part intact, which is the part the caller
+        // just edited). Append "…" on the truncation boundary.
+        let (final_summary, truncated) = if combined.chars().count() > max_cap as usize {
+            // Keep the first (cap-1) chars, then append ellipsis.
+            let keep = (max_cap as usize).saturating_sub(1);
+            let cut: String = combined.chars().take(keep).collect();
+            let truncated_str = format!("{}…", cut);
+            (truncated_str, true)
+        } else {
+            (combined, false)
+        };
+
+        entity.history_summary = Some(final_summary.clone());
+        (final_summary, truncated, entity.name.clone())
+        // entity borrow released at end of block
+    };
+
+    // Persist to save.owbl so the replace survives a restart.
+    if let Err(e) = BinaryPersistence::save_world(&world, &state.save_path) {
+        // Don't fail the request — the in-memory state is already updated.
+        // Just surface a warning.
+        return success_json(serde_json::json!({
+            "success": true,
+            "history_summary": final_summary,
+            "history_summary_chars": final_summary.chars().count(),
+            "truncated": truncated,
+            "warning": format!("In-memory summary updated, but save failed: {}", e),
+            "max_chars": max_cap,
+            "max_chars_source": max_source,
+        })).into_response();
+    }
+
+    // Build a warning string when truncated so the caller can see it
+    // (and the on-disk log gets a matching entry).
+    let mut warnings: Vec<String> = Vec::new();
+    if truncated {
+        warnings.push(format!(
+            "history_summary exceeded {} chars after replace; truncated to {}+'…'",
+            max_cap, max_cap - 1
+        ));
+    }
+
+    // Mirror the warning to the error log so the truncation is
+    // discoverable via /api/logs as well as the API response.
+    if !warnings.is_empty() {
+        if let Ok(mut logger) = state.logger.lock() {
+            logger.ensure_today(&PathBuf::from("logs"));
+            for w in &warnings {
+                logger.log_error(&format!(
+                    "[history-summary-replace] entity={} (id={}): {}",
+                    entity_name_for_log, id, w
+                ));
+            }
+        }
+    }
+
+    success_json(serde_json::json!({
+        "success": true,
+        "history_summary": final_summary,
+        "history_summary_chars": final_summary.chars().count(),
+        "truncated": truncated,
+        "warning": warnings.first().cloned(),
+        "max_chars": max_cap,
+        "max_chars_source": max_source,
+    })).into_response()
+}
+
+
 async fn create_entity(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1211,7 +1434,8 @@ async fn update_entity(
     }
     
     let mut world = state.world.write().await;
-    
+    let (max_cap, max_source) = resolve_history_summary_cap_info(&state, &world);
+
     match world.get_entity_mut(&id) {
         Some(entity) => {
             if let Some(name) = req.name {
@@ -1234,6 +1458,8 @@ async fn update_entity(
                 success: true,
                 data: Some(entity.clone()),
                 error: None,
+                max_history_summary_chars: Some(max_cap),
+                max_history_summary_source: Some(max_source),
             }).into_response()
         }
         None => error_json(StatusCode::NOT_FOUND, "Entity not found"),
@@ -1383,7 +1609,7 @@ async fn action_llm_handler(
             logger.ensure_today(&PathBuf::from("logs"));
             logger.log_error(&err);
             logger.log_llm(
-                &format!("LLM call for entity {} ({})", id, entity_name),
+                &req.context,
                 "",
                 0,
                 false,
@@ -1448,7 +1674,7 @@ async fn action_llm_handler(
                         logger.ensure_today(&PathBuf::from("logs"));
                         logger.log_error(&err);
                         logger.log_llm(
-                            &format!("LLM call for entity {} ({})", id, entity_name),
+                            &req.context,
                             &body_text,
                             elapsed_ms,
                             false,
@@ -1476,7 +1702,7 @@ async fn action_llm_handler(
                             logger.ensure_today(&PathBuf::from("logs"));
                             logger.log_error(&err);
                             logger.log_llm(
-                                &format!("LLM call for entity {} ({})", id, entity_name),
+                                &req.context,
                                 &body_text,
                                 elapsed_ms,
                                 false,
@@ -1538,7 +1764,7 @@ async fn action_llm_handler(
                     logger.ensure_today(&PathBuf::from("logs"));
                     logger.log_error(&err);
                     logger.log_llm(
-                        &format!("LLM call for entity {} ({})", id, entity_name),
+                        &req.context,
                         &body_text,
                         elapsed_ms,
                         false,
@@ -1559,7 +1785,7 @@ async fn action_llm_handler(
             if let Ok(mut logger) = state.logger.lock() {
                 logger.ensure_today(&PathBuf::from("logs"));
                 logger.log_llm(
-                    &format!("LLM call for entity {} ({})", id, entity_name),
+                    &req.context,
                     &raw_response,
                     elapsed_ms,
                     true,
@@ -1593,7 +1819,7 @@ async fn action_llm_handler(
                 logger.ensure_today(&PathBuf::from("logs"));
                 logger.log_error(&err);
                 logger.log_llm(
-                    &format!("LLM call for entity {} ({})", id, entity_name),
+                    &req.context,
                     "",
                     elapsed_ms,
                     false,
@@ -1715,9 +1941,25 @@ async fn entity_action(
             if !res.status().is_success() {
                 let status = res.status().to_string();
                 let body = res.text().await.unwrap_or_default();
+                let err = format!("LLM API error: {} - {}", status, body);
+                // Log the full prompt + the API error so the failure is
+                // discoverable via the 📜 Logs viewer (per Arcurus 2026-06-04:
+                // 'log the full call instructions not only the results').
+                if let Ok(mut logger) = state.logger.lock() {
+                    logger.ensure_today(&PathBuf::from("logs"));
+                    logger.log_error(&err);
+                    logger.log_llm(
+                        &prompt,
+                        &body,
+                        0,
+                        false,
+                        &err,
+                        &format!("Status: {} (entity_action)", status),
+                    );
+                }
                 return success_json(serde_json::json!({
                     "success": false,
-                    "error": format!("LLM API error: {} - {}", status, body),
+                    "error": err,
                     "debug": {
                         "entity_id": id.to_string(),
                         "entity_name": entity.name,
@@ -3644,6 +3886,7 @@ async fn main() {
         .route("/api/entities/:id", put(update_entity))
         .route("/api/entities/:id", axum::routing::delete(delete_entity))
         .route("/api/entities/:id/history", get(get_entity_history))
+        .route("/api/entities/:id/history-summary/replace", post(history_summary_replace_handler))
         .route("/api/entities/:id/action", post(entity_action))
         .route("/api/entities/:id/action/context", get(action_context_handler))
         .route("/api/entities/:id/action/llm", post(action_llm_handler))
