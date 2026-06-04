@@ -15,7 +15,8 @@ use std::io::{Read, Write, BufReader, BufWriter};
 /// [N bytes: binary data]
 
 const MAGIC: &[u8; 4] = b"OWBL"; // Open World Binary
-const VERSION: u32 = 2; // Increment when world format changes
+const VERSION: u32 = 3; // Increment when world format changes
+                         // v2 → v3: added max_history_summary_chars to WorldSettings
 const ENTITY_VERSION: u32 = 1; // Increment when entity format changes
 
 pub struct BinaryPersistence;
@@ -134,6 +135,7 @@ impl BinaryPersistence {
         Self::write_u64(world.settings.auto_save_interval_secs as u64, &mut data);
         Self::write_f64(world.settings.history_entries_fully_displayed as f64, &mut data);
         Self::write_f64(world.settings.history_entries_shortened as f64, &mut data);
+        Self::write_u64(world.settings.max_history_summary_chars as u64, &mut data);
 
         // Last world action
         Self::write_option_datetime(world.last_world_action, &mut data);
@@ -396,6 +398,14 @@ impl BinaryPersistence {
         }
 
         use super::WorldSettings;
+        // v3 added max_history_summary_chars to WorldSettings. For
+        // older saves (v1/v2) we fall back to the default so a
+        // downgrade is graceful.
+        let max_history_summary_chars = if version >= 3 {
+            Self::read_u64(data, &mut pos) as u32
+        } else {
+            WorldSettings::default().max_history_summary_chars
+        };
         let settings = WorldSettings {
             actions_per_year: Self::read_f64(data, &mut pos) as u32,
             tick_action_enabled: Self::read_bool(data, &mut pos),
@@ -406,6 +416,7 @@ impl BinaryPersistence {
             auto_save_interval_secs: Self::read_u64(data, &mut pos),
             history_entries_fully_displayed: Self::read_f64(data, &mut pos) as u32,
             history_entries_shortened: Self::read_f64(data, &mut pos) as u32,
+            max_history_summary_chars,
         };
 
         let last_world_action = Self::read_option_datetime(data, &mut pos);

@@ -21,6 +21,12 @@ pub struct ActionContext {
     pub nearby_entities_str: String,
     pub power_tier_str: String,
     pub world_events_str: String,
+    /// Current history_summary for the entity (or a placeholder
+    /// when none exists yet). Goes into `{history_summary}`.
+    pub history_summary_str: String,
+    /// Max characters the LLM may use for the summary it returns.
+    /// Goes into `{max_history_summary_chars}`.
+    pub max_history_summary_chars: u32,
 }
 
 /// Build the full action context for an entity. Used by both
@@ -36,6 +42,9 @@ pub fn build_action_context(world: &World, entity: &WorldEntity) -> ActionContex
         nearby_entities_str: build_nearby_entities_str(world, entity),
         power_tier_str: build_power_tier_str(entity),
         world_events_str: build_world_events_str(world),
+        history_summary_str: entity.history_summary.clone()
+            .unwrap_or_else(|| "(no history summary yet)".to_string()),
+        max_history_summary_chars: world.settings.max_history_summary_chars,
     }
 }
 
@@ -59,6 +68,8 @@ pub fn build_action_prompt(
         .replace("{entity_history}", &ctx.entity_history_str)
         .replace("{nearby_entities}", &ctx.nearby_entities_str)
         .replace("{world_events}", &ctx.world_events_str)
+        .replace("{history_summary}", &ctx.history_summary_str)
+        .replace("{max_history_summary_chars}", &ctx.max_history_summary_chars.to_string())
 }
 
 fn build_property_context(entity: &WorldEntity, type_stats: Option<&EntityTypeStats>) -> String {
@@ -330,12 +341,14 @@ mod tests {
             nearby_entities_str: "near".to_string(),
             power_tier_str: "tier".to_string(),
             world_events_str: "events".to_string(),
+            history_summary_str: "summary".to_string(),
+            max_history_summary_chars: 500,
         };
-        let template = "{world_name} {entity_name} {entity_type} {description} {tags} {x} {y} {property_context} {power_tier} {entity_history} {nearby_entities} {world_events}";
+        let template = "{world_name} {entity_name} {entity_type} {description} {tags} {x} {y} {property_context} {power_tier} {entity_history} {nearby_entities} {world_events} {history_summary} {max_history_summary_chars}";
         let result = build_action_prompt("Middle Earth", &entity, &ctx, template);
         assert_eq!(
             result,
-            "Middle Earth Aragorn hero A test entity test 10.0 20.0 props tier hist near events"
+            "Middle Earth Aragorn hero A test entity test 10.0 20.0 props tier hist near events summary 500"
         );
     }
 

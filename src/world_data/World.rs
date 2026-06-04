@@ -819,9 +819,18 @@ pub struct WorldSettings {
     /// Auto-save interval in seconds
     pub auto_save_interval_secs: u64,
     /// History entries to display fully in LLM context
+    /// (also the LLM's anti-repetition window — the LLM sees this many
+    ///  most-recent actions and is told not to pick one semantically
+    ///  the same as any of them).
     pub history_entries_fully_displayed: u32,
-    /// History entries to show in shortened form
+    /// History entries to show in shortened form (beyond the
+    /// fully-displayed window, these appear as a brief one-liner).
     pub history_entries_shortened: u32,
+    /// Max characters the LLM is allowed to use when writing the
+    /// per-entity history_summary field. Soft cap — the server
+    /// truncates with "…" if the LLM goes over.
+    /// Default 500.
+    pub max_history_summary_chars: u32,
 }
 
 impl Default for WorldSettings {
@@ -834,8 +843,9 @@ impl Default for WorldSettings {
             power_weight_factor: 1.0,
             resource_weight_factor: 1.0,
             auto_save_interval_secs: 300,
-            history_entries_fully_displayed: 5,
+            history_entries_fully_displayed: 10,  // bumped 5→10 for anti-repetition window
             history_entries_shortened: 10,
+            max_history_summary_chars: 500,
         }
     }
 }

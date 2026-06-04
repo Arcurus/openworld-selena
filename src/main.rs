@@ -1665,6 +1665,13 @@ struct LlmActionResponse {
     #[serde(default)]
     effects: std::collections::HashMap<String, serde_json::Value>,
     narrative: String,
+    /// Per-entity rolling history summary. The LLM is instructed
+    /// (in EntityAction.md) to always include an updated version.
+    /// Optional: if the LLM omits it the existing summary is left
+    /// untouched. Hard-capped server-side to
+    /// `world.settings.max_history_summary_chars` (truncated with "…").
+    #[serde(default)]
+    history_summary: Option<String>,
 }
 
 // Parse a JSON value as an effect change (handles string "+5", "5", or number 5)
@@ -1755,6 +1762,11 @@ async fn process_action_handler(
         Ok(action_data) => {
             // Apply effects to entity
             let mut world = state.world.write().await;
+            // Capture the history-summary cap BEFORE taking a mutable
+            // borrow of the entity (Rust borrow checker: we can't
+            // immutably borrow `world.settings` while `entity` is
+            // borrowed mutably).
+            let max_summary_chars = world.settings.max_history_summary_chars as usize;
             if let Some(entity) = world.entities.get_mut(&entity_id) {
                 let mut applied_effects = std::collections::HashMap::new();
                 let mut new_values = std::collections::HashMap::new();
@@ -1967,6 +1979,41 @@ async fn process_action_handler(
                     warnings: warnings.clone(),
                 };
 
+                // Apply the LLM-supplied history summary (if any) to the
+                // entity. We hard-cap the length to
+                // world.settings.max_history_summary_chars so a runaway
+                // LLM can't bloat the save file. The cap is a soft
+                // contract (truncate with "…"), not a reject — the
+                // `history_summary` field is optional in
+                // `LlmActionResponse`, so omitting it leaves the
+                // existing summary untouched (lenient mode).
+                let mut summary_truncated = false;
+                let applied_summary: Option<String> = match action_data.history_summary {
+                    Some(s) => {
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else if trimmed.chars().count() > max_summary_chars {
+                            // Truncate at a char boundary, append ellipsis.
+                            let cut: String = trimmed.chars().take(max_summary_chars.saturating_sub(1)).collect();
+                            let final_summary = format!("{}…", cut);
+                            entity.history_summary = Some(final_summary.clone());
+                            summary_truncated = true;
+                            Some(final_summary)
+                        } else {
+                            entity.history_summary = Some(trimmed.to_string());
+                            Some(trimmed.to_string())
+                        }
+                    }
+                    None => None,
+                };
+                if summary_truncated {
+                    warnings.push(format!(
+                        "LLM history_summary exceeded {} chars; truncated.",
+                        max_summary_chars
+                    ));
+                }
+
                 // Release the borrow by extracting the response payload.
                 let response_json = serde_json::json!({
                     "success": true,
@@ -1975,6 +2022,7 @@ async fn process_action_handler(
                     "effects_applied": applied_effects,
                     "new_values": new_values,
                     "narrative": action_data.narrative,
+                    "history_summary": applied_summary,
                     "warnings": warnings,
                 });
                 let response = success_json(response_json).into_response();

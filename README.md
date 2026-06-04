@@ -58,6 +58,19 @@ Every entity action is appended to a separate, durable, append-only JSONL log:
 
 Read API lives in `src/world_data/action_history_log.rs` (`append_entry`, `load_for_entity`, `count_for_entity`).
 
+### 📋 History Summary + Anti-Repetition (LLM-owned)
+
+Per `Arcurus 2026-06-04 (#openworld)`: every world action's LLM call also updates a rolling per-entity `history_summary`. Same call, no extra LLM budget.
+
+- **Setting:** `world.settings.max_history_summary_chars` (default `500`) — soft cap, server truncates with `…` if the LLM goes over and adds a warning to the response.
+- **Setting:** `world.settings.history_entries_fully_displayed` (default `10`) — the LLM sees this many most-recent actions in full and is explicitly told **not** to pick a semantically identical action from that window.
+- **Storage:** `entity.history_summary: Option<String>` on the WorldEntity (saved in `save.owbl`).
+- **LLM contract:** the response JSON now includes a required `history_summary` string. If the LLM omits it the existing summary is left untouched (lenient).
+- **UI:** the entity modal shows a `📋 History Summary` card above the `📜 Action History` section, with a configurable history-limit dropdown (10 / 25 / 50 / 100 / 250 / 500, default 10, persisted in `localStorage`).
+- **Save format:** v3 (was v2). Loads of older saves fall back to default `max_history_summary_chars`.
+
+Context assembly in `src/world_data/context_builder.rs`. Template in `ai_templates/EntityAction.md`.
+
 ---
 
 ## Build Commands
