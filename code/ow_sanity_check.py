@@ -251,6 +251,66 @@ def scan_llm_log(log_path: str) -> Dict[str, Any]:
     truncation_total = 0
     both_actions_post: List[str] = []
 
+    # Warning-categorization (per Arcurus 2026-06-05: "does the check now
+    # look at warnings in the log?"). The new binary (commit 3373e0d)
+    # writes a Python list literal into the "--- Parsing ---" line, so
+    # we can pull every warning out and bucket by the substring that
+    # identifies it. Keys are short, stable labels so the Markdown
+    # report stays compact.
+    warning_counts_all: Counter = Counter()
+    warning_counts_post: Counter = Counter()
+    warning_samples: Dict[str, List[str]] = {}
+
+    # Patterns keyed off a stable substring of the warning text. Add new
+    # buckets here when apply_history_summary_replaces or the truncation
+    # path starts emitting new warnings.
+    WARN_BUCKETS = [
+        ("both_dropped",        "Both history_summary and history_summary_replace"),
+        ("neither",             "Neither history_summary"),
+        ("truncated",           "exceeded"),  # generic "exceeded N chars" truncation
+        ("old_part_not_found",  "old_part not found"),
+        ("old_part_unique",     "occurs more than once"),
+        # System-entity protection (c7f3bc27 / d7bf225): the LLM
+        # sometimes tries to write effects to the world clock or other
+        # system entities; the server correctly rejects those. Expected
+        # and benign, but a useful signal to keep an eye on.
+        ("system_entity_targeted",  "Entity is a system entity"),
+        ("skipped_effect_system",   "Skipped effect on system entity"),
+        # Magnitude / delta cap (LLM trying to write a too-large number).
+        ("skipped_effect_magnitude",  "Skipped effect on"),
+    ]
+
+    def _bucket(warning: str) -> str:
+        for label, needle in WARN_BUCKETS:
+            if needle in warning:
+                return label
+        return "other"
+
+    def _parse_warnings_from_parsing_line(parsing_line: str) -> List[str]:
+        """Pull out the Python-list of warnings from the parsing line.
+
+        The parsing line looks like:
+          Applied 3 effects. Warnings: ["Both history_summary ...", "..."]
+        Older builds (pre-3373e0d) write `Warnings: []`. We do a tolerant
+        parse: find the first '[' and the matching ']' (handling nested
+        quoted strings naively) and split top-level quoted entries.
+        """
+        idx = parsing_line.find("Warnings:")
+        if idx < 0:
+            return []
+        tail = parsing_line[idx + len("Warnings:"):].strip()
+        if not (tail.startswith("[") and tail.endswith("]")):
+            return []
+        body = tail[1:-1]
+        if not body.strip():
+            return []
+        # Naive split on '", "' — works for the simple string-only lists
+        # the current apply helper emits (no embedded commas in the
+        # warning text). If the format ever gets fancier, switch to a
+        # proper Python-literal parser here.
+        parts = re.findall(r'"((?:[^"\\]|\\.)*)"', body)
+        return [p for p in parts]
+
     for b in blocks:
         ts = _get_ts(b) or ""
         is_post = ts >= RESTART_TS
@@ -291,12 +351,16 @@ def scan_llm_log(log_path: str) -> Dict[str, Any]:
             if is_post:
                 multi_post += 1
 
-        # Truncation in the parsing line
+        # Walk the warnings array (if any) and bucket them.
         m_p = re.search(r"---\s*Parsing\s*---\s*\n(.*?)(?:\n---|\Z)", b, re.DOTALL)
-        if m_p and "truncated" in m_p.group(1).lower():
-            truncation_total += 1
-            if is_post:
-                truncation_post += 1
+        if m_p:
+            for w in _parse_warnings_from_parsing_line(m_p.group(1)):
+                bucket = _bucket(w)
+                warning_counts_all[bucket] += 1
+                if is_post:
+                    warning_counts_post[bucket] += 1
+                if len(warning_samples.setdefault(bucket, [])) < 3:
+                    warning_samples[bucket].append(w)
 
     total_calls = sum(stats_total.values())
     post_calls = sum(stats_post.values())
@@ -320,6 +384,9 @@ def scan_llm_log(log_path: str) -> Dict[str, Any]:
         "truncation_events_post_restart": truncation_post,
         "sample_parse_errors": parse_error_samples,
         "sample_both_actions_post": both_actions_post[:5],
+        "warning_counts_all": dict(warning_counts_all),
+        "warning_counts_post": dict(warning_counts_post),
+        "warning_samples": warning_samples,
     }
 
 
@@ -446,6 +513,53 @@ def render_report(rels: List[Dict[str, Any]],
         parts.append(f"  • truncation events: "
                      f"all-day = {log_stats['truncation_events_all_day']}, "
                      f"post-restart = {log_stats['truncation_events_post_restart']}")
+
+        # === Warnings bucketed from the per-call warnings: [...] list ===
+        w_all = log_stats.get("warning_counts_all") or {}
+        w_post = log_stats.get("warning_counts_post") or {}
+        w_samples = log_stats.get("warning_samples") or {}
+        if w_all or w_post:
+            parts.append("  • warnings bucketed (from `Warnings: [...]` per call):")
+            # Stable order, all buckets even when zero, so the report shape
+            # is stable run-to-run.
+            bucket_order = ["both_dropped", "neither", "truncated",
+                            "old_part_not_found", "old_part_unique",
+                            "system_entity_targeted", "skipped_effect_system",
+                            "skipped_effect_magnitude", "other"]
+            bucket_labels = {
+                "both_dropped":            "Both dropped (replace wins)",
+                "neither":                 "Neither (no update)",
+                "truncated":               "Truncated (over cap)",
+                "old_part_not_found":      "old_part not found",
+                "old_part_unique":         "old_part ambiguous (occurs N×)",
+                "system_entity_targeted":  "System entity targeted",
+                "skipped_effect_system":   "Skipped effect (system entity)",
+                "skipped_effect_magnitude":"Skipped effect (magnitude cap)",
+                "other":                   "Other (unrecognized)",
+            }
+            for b in bucket_order:
+                a = w_all.get(b, 0)
+                p = w_post.get(b, 0)
+                if a == 0 and p == 0:
+                    continue  # skip empty buckets so the report stays tight
+                parts.append(f"    - {bucket_labels.get(b, b)}: "
+                             f"all-day = {a}, post-restart = {p}")
+            # Show up to 2 samples per bucket for the post-restart warnings.
+            any_samples = False
+            for b, samples in w_samples.items():
+                if not samples:
+                    continue
+                if not any_samples:
+                    parts.append("  • warning samples:")
+                    any_samples = True
+                for s in samples[:2]:
+                    short = s if len(s) <= 140 else s[:137] + "…"
+                    parts.append(f"    - `{bucket_labels.get(b, b)}`: {short}")
+        else:
+            parts.append("  • warnings bucketed: **none** "
+                         "(the binary is writing the warnings: [...] list — "
+                         "if you see this line, double-check the log format)")
+
         if log_stats["sample_parse_errors"]:
             parts.append("  • parse-error samples:")
             for s in log_stats["sample_parse_errors"]:

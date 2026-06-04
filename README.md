@@ -188,6 +188,40 @@ Two daily-rotating log files in `logs/`:
 - `error-log-YYYY-MM-DD.log` — all errors and warnings
 - `llm-log-YYYY-MM-DD.log` — every LLM call with context, response, timing, parsing outcome
 
+### 🛡️ Sanity Check
+
+A read-only sanity check is bundled with the project at `code/ow_sanity_check.py`. It scans the running world server and today's LLM log for things worth reporting on, and prints (or posts) a Markdown report. **It never mutates anything** — there is no `--apply` flag by design.
+
+What it checks (per Arcurus 2026-06-05 #openworld):
+
+- **Duplicate relations in entity summaries** — flags entities whose `history_summary` lists the same relation name more than once (e.g. `Mira the Scribe → …` appearing twice on Velora's card). Names are normalized (case + whitespace + trailing punctuation) before comparison.
+- **LLM call counts** for the day, split by `replace_only` / `full_only` / `both` (which corresponds to the LLM returning both `history_summary` and `history_summary_replace` in one response) / `parse_error`, and separated into pre- and post-restart slices (binary restart = commit 3373e0d, 2026-06-04 22:05:52 UTC) so the warnings-vec fix can be measured.
+- **Multi-replace calls** (one LLM response containing ≥2 `history_summary_replace` pairs).
+- **Truncation events** flagged in the parsing line.
+- **Per-call warnings bucketed** by reading the `Warnings: [...]` list that the new binary writes into the `--- Parsing ---` line (commit 3373e0d, 2026-06-04). Buckets: `Both dropped (replace wins)`, `Neither (no update)`, `Truncated (over cap)`, `old_part not found`, `old_part ambiguous (occurs N×)`, `Other`. For each non-zero bucket we print a couple of sample warning strings.
+- **Summary length distribution** vs the hard cap (`world.settings.max_history_summary_chars`, default 10 000).
+- **Stale entities** (no action in 24+ h).
+
+Usage:
+
+```bash
+# print the report to stdout
+python3 code/ow_sanity_check.py
+
+# machine-readable JSON
+python3 code/ow_sanity_check.py --json
+
+# post to #openworld-log (Discord channel 1511696310984773633) via the bot token
+python3 code/ow_sanity_check.py --post
+
+# build + show, do not post
+python3 code/ow_sanity_check.py --post --dry-run
+```
+
+Exit codes: `0` = clean, `1` = findings (non-fatal), `2` = runtime error (couldn't reach server, etc.).
+
+**Scheduling:** the check is **on-demand**, not cron-scheduled. Run it after a service restart, after seeding entities, or whenever you want a one-shot report. The script defaults to the open-world server at `http://127.0.0.1:8081`; override with `--api-url=URL` for a remote box.
+
 ---
 
 ## 🌐 API Endpoints
