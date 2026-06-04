@@ -471,6 +471,119 @@ impl World {
         repairs
     }
 
+    /// Sanitize int AND float properties on non-system entities.
+    ///
+    /// Background: `c7f3bc27` blocks LLM effect writes against system
+    /// entities, and `sanitize_system_entities` cleans up the persisted
+    /// garbage on the world_clock. But the same LLM garbage pattern
+    /// happens on *normal* entities too — observed in the wild: a dragon
+    /// entity whose `power` field is `-4.05e18` and whose `shadow_reach`
+    /// float is `8.03e19` (well beyond any sane magnitude for those
+    /// keys). The entity was created and fed garbage values before
+    /// `c7f3bc27` shipped, and the magnitude guard only rejects NEW
+    /// writes — the old corruption is still on disk and gets re-saved
+    /// on every cycle.
+    ///
+    /// This method is the non-system counterpart to
+    /// `sanitize_system_entities`. It applies sane per-key magnitude
+    /// bounds (with a conservative `MAX_GENERAL` default of 1M for
+    /// ints and `MAX_GENERAL_FLOAT` of 1e7 for floats — anything beyond
+    /// is almost certainly the LLM garbage signature, not a realistic
+    /// world value). The bounds per key are:
+    ///
+    ///   * `actions_today`, `has_history`, `is_recording`,
+    ///     `history_entries`, `last_recorded_day`, `power`, `reputation`,
+    ///     `wealth`, `knowledge`, `visibility`, `divine_favor`,
+    ///     `allies`, `enemies`, `troops`, `mana`, `gold`, `troop_count`,
+    ///     `danger_level`, `corruption`, `army_size`, `political_power`,
+    ///     `loyalty`, `tithe`, `population`, `garrison`, `supplies`,
+    ///     `curse_strength`, `blessing`, `piety`, `fervor`, `evil`,
+    ///     `good`, `law`, `chaos`, `strength`, `dexterity`,
+    ///     `constitution`, `intelligence`, `wisdom`, `charisma`,
+    ///     `level`, `experience`, `hp`, `mp`, `armor_class`, `speed`,
+    ///     `max_hp`, `max_mp`, `attack`, `defense`, `magic`, `skill`,
+    ///     `rank`, `age`, `age_years`, `hunt_score`, `harvest`,
+    ///     `bandit_power`, `spell_power`, `health`, `energy`, `focus`,
+    ///     `morale`, `mood`, `inspiration`, `discipline`, `courage`,
+    ///     `patience`, `rage`, `suspicion`, `awakening_count`,
+    ///     `dominion`, `command`, `reach`, `ambition`,
+    ///     `*-power` (e.g. `Shadow Ridge Camp.power`): < 1M
+    ///   * Boolean keys (`awakening`, `recording`): 0 or 1
+    ///   * Everything else: < 1M (matches the default)
+    ///
+    ///   * Float bounds: `location_x`, `location_y`, `influence_radius`,
+    ///     `shadow_reach`, `view_radius`, `territory_radius`, etc. all
+    ///     use `MAX_GENERAL_FLOAT` (1e7) by default.
+    ///
+    /// Returns `(entity_id, key, old_value, new_value)` for every int
+    /// repair and `(entity_id, key, old_value, new_value)` (f64-typed)
+    /// for every float repair. The two lists are kept separate so
+    /// callers can log them in distinct streams. System entities are
+    /// left alone (use `sanitize_system_entities` for those).
+    pub fn sanitize_non_system_entity_properties(
+        &mut self,
+    ) -> (Vec<(Uuid, String, i64, i64)>, Vec<(Uuid, String, f64, f64)>) {
+        // Conservative per-key bound. The keys listed are the ones we've
+        // seen the LLM write to non-system entities in /api/entities. The
+        // `_` arm catches anything else (e.g. a future key) with the same
+        // 1M ceiling — anything beyond that is almost certainly LLM
+        // garbage, not a meaningful world value.
+        const MAX_BOOL: i64 = 1;
+        const MAX_GENERAL: i64 = 1_000_000;
+        const MAX_GENERAL_FLOAT: f64 = 1.0e7;
+
+        let mut int_repairs: Vec<(Uuid, String, i64, i64)> = Vec::new();
+        let mut float_repairs: Vec<(Uuid, String, f64, f64)> = Vec::new();
+
+        // Collect first to avoid borrowck issues.
+        let mut int_to_fix: Vec<(Uuid, String, i64)> = Vec::new();
+        let mut float_to_fix: Vec<(Uuid, String, f64)> = Vec::new();
+        for (id, entity) in &self.entities {
+            if entity.is_system_entity() {
+                continue; // leave system entities to sanitize_system_entities
+            }
+            for (key, val) in &entity.properties_int {
+                let sane_max: i64 = match key.as_str() {
+                    "awakening" | "is_recording" | "has_history" | "recording" => MAX_BOOL,
+                    _ => MAX_GENERAL,
+                };
+                let magnitude = val.unsigned_abs();
+                if magnitude > sane_max as u64 {
+                    int_to_fix.push((*id, key.clone(), *val));
+                }
+            }
+            for (key, val) in &entity.properties_float {
+                if !val.is_finite() || val.abs() > MAX_GENERAL_FLOAT {
+                    float_to_fix.push((*id, key.clone(), *val));
+                }
+            }
+        }
+
+        for (id, key, old_val) in int_to_fix {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.properties_int.insert(key.clone(), 0);
+            }
+            int_repairs.push((id, key, old_val, 0));
+        }
+        for (id, key, old_val) in float_to_fix {
+            let new_val = if !old_val.is_finite() {
+                0.0
+            } else {
+                // Clamp to MAX_GENERAL_FLOAT with the original sign. A
+                // shadow_reach of -8e19 should become a clamped -1e7, not
+                // 0, so the agent's "negative reach" semantic is preserved
+                // while the magnitude is tamed.
+                old_val.signum() * MAX_GENERAL_FLOAT
+            };
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.properties_float.insert(key.clone(), new_val);
+            }
+            float_repairs.push((id, key, old_val, new_val));
+        }
+
+        (int_repairs, float_repairs)
+    }
+
     /// Add an entity to the world
     pub fn add_entity(&mut self, entity: WorldEntity) -> Uuid {
         let id = entity.id;
@@ -943,5 +1056,143 @@ mod tests {
         assert_eq!(clock.get_int("hour").unwrap(), 14);
         assert_eq!(clock.get_int("actions_today").unwrap(), 42);
         assert_eq!(clock.get_int("has_history").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_sanitize_non_system_repairs_garbage_int_on_character() {
+        // A character entity with the LLM-garbage signature on a regular
+        // int property. The non-system sanitizer must reset to 0 and
+        // report the repair.
+        let mut world = World::new("Test");
+        let hero = WorldEntity::new("character", "Vaelthrix", 0.0, 0.0);
+        let hero_id = world.add_entity(hero);
+        world
+            .entities
+            .get_mut(&hero_id)
+            .unwrap()
+            .set_int("power", -4_050_000_000_000_000_000);
+
+        let (int_repairs, float_repairs) = world.sanitize_non_system_entity_properties();
+        assert!(float_repairs.is_empty());
+        assert_eq!(int_repairs.len(), 1);
+        let (_id, key, old, new) = &int_repairs[0];
+        assert_eq!(key, "power");
+        assert_eq!(*old, -4_050_000_000_000_000_000);
+        assert_eq!(*new, 0);
+        assert_eq!(world.entities.get(&hero_id).unwrap().get_int("power").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_sanitize_non_system_clamps_garbage_float_preserving_sign() {
+        // The non-system sanitizer must clamp out-of-bounds floats to
+        // ±MAX_GENERAL_FLOAT (1e7), preserving the original sign so the
+        // agent's "negative reach" semantic isn't lost.
+        let mut world = World::new("Test");
+        let dragon = WorldEntity::new("creature", "Old Dragon", 10.0, 10.0);
+        let dragon_id = world.add_entity(dragon);
+        world
+            .entities
+            .get_mut(&dragon_id)
+            .unwrap()
+            .set_float("shadow_reach", 8.03e19);
+        world
+            .entities
+            .get_mut(&dragon_id)
+            .unwrap()
+            .set_float("view_radius", -4.5e18);
+
+        let (int_repairs, float_repairs) = world.sanitize_non_system_entity_properties();
+        assert!(int_repairs.is_empty());
+        assert_eq!(float_repairs.len(), 2);
+
+        // Original sign is preserved, magnitude is clamped to 1e7.
+        let sr = world
+            .entities
+            .get(&dragon_id)
+            .unwrap()
+            .get_float("shadow_reach")
+            .unwrap();
+        assert!(sr > 0.0 && sr <= 1.0e7, "shadow_reach must clamp positive, got {}", sr);
+        let vr = world
+            .entities
+            .get(&dragon_id)
+            .unwrap()
+            .get_float("view_radius")
+            .unwrap();
+        assert!(vr < 0.0 && vr >= -1.0e7, "view_radius must clamp negative, got {}", vr);
+    }
+
+    #[test]
+    fn test_sanitize_non_system_resets_nan_and_infinity() {
+        // Non-finite floats (NaN, +inf, -inf) must be replaced with 0.0 —
+        // they would propagate NaN through every subsequent computation.
+        let mut world = World::new("Test");
+        let ghost = WorldEntity::new("creature", "Ghost", 0.0, 0.0);
+        let ghost_id = world.add_entity(ghost);
+        let g = world.entities.get_mut(&ghost_id).unwrap();
+        g.set_float("presence", f64::NAN);
+        g.set_float("corruption", f64::INFINITY);
+        g.set_float("purity", f64::NEG_INFINITY);
+
+        let (_int, float_repairs) = world.sanitize_non_system_entity_properties();
+        assert_eq!(float_repairs.len(), 3);
+        let g = world.entities.get(&ghost_id).unwrap();
+        assert_eq!(g.get_float("presence").unwrap(), 0.0);
+        assert_eq!(g.get_float("corruption").unwrap(), 0.0);
+        assert_eq!(g.get_float("purity").unwrap(), 0.0);
+    }
+
+    #[test]
+    fn test_sanitize_non_system_preserves_sane_values() {
+        // Normal, in-range int and float values on a regular entity must
+        // not be touched.
+        let mut world = World::new("Test");
+        let hero = WorldEntity::new("character", "Kira", 5.0, 5.0);
+        let hero_id = world.add_entity(hero);
+        let h = world.entities.get_mut(&hero_id).unwrap();
+        h.set_int("power", 500);
+        h.set_int("army_size", 12_345);
+        h.set_float("view_radius", 250.0);
+        h.set_float("location_x", 42.5);
+
+        let (int_repairs, float_repairs) = world.sanitize_non_system_entity_properties();
+        assert!(int_repairs.is_empty());
+        assert!(float_repairs.is_empty());
+        let h = world.entities.get(&hero_id).unwrap();
+        assert_eq!(h.get_int("power").unwrap(), 500);
+        assert_eq!(h.get_int("army_size").unwrap(), 12_345);
+        assert_eq!(h.get_float("view_radius").unwrap(), 250.0);
+        assert_eq!(h.get_float("location_x").unwrap(), 42.5);
+    }
+
+    #[test]
+    fn test_sanitize_non_system_skips_system_entities() {
+        // The non-system sanitizer must not touch system entities —
+        // those are the system sanitizer's job. This is the same
+        // division-of-labor as the existing test for the system
+        // sanitizer.
+        let mut world = World::new("Test");
+        let clock_id = clock_entity_id();
+        world
+            .entities
+            .get_mut(&clock_id)
+            .unwrap()
+            .set_int("day", i64::MAX);
+        world
+            .entities
+            .get_mut(&clock_id)
+            .unwrap()
+            .set_float("total_years", f64::INFINITY);
+
+        let (int_repairs, float_repairs) = world.sanitize_non_system_entity_properties();
+        assert!(
+            int_repairs.is_empty() && float_repairs.is_empty(),
+            "non-system sanitizer must leave system entities alone"
+        );
+        // The corruption is still there — it's the system sanitizer's job.
+        assert_eq!(
+            world.entities.get(&clock_id).unwrap().get_int("day").unwrap(),
+            i64::MAX
+        );
     }
 }

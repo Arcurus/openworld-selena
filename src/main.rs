@@ -3237,6 +3237,24 @@ async fn main() {
                         println!("   • {} :: {} :: {} -> {}", id, key, old, new);
                     }
                 }
+                // Sanitize int and float properties on non-system entities
+                // (e.g. an old dragon entity whose `power` was written as
+                // `-4.05e18` before c7f3bc27). Wired in alongside the
+                // system-entity sanitizer so the on-disk corruption gets
+                // cleaned up on every load. See todo 2df49bd8.
+                let (int_repairs, float_repairs) = w.sanitize_non_system_entity_properties();
+                if !int_repairs.is_empty() {
+                    println!("🧹 Sanitized {} non-system int property repair(s):", int_repairs.len());
+                    for (id, key, old, new) in &int_repairs {
+                        println!("   • {} :: {} :: {} -> {}", id, key, old, new);
+                    }
+                }
+                if !float_repairs.is_empty() {
+                    println!("🧹 Sanitized {} non-system float property repair(s):", float_repairs.len());
+                    for (id, key, old, new) in &float_repairs {
+                        println!("   • {} :: {} :: {} -> {}", id, key, old, new);
+                    }
+                }
                 // Sync time from clock entity to world_time
                 w.sync_time_from_clock();
                 // Advance time based on real elapsed time since last save
