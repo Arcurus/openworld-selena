@@ -1200,14 +1200,18 @@
         }
         
         function selectEntity(id) {
-            // If already selected, open details instead
-            if (selectedEntity?.id === id) {
-                openEntityDetails(id);
-                return;
-            }
+            // 2026-06-05: open the details modal on the FIRST click,
+            // not the second. (Old behavior: 1st click = select+highlight,
+            // 2nd click = open modal. Arcurus reported that as a bug —
+            // the user expected one click to display the entity, and
+            // because the entity list is dimmed behind the modal-overlay
+            // (z-index 1000), the visible empty list read as 'stops
+            // displaying any entity'.)  We still set `selectedEntity`
+            // so the map still draws the selection ring.
             selectedEntity = entities.find(e => e.id === id) || null;
             renderEntityList();
             renderMap();
+            openEntityDetails(id);
         }
         
         function renderMap() {
