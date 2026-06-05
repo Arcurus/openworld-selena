@@ -628,9 +628,14 @@ impl World {
     ///   * Boolean keys (`awakening`, `recording`): 0 or 1
     ///   * Everything else: < 1M (matches the default)
     ///
-    ///   * Float bounds: `location_x`, `location_y`, `influence_radius`,
-    ///     `shadow_reach`, `view_radius`, `territory_radius`, etc. all
-    ///     use `MAX_GENERAL_FLOAT` (1e7) by default.
+    ///   * Float bounds: spatial/scale keys (`location_x`, `location_y`,
+    ///     `influence_radius`, `shadow_reach`, `view_radius`,
+    ///     `territory_radius`, `patrol_radius`, `search_radius`,
+    ///     `spell_range`, `view_range`, `hearing_radius`) use
+    ///     `MAX_SPATIAL_FLOAT` (1e6) — anything in the millions is the
+    ///     LLM "1e7 garbage" signature seen in prod. Other float keys
+    ///     use `MAX_GENERAL_FLOAT` (1e7) as a catch-all. The clamp
+    ///     preserves the original sign.
     ///
     /// Returns `(entity_id, key, old_value, new_value)` for every int
     /// repair and `(entity_id, key, old_value, new_value)` (f64-typed)
@@ -647,6 +652,18 @@ impl World {
         // garbage, not a meaningful world value.
         const MAX_BOOL: i64 = 1;
         const MAX_GENERAL: i64 = 1_000_000;
+        // Float caps:
+        //   * `MAX_SPATIAL_FLOAT` (1e6) is the bound for spatial/scale floats
+        //     — location_x, location_y, influence_radius, shadow_reach,
+        //     view_radius, territory_radius, etc. These are game-world
+        //     coordinates or distances; values in the millions are the LLM
+        //     "1e7 garbage" signature seen in prod (e.g. dragon.location_x
+        //     pinned at 10,000,000.0 from repeated LLM writes).
+        //   * `MAX_GENERAL_FLOAT` (1e7) is the catch-all for any other
+        //     float key — 10M is still suspicious for non-spatial floats
+        //     (mana, piety, etc.) and worth flagging, but more permissive
+        //     than the spatial cap.
+        const MAX_SPATIAL_FLOAT: f64 = 1.0e6;
         const MAX_GENERAL_FLOAT: f64 = 1.0e7;
 
         let mut int_repairs: Vec<(Uuid, String, i64, i64)> = Vec::new();
@@ -670,7 +687,27 @@ impl World {
                 }
             }
             for (key, val) in &entity.properties_float {
-                if !val.is_finite() || val.abs() > MAX_GENERAL_FLOAT {
+                if !val.is_finite() {
+                    float_to_fix.push((*id, key.clone(), *val));
+                    continue;
+                }
+                // Per-key spatial cap: location/radius/reach floats get
+                // a tighter 1e6 bound so the LLM "1e7 garbage" signature
+                // (dragon.location_x = 10_000_000.0, artifact.influence_radius
+                // = 8_508_917.82 observed in prod) gets actually repaired
+                // on load. The check uses `>=` so boundary values are
+                // flagged too (so a future regression to 1e7 is visible
+                // in the repair list, not silently preserved).
+                let sane_max: f64 = match key.as_str() {
+                    "location_x" | "location_y"
+                    | "location"
+                    | "influence_radius"
+                    | "shadow_reach" | "view_radius" | "territory_radius"
+                    | "patrol_radius" | "search_radius" | "spell_range"
+                    | "view_range" | "hearing_radius" => MAX_SPATIAL_FLOAT,
+                    _ => MAX_GENERAL_FLOAT,
+                };
+                if val.abs() >= sane_max {
                     float_to_fix.push((*id, key.clone(), *val));
                 }
             }
@@ -683,14 +720,25 @@ impl World {
             int_repairs.push((id, key, old_val, 0));
         }
         for (id, key, old_val) in float_to_fix {
+            // Re-derive the cap here so the clamp matches the per-key
+            // bound used in the detection loop above.
+            let sane_max: f64 = match key.as_str() {
+                "location_x" | "location_y"
+                | "location"
+                | "influence_radius"
+                | "shadow_reach" | "view_radius" | "territory_radius"
+                | "patrol_radius" | "search_radius" | "spell_range"
+                | "view_range" | "hearing_radius" => MAX_SPATIAL_FLOAT,
+                _ => MAX_GENERAL_FLOAT,
+            };
             let new_val = if !old_val.is_finite() {
                 0.0
             } else {
-                // Clamp to MAX_GENERAL_FLOAT with the original sign. A
-                // shadow_reach of -8e19 should become a clamped -1e7, not
-                // 0, so the agent's "negative reach" semantic is preserved
-                // while the magnitude is tamed.
-                old_val.signum() * MAX_GENERAL_FLOAT
+                // Clamp to the per-key sane_max with the original sign.
+                // A shadow_reach of -8e19 should become a clamped -1e6,
+                // not 0, so the agent's "negative reach" semantic is
+                // preserved while the magnitude is tamed.
+                old_val.signum() * sane_max
             };
             if let Some(entity) = self.entities.get_mut(&id) {
                 entity.properties_float.insert(key.clone(), new_val);
@@ -1235,21 +1283,131 @@ mod tests {
         assert!(int_repairs.is_empty());
         assert_eq!(float_repairs.len(), 2);
 
-        // Original sign is preserved, magnitude is clamped to 1e7.
+        // Original sign is preserved, magnitude is clamped to the
+        // spatial cap (1e6) since shadow_reach / view_radius are
+        // spatial keys.
         let sr = world
             .entities
             .get(&dragon_id)
             .unwrap()
             .get_float("shadow_reach")
             .unwrap();
-        assert!(sr > 0.0 && sr <= 1.0e7, "shadow_reach must clamp positive, got {}", sr);
+        assert!(sr > 0.0 && sr <= 1.0e6, "shadow_reach must clamp positive to spatial cap, got {}", sr);
         let vr = world
             .entities
             .get(&dragon_id)
             .unwrap()
             .get_float("view_radius")
             .unwrap();
-        assert!(vr < 0.0 && vr >= -1.0e7, "view_radius must clamp negative, got {}", vr);
+        assert!(vr < 0.0 && vr >= -1.0e6, "view_radius must clamp negative to spatial cap, got {}", vr);
+    }
+
+    #[test]
+    fn test_sanitize_non_system_clamps_garbage_spatial_at_one_e_seven_boundary() {
+        // The exact prod pattern: a dragon entity whose location_x /
+        // location_y / shadow_reach are pinned at 1e7 from repeated LLM
+        // writes (the LLM gravitates to 1e7 because that was the
+        // previous default cap). The old check used `>` strict, so 1e7
+        // slipped through. The new check uses `>=` AND a per-key
+        // spatial cap of 1e6, so the boundary is caught and clamped to
+        // a sane value.
+        let mut world = World::new("Test");
+        let dragon = WorldEntity::new("creature", "Vaelthrix the Endless", 0.0, 0.0);
+        let dragon_id = world.add_entity(dragon);
+        let d = world.entities.get_mut(&dragon_id).unwrap();
+        d.set_float("location_x", 1.0e7);
+        d.set_float("location_y", 1.0e7);
+        d.set_float("shadow_reach", 1.0e7);
+
+        let (_int, float_repairs) = world.sanitize_non_system_entity_properties();
+        assert_eq!(
+            float_repairs.len(),
+            3,
+            "all three 1e7 spatial floats should be flagged"
+        );
+
+        let d = world.entities.get(&dragon_id).unwrap();
+        let lx = d.get_float("location_x").unwrap();
+        assert!(
+            (1.0e6 - 1.0..=1.0e6).contains(&lx),
+            "location_x must clamp to exactly the spatial cap (1e6), got {}",
+            lx
+        );
+        assert_eq!(d.get_float("location_y").unwrap(), 1.0e6);
+        assert_eq!(d.get_float("shadow_reach").unwrap(), 1.0e6);
+    }
+
+    #[test]
+    fn test_sanitize_non_system_clamps_artifacts_eight_million_influence_radius() {
+        // The other prod pattern: an artifact with influence_radius
+        // around 8.5e6 — well below the old 1e7 default cap, but
+        // unrealistic for a "radius" key in a fantasy world. The
+        // per-key spatial cap (1e6) catches it.
+        let mut world = World::new("Test");
+        let crown = WorldEntity::new("artifact", "The Shadow Crown", 0.0, 0.0);
+        let crown_id = world.add_entity(crown);
+        world
+            .entities
+            .get_mut(&crown_id)
+            .unwrap()
+            .set_float("influence_radius", 8_508_917.82);
+
+        let (_int, float_repairs) = world.sanitize_non_system_entity_properties();
+        assert_eq!(float_repairs.len(), 1, "8.5e6 influence_radius must be flagged");
+        let (_id, key, old, new) = &float_repairs[0];
+        assert_eq!(key, "influence_radius");
+        assert_eq!(*old, 8_508_917.82);
+        assert_eq!(*new, 1.0e6, "must clamp to the spatial cap, not the general 1e7 cap");
+    }
+
+    #[test]
+    fn test_sanitize_non_system_spatial_cap_does_not_affect_non_spatial_floats() {
+        // Non-spatial floats use the general 1e7 cap, NOT the 1e6
+        // spatial cap. A mana value of 5e6 is above the spatial cap
+        // but below the general cap, so it must be preserved.
+        let mut world = World::new("Test");
+        let mage = WorldEntity::new("character", "Archmage", 0.0, 0.0);
+        let mage_id = world.add_entity(mage);
+        let m = world.entities.get_mut(&mage_id).unwrap();
+        m.set_float("mana", 5_000_000.0); // 5e6, above spatial but below general
+        m.set_float("view_radius", 5_000_000.0); // 5e6 spatial key, must clamp
+        m.set_float("piety", 5_000_000.0); // 5e6 non-spatial, must preserve
+
+        let (_int, float_repairs) = world.sanitize_non_system_entity_properties();
+        assert_eq!(float_repairs.len(), 1, "only the spatial view_radius should be flagged");
+        let (_id, key, _old, _new) = &float_repairs[0];
+        assert_eq!(key, "view_radius");
+
+        let m = world.entities.get(&mage_id).unwrap();
+        // mana: 5e6 < 1e7 general cap, must be preserved
+        assert_eq!(m.get_float("mana").unwrap(), 5_000_000.0);
+        // view_radius: clamped to ±1e6 spatial cap
+        assert_eq!(m.get_float("view_radius").unwrap(), 1.0e6);
+        // piety: 5e6 < 1e7 general cap, must be preserved
+        assert_eq!(m.get_float("piety").unwrap(), 5_000_000.0);
+    }
+
+    #[test]
+    fn test_sanitize_non_system_preserves_normal_location_values() {
+        // A character with normal location coordinates (within a few
+        // hundred units) must not be touched. This guards against the
+        // spatial cap being too tight for the normal game world.
+        let mut world = World::new("Test");
+        let hero = WorldEntity::new("character", "Wanderer", 0.0, 0.0);
+        let hero_id = world.add_entity(hero);
+        let h = world.entities.get_mut(&hero_id).unwrap();
+        h.set_float("location_x", 487.7);
+        h.set_float("location_y", -123.4);
+        h.set_float("view_radius", 50.0);
+        h.set_float("influence_radius", 12.5);
+
+        let (_int, float_repairs) = world.sanitize_non_system_entity_properties();
+        assert!(float_repairs.is_empty(), "normal spatial values must not be touched");
+        let h = world.entities.get(&hero_id).unwrap();
+        assert_eq!(h.get_float("location_x").unwrap(), 487.7);
+        assert_eq!(h.get_float("location_y").unwrap(), -123.4);
+        assert_eq!(h.get_float("view_radius").unwrap(), 50.0);
+        assert_eq!(h.get_float("influence_radius").unwrap(), 12.5);
     }
 
     #[test]
