@@ -45,7 +45,7 @@ Respond ONLY with valid JSON (no other text before or after). Required fields:
   "outcome": "2-3 sentences describing what happens",
   "effects": {{"property_name": change_value, ...}},
   "narrative": "a story-driven description of the action",
-  "history_summary": "rolling summary, max {max_history_summary_chars} chars"
+  "history_summary": "rolling summary, max {max_history_summary_chars} chars",
   "history_summary_replace": {{"old_part": "current text to change", "new_part": "what to change it to"}}
 }}
 

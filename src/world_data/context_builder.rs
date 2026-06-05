@@ -400,4 +400,111 @@ mod tests {
         let result = build_action_prompt("W", &entity, &ctx, template);
         assert_eq!(result, "static text with no placeholders");
     }
+
+    /// Regression test: the LLM prompt template's "respond with this JSON
+    /// shape" example must itself be syntactically valid JSON after
+    /// unescaping the `{{` / `}}` mustache-style braces, otherwise the
+    /// LLM is asked to mirror invalid JSON.
+    ///
+    /// Background: the template is sent to the LLM with literal `{{` and
+    /// `}}` (mustache-style escape for a single `{` / `}` in the
+    /// response). The LLM is told to "Respond ONLY with valid JSON" and
+    /// shown an example block. The example must describe a parseable JSON
+    /// shape (with `{{` → `{` and `}}` → `}`), otherwise the LLM is asked
+    /// to mirror broken JSON.
+    ///
+    /// Found in production: a missing comma between `history_summary` and
+    /// `history_summary_replace` made the example block invalid JSON, and
+    /// the LLM occasionally produced JS-style `Number(...)` wrappers and
+    /// concatenated sibling replace objects as "workarounds" — both of
+    /// which serde_json::from_str then rejected (~7/day parse_error
+    /// warnings in the LLM log).
+    #[test]
+    fn entity_action_template_json_example_is_valid_json() {
+        // Tests run with CARGO_MANIFEST_DIR set to the crate root.
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR not set (running outside cargo?)");
+        let template_path = std::path::Path::new(&manifest_dir)
+            .join("ai_templates")
+            .join("EntityAction.md");
+        let template = std::fs::read_to_string(&template_path)
+            .unwrap_or_else(|e| panic!("read {:?}: {}", template_path, e));
+
+        // Render the template with all placeholders filled so any
+        // placeholder that ends up inside the JSON example block has
+        // concrete values. Use a minimal dummy entity and context.
+        // Note: `build_action_prompt` does plain String::replace and
+        // does NOT process `{{` / `}}` (mustache escape is intentional —
+        // the LLM unescapes them in its response).
+        let entity = make_entity("X", 0.0, 0.0);
+        let ctx = ActionContext {
+            prop_context: String::new(),
+            entity_history_str: String::new(),
+            nearby_entities_str: String::new(),
+            power_tier_str: String::new(),
+            world_events_str: String::new(),
+            history_summary_str: String::new(),
+            max_history_summary_chars: 500,
+        };
+        let rendered = build_action_prompt("TestWorld", &entity, &ctx, &template);
+
+        // The example block is the first top-level `{{ ... }}` in the
+        // rendered template (line `{{` ... line `}}`). The rendered
+        // template keeps `{{` and `}}` literal.
+        let start_marker = "\"action\":";
+        let start = rendered
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("no '{}' in rendered template", start_marker));
+        // Walk back to the opening `{{` on its own line.
+        let open_idx = rendered[..start]
+            .rfind("\n{{")
+            .map(|i| i + 1)
+            .unwrap_or_else(|| {
+                if rendered.starts_with("{{") {
+                    0
+                } else {
+                    panic!("no opening '{{' for example block")
+                }
+            });
+        // Find the first `\n}}` after the opening (the example ends with
+        // `}}` on its own line).
+        let after_open = open_idx + 2;
+        let close_rel = rendered[after_open..]
+            .find("\n}}")
+            .unwrap_or_else(|| panic!("no closing '}}' for example block"));
+        let close_idx = after_open + close_rel + 1; // position of the '}'
+        let example_raw = &rendered[open_idx..=close_idx + 1];
+
+        // Unescape mustache: `{{` → `{` and `}}` → `}` — this is the
+        // shape the LLM is being asked to produce. Then normalize the
+        // illustrative placeholders so serde_json can parse the shape:
+        //   - `change_value` (a bare identifier) → `0` (number)
+        //   - `, ...` (placeholder for "more KV pairs" inside an object
+        //     value, e.g. `"effects": {"property_name": 0, ...}`)
+        //     → `` (empty). Without this strip, the inner object would
+        //     end with `, "…"` which is an orphan value with no key.
+        //   - remaining `...` (ellipsis used as a value placeholder in
+        //     string positions like `"action": "..."`) → `"…"`
+        //     (a string sentinel). The strip above must run first so
+        //     this replace doesn't match the `, ...` form.
+        let example_unescaped = example_raw
+            .replace("{{", "{")
+            .replace("}}", "}")
+            .replace("change_value", "0")
+            .replace(", ...", "")
+            .replace("...", "\"…\"");
+
+        // Parse it. If the template's example is invalid JSON, fail with
+        // both the unescaped shape and the raw literal so the bug is
+        // obvious.
+        serde_json::from_str::<serde_json::Value>(&example_unescaped).unwrap_or_else(|e| {
+            panic!(
+                "EntityAction.md JSON example is not valid JSON.\n\
+                 Error: {}\n\
+                 Shape the LLM is being asked to produce (after unescaping {{{{ / }}}}):\n{}\n\
+                 Raw literal in template:\n{}",
+                e, example_unescaped, example_raw
+            )
+        });
+    }
 }
