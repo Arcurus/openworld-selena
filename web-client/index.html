@@ -962,6 +962,7 @@
                 <span>📜 World Action Logs <span id="logsCurrentFile" style="color: #5a7a9a; font-size: 12px; font-weight: 400; margin-left: 8px;"></span></span>
                 <div style="display: flex; align-items: center; gap: 6px;">
                     <button class="btn btn-small" onclick="refreshLogsModal()" style="padding: 2px 8px; font-size: 11px;">🔄 Refresh</button>
+                    <button class="btn btn-small" id="logsDownloadBtn" onclick="downloadCurrentLog()" style="padding: 2px 8px; font-size: 11px;">⬇ Download</button>
                     <button class="modal-close" onclick="closeLogsModal()">&times;</button>
                 </div>
             </div>
@@ -2824,35 +2825,36 @@
                 if (!content) {
                     contentEl.innerHTML = '<div style="color: #5a7a9a; font-size: 11px; padding: 12px;">(empty log file)</div>';
                 } else {
-                    // Reverse lines so the NEWEST entry is at the top of the
-                    // modal (file is append-only, so the API's tail returns
-                    // lines in chronological order — oldest of the chunk
-                    // first, newest last; we flip that). 2026-06-05 per
-                    // Arcurus #openworld: the "I can't see new entries"
-                    // complaint was rooted in the old code scrolling to the
-                    // bottom where the layout race made the scroll a no-op,
-                    // so the user kept staring at the (unchanged) template
-                    // header. Newest-first is unambiguous.
-                    // The file is append-only and the logger often
-                    // closes each call with `====================\n\n`,
-                    // so the API's tail can come back with trailing
-                    // empty strings. trimEnd() drops ALL of them, then
-                    // we split. Without this, the (now-top) newest
-                    // block starts with 1–2 blank lines that look like
-                    // missing content.
-                    const lines = content.trimEnd().split('\n');
-                    lines.reverse();
-                    const reversed = lines.join('\n');
+                    // Per-entry reversal (NOT per-line). 2026-06-05 per
+                    // Arcurus #openworld: the previous version reversed
+                    // *every line* in the chunk, which put the END of the
+                    // latest call (`** Result: ... **`) at the top of the
+                    // modal and buried the START way down off-screen. The
+                    // right shape is to keep each entry internally ordered
+                    // (START → Instruction → Result → …) but reverse the
+                    // *order of entries* so the newest call sits at the
+                    // top with its `** label - timestamp **` header
+                    // visible. The log format uses 3+ blank lines as the
+                    // entry separator (`\n\n\n` at the start of every
+                    // entry body), so split on that, drop empties, and
+                    // reverse the array.
+                    const entries = content
+                        .split(/\n{3,}/)
+                        .map(e => e.replace(/^\s+|\s+$/g, ''))
+                        .filter(e => e.length > 0);
+                    entries.reverse();
+                    // Re-join with 3+ blank lines between entries so the
+                    // visual separation the file uses is preserved.
+                    const reversed = entries.join('\n\n\n\n');
                     contentEl.innerHTML =
                         '<div style="color: #5a7a9a; font-size: 10px; margin-bottom: 6px;">' + escapeHtml(metaLine) + '</div>' +
                         escapeHtml(reversed);
-                    // Scroll to TOP — newest is at the top now. We have
-                    // to do this in a rAF because innerHTML + scrollTop
-                    // in the same tick is a no-op in some browsers
-                    // (the layout hasn't been recalculated yet). The
-                    // refresh button calls this same path, so the
-                    // "always show newest first" behavior also applies
-                    // on refresh.
+                    // Scroll to TOP — newest entry's START header is at
+                    // the top now. rAF is needed because innerHTML +
+                    // scrollTop in the same tick is a no-op in some
+                    // browsers (layout hasn't been recalculated yet).
+                    // Refresh calls this same path, so newest-first
+                    // applies on refresh too.
                     const wrap = contentEl.parentElement;
                     if (wrap) {
                         requestAnimationFrame(() => {
@@ -2862,6 +2864,62 @@
                 }
             } catch (e) {
                 contentEl.innerHTML = '<div style="color: #f87171; font-size: 11px; padding: 12px;">Failed to load log: ' + escapeHtml(String(e)) + '</div>';
+            }
+        }
+
+        /// Download the currently-selected log file as a raw .log blob
+        /// (per Arcurus 2026-06-05 #openworld — the in-modal viewer only
+        /// shows the last 400 KB; this gives him the *full* file).
+        /// Fetches the JSON wrapper from /api/logs/:name, extracts the
+        /// `content` field, wraps it in a Blob, and triggers a browser
+        /// download. No tail/max_bytes — we want everything.
+        async function downloadCurrentLog() {
+            const filename = document.getElementById('logsCurrentFile').textContent.trim();
+            if (!filename) {
+                showNotification('No log file selected', 'error');
+                return;
+            }
+            const btn = document.getElementById('logsDownloadBtn');
+            if (btn) { btn.disabled = true; btn.textContent = '⏳ Downloading…'; }
+            try {
+                const r = await fetch('api/logs/' + encodeURIComponent(filename), {
+                    credentials: 'include',
+                });
+                if (!r.ok) {
+                    if (r.status === 401) {
+                        showNotification('Auth required to download log', 'error');
+                        if (typeof showPasswordUnlockDialog === 'function') {
+                            showPasswordUnlockDialog(() => downloadCurrentLog());
+                        }
+                    } else {
+                        showNotification('Download failed: HTTP ' + r.status, 'error');
+                    }
+                    return;
+                }
+                const d = await r.json();
+                if (!d || typeof d.content !== 'string') {
+                    showNotification('Unexpected log response shape', 'error');
+                    return;
+                }
+                // The API returns the file's full text. The browser
+                // download name is just the basename so it lands in
+                // ~/Downloads as e.g. `llm-log-2026-06-05.log` (no
+                // `logs/` prefix from the path).
+                const blob = new Blob([d.content], { type: 'text/plain;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;  // already basename, e.g. llm-log-2026-06-05.log
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                // Revoke after a short delay so the click can complete.
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+                showNotification('Downloaded ' + filename, 'success');
+            } catch (e) {
+                showNotification('Download failed: ' + (e && e.message ? e.message : e), 'error');
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = '⬇ Download'; }
             }
         }
 
