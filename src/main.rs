@@ -4729,6 +4729,73 @@ mod history_summary_replace_tests {
         assert_eq!(result.new_summary, None);
     }
 
+    // -- matrix row 13: !ALL! full-replace discards the current summary
+    //    and sets it to new_part (regression guard for 920fae9 / Arcurus
+    //    2026-06-05: !ALL! convention was added so callers can request a
+    //    full restructure without the API/LLM paths diverging). --
+    #[test]
+    fn all_full_replace_discards_current() {
+        let result = apply_history_summary_replaces(
+            Some("old narrative that is being thrown away"),
+            &[r("!ALL!", "completely fresh summary, new arc")],
+            10_000,
+        );
+        assert_eq!(
+            result.new_summary.as_deref(),
+            Some("completely fresh summary, new arc")
+        );
+        // !ALL! is by-design, no warning expected.
+        assert!(result.warnings.is_empty(), "got warnings: {:?}", result.warnings);
+        assert!(!result.truncated);
+    }
+
+    // -- matrix row 14: !ALL! followed by an append in the same chain
+    //    still applies the append (the [.!ALL! + append] combo is the
+    //    canonical "replace the whole summary, then add a tag line"
+    //    pattern that the LLM uses after a chapter break). --
+    #[test]
+    fn all_full_replace_then_append() {
+        let result = apply_history_summary_replaces(
+            Some("stale content"),
+            &[
+                r("!ALL!", "fresh chapter 1 content"),
+                r("", " (next: investigate ruins)"),
+            ],
+            10_000,
+        );
+        assert_eq!(
+            result.new_summary.as_deref(),
+            Some("fresh chapter 1 content (next: investigate ruins)")
+        );
+        assert!(result.warnings.is_empty());
+    }
+
+    // -- matrix row 15: !ALL! with empty new_part results in None
+    //    (the empty-as-None rule still applies to !ALL! — a full replace
+    //    to "" is equivalent to "no summary"). --
+    #[test]
+    fn all_full_replace_with_empty_new_part_results_in_none() {
+        let result = apply_history_summary_replaces(
+            Some("existing summary content"),
+            &[r("!ALL!", "")],
+            10_000,
+        );
+        assert_eq!(result.new_summary, None);
+        assert!(result.warnings.is_empty());
+    }
+
+    // -- matrix row 16: !ALL! is also a no-op when new_part is empty AND
+    //    there is no current summary (chain order still respected). --
+    #[test]
+    fn all_full_replace_with_none_summary_and_empty_new_part() {
+        let result = apply_history_summary_replaces(
+            None,
+            &[r("!ALL!", "")],
+            10_000,
+        );
+        assert_eq!(result.new_summary, None);
+    }
+
     // -- edge: into_vec on Single --
     #[test]
     fn one_or_many_into_vec_single() {
