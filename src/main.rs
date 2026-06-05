@@ -407,6 +407,16 @@ fn default_max_history_summary_chars() -> u32 {
     10000
 }
 
+// True if `s` has no meaningful content — only whitespace, punctuation,
+// ellipses (`…`), dashes (`—`/`-`), dots, etc. Catches the LLM-emit
+// "placebo summary" pattern where the model returns a single placeholder
+// character instead of an actual narrative summary. Storing these as
+// `Some("…")` produces a useless 1-char `history_summary` that the UI
+// shows in place of the real thing. We treat them as `None` instead.
+fn is_placeholder_summary(s: &str) -> bool {
+    !s.chars().any(|c| c.is_alphanumeric())
+}
+
 // ============================================================================
 // LLM rate limiter (rolling 1-hour window)
 // ============================================================================
@@ -2809,16 +2819,39 @@ async fn process_action_handler(
                     } else if let Some(s) = action_data.history_summary {
                         // Case 2: full replace (existing behavior).
                         let trimmed = s.trim();
-                        if trimmed.is_empty() {
+                        if trimmed.is_empty() || is_placeholder_summary(trimmed) {
+                            // LLM emitted a "placebo" summary (just "…",
+                            // "—", ".", or other non-meaningful content)
+                            // or sent an empty string. Either way, treat
+                            // as no summary so the entity has a clear
+                            // "no summary" state (None) instead of a
+                            // useless 1-char placeholder. The 124-entry
+                            // Shadow Crown bug (history_summary="…" while
+                            // history.len()=124) was caused by the missing
+                            // is_placeholder_summary check here.
                             entity.history_summary = None;
                             None
                         } else if trimmed.chars().count() > max_summary_chars {
                             let cut: String =
                                 trimmed.chars().take(max_summary_chars.saturating_sub(1)).collect();
-                            let final_summary = format!("{}…", cut);
-                            entity.history_summary = Some(final_summary.clone());
-                            summary_truncated = true;
-                            Some(final_summary)
+                            // If max_summary_chars was 0 (degenerate),
+                            // `cut` is empty and `format!("{}…", "")`
+                            // would produce a bare "…". Guard against
+                            // that so we don't store another placeholder.
+                            let final_summary = if cut.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{}…", cut)
+                            };
+                            if final_summary.is_empty() {
+                                entity.history_summary = None;
+                                summary_truncated = true;
+                                None
+                            } else {
+                                entity.history_summary = Some(final_summary.clone());
+                                summary_truncated = true;
+                                Some(final_summary)
+                            }
                         } else {
                             entity.history_summary = Some(trimmed.to_string());
                             Some(trimmed.to_string())
@@ -4822,5 +4855,39 @@ mod history_summary_replace_tests {
     fn find_replace_range_empty_needle_returns_zero_zero() {
         let h = "the hero met the dragon";
         assert_eq!(find_replace_range(h, ""), Some((0, 0)));
+    }
+
+    // -- is_placeholder_summary: detects LLM "placebo summaries" --
+    // Regression guard for the Shadow Crown bug (2026-06-05): the entity
+    // had history_summary="…" (1 char) while history.len()=124 because
+    // an earlier LLM emit stored the ellipsis as a real summary.
+    #[test]
+    fn is_placeholder_summary_detects_ellipsis_alone() {
+        assert!(is_placeholder_summary("…"));
+        assert!(is_placeholder_summary("… "));
+        assert!(is_placeholder_summary(" …"));
+    }
+
+    #[test]
+    fn is_placeholder_summary_detects_dash_alone() {
+        assert!(is_placeholder_summary("—"));
+        assert!(is_placeholder_summary("-"));
+        assert!(is_placeholder_summary(" -- "));
+    }
+
+    #[test]
+    fn is_placeholder_summary_detects_punctuation_only() {
+        assert!(is_placeholder_summary("..."));
+        assert!(is_placeholder_summary(".,;:"));
+        assert!(is_placeholder_summary("   "));
+    }
+
+    #[test]
+    fn is_placeholder_summary_accepts_real_summaries() {
+        assert!(!is_placeholder_summary("The hero drew their sword."));
+        assert!(!is_placeholder_summary("a")); // single alphanum is enough
+        assert!(!is_placeholder_summary("…but tomorrow the dragon wakes"));
+        // numeric-only is also meaningful (e.g., "12 victories")
+        assert!(!is_placeholder_summary("42"));
     }
 }
