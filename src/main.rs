@@ -2181,8 +2181,19 @@ pub struct HistorySummaryReplace {
 
 /// Accepts either a single `{old_part, new_part}` object or an array
 /// of such objects. Untagged so the LLM can use either shape freely.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+///
+/// Custom `Deserialize` (instead of `#[derive(Deserialize)]` +
+/// `#[serde(untagged)]`) so we can tolerate the empty shapes `{}`
+/// and `[]` — observed 2026-06-05 in llm-log: the world clock
+/// emitted `"history_summary_replace":{}` alongside a full
+/// `history_summary`, and the default untagged decoder rejected
+/// the response with "data did not match any variant of untagged
+/// enum HistorySummaryReplaceOneOrMany" (which caused the entire
+/// LLM response to be dropped, losing the `history_summary` too).
+/// Both `{}` and `[]` are now treated as `Many(vec![])` — a no-op
+/// replace chain — so the rest of the response still parses and
+/// the `history_summary` field (if present) is still applied.
+#[derive(Debug)]
 pub enum HistorySummaryReplaceOneOrMany {
     Single(HistorySummaryReplace),
     Many(Vec<HistorySummaryReplace>),
@@ -2195,6 +2206,46 @@ impl HistorySummaryReplaceOneOrMany {
         match self {
             HistorySummaryReplaceOneOrMany::Single(r) => vec![r],
             HistorySummaryReplaceOneOrMany::Many(rs) => rs,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HistorySummaryReplaceOneOrMany {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            // Tolerate `{}` and `[]` from the LLM (a stub empty replace).
+            serde_json::Value::Object(ref map) if map.is_empty() => {
+                Ok(HistorySummaryReplaceOneOrMany::Many(Vec::new()))
+            }
+            serde_json::Value::Array(ref items) if items.is_empty() => {
+                Ok(HistorySummaryReplaceOneOrMany::Many(Vec::new()))
+            }
+            // Otherwise defer to the original untagged dispatch.
+            other => {
+                #[derive(Deserialize)]
+                #[serde(untagged)]
+                enum Raw {
+                    Single(HistorySummaryReplace),
+                    Many(Vec<HistorySummaryReplace>),
+                }
+                let raw = Raw::deserialize(other).map_err(|e| {
+                    D::Error::custom(format!(
+                        "history_summary_replace: expected \
+                         {{old_part, new_part}} or array, or empty \
+                         {{}}/[]; got: {}",
+                        e
+                    ))
+                })?;
+                Ok(match raw {
+                    Raw::Single(s) => HistorySummaryReplaceOneOrMany::Single(s),
+                    Raw::Many(v) => HistorySummaryReplaceOneOrMany::Many(v),
+                })
+            }
         }
     }
 }
@@ -4635,6 +4686,63 @@ mod history_summary_replace_tests {
     fn one_or_many_into_vec_many() {
         let many = HistorySummaryReplaceOneOrMany::Many(vec![r("a", "b"), r("c", "d")]);
         assert_eq!(many.into_vec().len(), 2);
+    }
+
+    // -- edge: empty `{}` from the LLM is tolerated and deserializes
+    //    to a no-op Many(vec![]) (regression: 2026-06-05 00:52:19 the
+    //    world clock emitted `"history_summary_replace":{}` and the
+    //    default untagged decoder dropped the entire LLM response).
+    #[test]
+    fn one_or_many_deserializes_empty_object_as_noop() {
+        let parsed: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str("{}").expect("empty object should parse");
+        assert_eq!(parsed.into_vec().len(), 0);
+    }
+
+    // -- edge: empty `[]` from the LLM is tolerated and deserializes
+    //    to a no-op Many(vec![]) (symmetry with the `{}` case).
+    #[test]
+    fn one_or_many_deserializes_empty_array_as_noop() {
+        let parsed: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str("[]").expect("empty array should parse");
+        assert_eq!(parsed.into_vec().len(), 0);
+    }
+
+    // -- edge: a single object with both fields still deserializes
+    //    to Single (regression guard for the rewrite).
+    #[test]
+    fn one_or_many_deserializes_single_object() {
+        let parsed: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str(r#"{"old_part":"a","new_part":"b"}"#)
+                .expect("single object should parse");
+        let v = parsed.into_vec();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].old_part, "a");
+        assert_eq!(v[0].new_part, "b");
+    }
+
+    // -- edge: an array of two objects still deserializes to Many
+    //    (regression guard for the rewrite).
+    #[test]
+    fn one_or_many_deserializes_array_of_two() {
+        let parsed: HistorySummaryReplaceOneOrMany = serde_json::from_str(
+            r#"[{"old_part":"a","new_part":"b"},{"old_part":"c","new_part":"d"}]"#,
+        )
+        .expect("array should parse");
+        let v = parsed.into_vec();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[1].old_part, "c");
+    }
+
+    // -- edge: a non-empty object missing `new_part` still errors
+    //    (regression guard: we only relaxed the EMPTY case, real
+    //    malformed payloads should still be rejected so the operator
+    //    notices).
+    #[test]
+    fn one_or_many_rejects_partial_object() {
+        let result: Result<HistorySummaryReplaceOneOrMany, _> =
+            serde_json::from_str(r#"{"old_part":"a"}"#);
+        assert!(result.is_err(), "missing new_part must still fail");
     }
 
     // -- find_replace_range: strict matches --
