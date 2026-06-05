@@ -2799,8 +2799,10 @@
             contentEl.innerHTML = '<div style="color: #5a7a9a; font-size: 11px; padding: 12px;">Loading ' + escapeHtml(filename) + '…</div>';
             headerEl.textContent = filename;
             try {
-                // tail=200 lines OR last 400 KB, whichever is smaller
-                const url = 'api/logs/' + encodeURIComponent(filename) + '?tail=200&max_bytes=400000';
+                // tail=400 lines OR last 800 KB, whichever is smaller.
+                // Doubled from the original 200/400000 (per Arcurus 2026-06-05
+                // #openworld) so the viewer shows roughly 2x the recent window.
+                const url = 'api/logs/' + encodeURIComponent(filename) + '?tail=400&max_bytes=800000';
                 const r = await fetch(url, { credentials: 'include' });
                 if (!r.ok) {
                     if (r.status === 401) {
@@ -2822,12 +2824,41 @@
                 if (!content) {
                     contentEl.innerHTML = '<div style="color: #5a7a9a; font-size: 11px; padding: 12px;">(empty log file)</div>';
                 } else {
+                    // Reverse lines so the NEWEST entry is at the top of the
+                    // modal (file is append-only, so the API's tail returns
+                    // lines in chronological order — oldest of the chunk
+                    // first, newest last; we flip that). 2026-06-05 per
+                    // Arcurus #openworld: the "I can't see new entries"
+                    // complaint was rooted in the old code scrolling to the
+                    // bottom where the layout race made the scroll a no-op,
+                    // so the user kept staring at the (unchanged) template
+                    // header. Newest-first is unambiguous.
+                    // The file is append-only and the logger often
+                    // closes each call with `====================\n\n`,
+                    // so the API's tail can come back with trailing
+                    // empty strings. trimEnd() drops ALL of them, then
+                    // we split. Without this, the (now-top) newest
+                    // block starts with 1–2 blank lines that look like
+                    // missing content.
+                    const lines = content.trimEnd().split('\n');
+                    lines.reverse();
+                    const reversed = lines.join('\n');
                     contentEl.innerHTML =
                         '<div style="color: #5a7a9a; font-size: 10px; margin-bottom: 6px;">' + escapeHtml(metaLine) + '</div>' +
-                        escapeHtml(content);
-                    // Scroll to bottom (newest entries at the end, since file is append-only)
+                        escapeHtml(reversed);
+                    // Scroll to TOP — newest is at the top now. We have
+                    // to do this in a rAF because innerHTML + scrollTop
+                    // in the same tick is a no-op in some browsers
+                    // (the layout hasn't been recalculated yet). The
+                    // refresh button calls this same path, so the
+                    // "always show newest first" behavior also applies
+                    // on refresh.
                     const wrap = contentEl.parentElement;
-                    if (wrap) wrap.scrollTop = wrap.scrollHeight;
+                    if (wrap) {
+                        requestAnimationFrame(() => {
+                            wrap.scrollTop = 0;
+                        });
+                    }
                 }
             } catch (e) {
                 contentEl.innerHTML = '<div style="color: #f87171; font-size: 11px; padding: 12px;">Failed to load log: ' + escapeHtml(String(e)) + '</div>';

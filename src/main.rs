@@ -282,42 +282,18 @@ fn chrono_now_date() -> String {
 }
 
 fn chrono_now_timestamp() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let secs = now.as_secs();
-    // BUGFIX (2026-06-04): same as chrono_now_date — was using `secs` instead
-    // of `(secs / 86400)` for the day count, producing garbage years in
-    // log line timestamps. The HH:MM:SS part below was already correct.
-    let days_since_epoch = (secs / 86400) as i64;
-    let mut year = 1970;
-    let mut month = 1;
-    let mut day = 1;
-    let mut remaining = days_since_epoch;
-    let days_in_month: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    while remaining >= 365 {
-        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-        let days_in_year = if is_leap { 366 } else { 365 };
-        if remaining < days_in_year { break; }
-        remaining -= days_in_year;
-        year += 1;
-    }
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let mut dim = days_in_month.to_vec();
-    if is_leap { dim[1] = 29; }
-    for m in 0..12 {
-        if remaining < dim[m] {
-            // Same bugfix as chrono_now_date: set month before break.
-            month = (m + 1) as i64;
-            break;
-        }
-        remaining -= dim[m];
-        month = (m + 1) as i64;
-    }
-    day = remaining as i64 + 1;
-    let secs_of_day = secs % 86400;
-    let hours = secs_of_day / 3600;
-    let mins = (secs_of_day % 3600) / 60;
-    let secs = secs_of_day % 60;
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hours, mins, secs)
+    // BUGFIX (2026-06-05): this used to be a hand-rolled UTC formatter
+    // (epoch → year/month/day/h/m/s). That produced log timestamps in
+    // UTC, which on a CEST host diverged from the wall clock by 2 hours
+    // and made the log viewer look like the scheduler had stopped when
+    // it was actually running fine (per Arcurus #openworld). Switched to
+    // chrono::Local so the timestamps match the host's local timezone,
+    // consistent with the selena-project api_server.py log which already
+    // uses local time. (Note: the daily log filename still uses
+    // chrono_now_date which is also local — see comment there for why
+    // we keep it local too.) The `clock` feature is enabled on chrono
+    // in Cargo.toml to make `Local` available.
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 
