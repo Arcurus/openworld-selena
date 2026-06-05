@@ -84,7 +84,25 @@ fn tracking_url_and_token() -> (String, String) {
 
 /// Fire-and-forget POST to /api/llm-usage/record.  Reads token + URL
 /// from env at call time so a config change doesn't require a recompile.
-fn record_llm_call_async(provider: String, model: String, project: String) {
+///
+/// As of 2026-06-04 this also forwards real `usage` token counts
+/// (extracted from the MiniMax response) and char counts (input
+/// context, output text, optional reasoning/thinking block).  All
+/// count fields are optional query params; missing fields are
+/// stored as `null` in the event log, which is forward-compatible
+/// with older readers.
+#[allow(clippy::too_many_arguments)]
+fn record_llm_call_async(
+    provider: String,
+    model: String,
+    project: String,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    chars_in: Option<i64>,
+    chars_out: Option<i64>,
+    chars_reasoning: Option<i64>,
+) {
     tokio::spawn(async move {
         let (base, token) = tracking_url_and_token();
         if token.is_empty() {
@@ -102,13 +120,21 @@ fn record_llm_call_async(provider: String, model: String, project: String) {
             }
             return;
         }
-        let url = format!(
+        // Build the URL with all optional count fields.  Empty Option
+        // => no query param => the receiver stores `null` in the log.
+        let mut url = format!(
             "{}/api/llm-usage/record?provider={}&model={}&project={}",
             base,
             urlencoding::encode(&provider),
             urlencoding::encode(&model),
             urlencoding::encode(&project),
         );
+        if let Some(v) = tokens_in        { url.push_str(&format!("&tokens_in={}", v)); }
+        if let Some(v) = tokens_out       { url.push_str(&format!("&tokens_out={}", v)); }
+        if let Some(v) = reasoning_tokens { url.push_str(&format!("&reasoning_tokens={}", v)); }
+        if let Some(v) = chars_in         { url.push_str(&format!("&chars_in={}", v)); }
+        if let Some(v) = chars_out        { url.push_str(&format!("&chars_out={}", v)); }
+        if let Some(v) = chars_reasoning  { url.push_str(&format!("&chars_reasoning={}", v)); }
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
@@ -1824,10 +1850,49 @@ async fn action_llm_handler(
             // Report this LLM call back to the central selena-api tracker
             // so per-project / per-provider / per-model budgets reflect OW.
             // Fire-and-forget; does not block the response.
+            //
+            // As of 2026-06-04 this Rust-side call is the *sole* recorder
+            // for OW entity-action LLM calls. The Python scheduler in
+            // selena-project/code/scheduled_actions.py used to also call
+            // record_llm_call here, but that produced phantom duplicates
+            // in the events log (the scheduler is a *client* of this
+            // server, not a peer recorder). Removing the scheduler's
+            // record call was done in the same audit.
+            //
+            // We extract the real `usage` block from the MiniMax response
+            // (Anthropic-compatible shape: `input_tokens`,
+            // `output_tokens`) and the char counts of the request /
+            // response / reasoning block, then forward them as query
+            // params so the cost tracker can show real spend (not just
+            // call counts) for the OW project.
+            let (ti, to) = (
+                body.get("usage").and_then(|u| u.get("input_tokens")).and_then(|v| v.as_i64()),
+                body.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_i64()),
+            );
+            // Reasoning tokens (Anthropic / OpenAI both expose a
+            // `completion_tokens_details.reasoning_tokens` style field;
+            // the Anthropic-compatible shape often omits it, in which
+            // case we approximate from the `thinking` block length if
+            // present. 1 char ≈ 1 token for CJK reasoning text and
+            // ~0.25 token/char for English — we just send the char
+            // count and let the tracker divide if it needs to.  Best-
+            // effort: stay None on anything that doesn't parse.
+            let rt = body.get("usage")
+                .and_then(|u| u.get("reasoning_tokens"))
+                .and_then(|v| v.as_i64());
+            let ci = req.context.len() as i64;
+            let co = raw_response.len() as i64;
+            let cr = reasoning.as_ref().map(|s| s.len() as i64).unwrap_or(0);
             record_llm_call_async(
                 state.settings.llm.provider.clone(),
                 model.clone(),
-                "open-world".to_string(),
+                "open-world-selena".to_string(),
+                ti,
+                to,
+                rt,
+                Some(ci),
+                Some(co),
+                Some(cr),
             );
             
             success_json(serde_json::json!({
