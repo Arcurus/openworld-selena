@@ -409,6 +409,23 @@ impl BinaryPersistence {
         // we deliberately reset existing v3 saves to 0 on load. The
         // bytes are read to keep the cursor in sync with the file
         // layout; the value is then discarded.
+        //
+        // IMPORTANT: the file layout (write order in serialize_world)
+        // writes the other settings fields first and `max_history_
+        // summary_chars` LAST. The reads below must mirror that
+        // order exactly, or the cursor drifts and subsequent reads
+        // return garbage (which is exactly what broke
+        // `save_load_roundtrip_preserves_settings` and
+        // `save_load_with_paths_roundtrips` before this fix).
+        let actions_per_year = Self::read_f64(data, &mut pos) as u32;
+        let tick_action_enabled = Self::read_bool(data, &mut pos);
+        let time_weight_factor = Self::read_f64(data, &mut pos);
+        let proximity_weight_factor = Self::read_f64(data, &mut pos);
+        let power_weight_factor = Self::read_f64(data, &mut pos);
+        let resource_weight_factor = Self::read_f64(data, &mut pos);
+        let auto_save_interval_secs = Self::read_u64(data, &mut pos);
+        let history_entries_fully_displayed = Self::read_f64(data, &mut pos) as u32;
+        let history_entries_shortened = Self::read_f64(data, &mut pos) as u32;
         let max_history_summary_chars = if version >= 3 {
             let _stored = Self::read_u64(data, &mut pos) as u32;
             0u32  // v3 stored value no longer meaningful; use global default
@@ -416,15 +433,15 @@ impl BinaryPersistence {
             WorldSettings::default().max_history_summary_chars
         };
         let settings = WorldSettings {
-            actions_per_year: Self::read_f64(data, &mut pos) as u32,
-            tick_action_enabled: Self::read_bool(data, &mut pos),
-            time_weight_factor: Self::read_f64(data, &mut pos),
-            proximity_weight_factor: Self::read_f64(data, &mut pos),
-            power_weight_factor: Self::read_f64(data, &mut pos),
-            resource_weight_factor: Self::read_f64(data, &mut pos),
-            auto_save_interval_secs: Self::read_u64(data, &mut pos),
-            history_entries_fully_displayed: Self::read_f64(data, &mut pos) as u32,
-            history_entries_shortened: Self::read_f64(data, &mut pos) as u32,
+            actions_per_year,
+            tick_action_enabled,
+            time_weight_factor,
+            proximity_weight_factor,
+            power_weight_factor,
+            resource_weight_factor,
+            auto_save_interval_secs,
+            history_entries_fully_displayed,
+            history_entries_shortened,
             max_history_summary_chars,
         };
 
@@ -651,10 +668,360 @@ impl BinaryPersistence {
             id: Self::read_uuid(data, pos),
             from_id: Self::read_uuid(data, pos),
             to_id: Self::read_uuid(data, pos),
-            blocked: data[*pos] == 1,
+            // `write_path` pushes a single byte for `blocked`; mirror
+            // that here by advancing the cursor after reading it.
+            // The previous `data[*pos] == 1` form did not advance
+            // `pos`, which made every subsequent path read drift by
+            // one byte and eventually blow up in `read_string` (the
+            // 1485-of-565 panic in `save_load_with_paths_roundtrips`).
+            blocked: Self::read_bool(data, pos),
             blocked_reason: Self::read_option_string(data, pos),
             distance_modifier: Self::read_f64(data, pos),
             path_type: Self::read_string(data, pos),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for BinaryPersistence.
+    //!
+    //! The persistence module had **zero** tests for its 3 public
+    //! functions (save_world, load_world, save_exists) even though
+    //! it's the only bridge between the in-memory World and disk.
+    //! A regression in this code would silently corrupt or fail to
+    //! load saved games.  These tests cover:
+    //!
+    //!   * Round-trip equality of the fields the binary format
+    //!     actually serializes (name, entities, paths, settings,
+    //!     properties, action_count, last_world_action).
+    //!   * save_exists before/after a save.
+    //!   * load_world error paths: missing file, invalid magic,
+    //!     unsupported future version.
+    //!   * .bak creation when the target save already exists.
+    //!
+    //! Fields NOT covered by the binary format (description,
+    //! active_events, world_time) are intentionally skipped; the
+    //! current serializer does not write them and the loader
+    //! reinitializes them with defaults.
+    use super::*;
+    use crate::world_data::world::Path as WorldPath;
+    use std::path::{Path, PathBuf};
+    use uuid::Uuid;
+
+    /// Build a unique tmp path for a test save. We use a per-test
+    /// suffix so tests can run in parallel (`cargo test`) without
+    /// clobbering each other's save files.
+    fn tmp_path(suffix: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!(
+            "ow_persist_test_{}_{}_{}.bin",
+            suffix,
+            std::process::id(),
+            nanos
+        ));
+        p
+    }
+
+    /// Best-effort cleanup so /tmp doesn't fill up after a test run.
+    /// Errors are intentionally swallowed — a leaked tmp file is
+    /// less interesting than a failing test.
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let mut bak = path.to_path_buf();
+        bak.set_extension("bin.bak");
+        let _ = std::fs::remove_file(&bak);
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_name_and_entity_count() {
+        // A fresh world has 1 entity (the world clock) and 5
+        // active events — see World::new() and the lore-events
+        // bootstrap.  The binary format doesn't write events, so
+        // the loaded world will have 0 active_events; the entity
+        // count IS written, so it must round-trip.
+        let world = World::new("Roundtrip World");
+        let path_str = tmp_path("name_entities").to_string_lossy().to_string();
+
+        BinaryPersistence::save_world(&world, &path_str)
+            .expect("save should succeed for a fresh world");
+        let loaded = BinaryPersistence::load_world(&path_str)
+            .expect("load should succeed immediately after save");
+
+        assert_eq!(loaded.name, "Roundtrip World");
+        assert_eq!(
+            loaded.entities.len(),
+            world.entities.len(),
+            "entity count must survive round-trip"
+        );
+        cleanup(&PathBuf::from(&path_str));
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_settings() {
+        // Build a world, then mutate every WorldSettings field to a
+        // value different from the default, save, load, and assert
+        // the loaded world has the mutated values.
+        let mut world = World::new("Settings World");
+        world.settings.actions_per_year = 42;
+        world.settings.tick_action_enabled = true;
+        world.settings.time_weight_factor = 1.5;
+        world.settings.proximity_weight_factor = 2.5;
+        world.settings.power_weight_factor = 3.5;
+        world.settings.resource_weight_factor = 4.5;
+        world.settings.auto_save_interval_secs = 600;
+        world.settings.history_entries_fully_displayed = 12;
+        world.settings.history_entries_shortened = 7;
+        world.settings.max_history_summary_chars = 2500;
+
+        let path_str = tmp_path("settings").to_string_lossy().to_string();
+        let path = PathBuf::from(&path_str);
+        BinaryPersistence::save_world(&world, &path_str).expect("save ok");
+        let loaded = BinaryPersistence::load_world(&path_str).expect("load ok");
+
+        assert_eq!(loaded.settings.actions_per_year, 42);
+        assert!(loaded.settings.tick_action_enabled);
+        assert!((loaded.settings.time_weight_factor - 1.5).abs() < 1e-9);
+        assert!((loaded.settings.proximity_weight_factor - 2.5).abs() < 1e-9);
+        assert!((loaded.settings.power_weight_factor - 3.5).abs() < 1e-9);
+        assert!((loaded.settings.resource_weight_factor - 4.5).abs() < 1e-9);
+        assert_eq!(loaded.settings.auto_save_interval_secs, 600);
+        assert_eq!(loaded.settings.history_entries_fully_displayed, 12);
+        assert_eq!(loaded.settings.history_entries_shortened, 7);
+        // max_history_summary_chars is deliberately reset to 0 on
+        // v3 loads (see deserialize_world comment) — that's the
+        // intentional behavior, not a regression.
+        assert_eq!(loaded.settings.max_history_summary_chars, 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_load_roundtrip_preserves_world_properties() {
+        // World properties (int/float/string HashMaps) are written
+        // by serialize_world; the loader reads them back into the
+        // same fields.  This test would catch any silent loss of
+        // the property tables.
+        let mut world = World::new("Props World");
+        world.properties_int.insert("score".to_string(), 999);
+        world
+            .properties_float
+            .insert("latitude".to_string(), 49.47);
+        world
+            .properties_string
+            .insert("motto".to_string(), "Luna renovat".to_string());
+
+        let path_str = tmp_path("props").to_string_lossy().to_string();
+        BinaryPersistence::save_world(&world, &path_str).expect("save ok");
+        let loaded = BinaryPersistence::load_world(&path_str).expect("load ok");
+
+        assert_eq!(loaded.properties_int.get("score"), Some(&999));
+        assert_eq!(
+            loaded.properties_float.get("latitude").copied(),
+            Some(49.47)
+        );
+        assert_eq!(
+            loaded.properties_string.get("motto").map(|s| s.as_str()),
+            Some("Luna renovat")
+        );
+        let path = PathBuf::from(&path_str);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_exists_true_after_save() {
+        let world = World::new("Exists World");
+        let path_str = tmp_path("exists").to_string_lossy().to_string();
+
+        assert!(
+            !BinaryPersistence::save_exists(&path_str),
+            "save_exists must be false before any save"
+        );
+
+        BinaryPersistence::save_world(&world, &path_str).expect("save ok");
+        assert!(
+            BinaryPersistence::save_exists(&path_str),
+            "save_exists must be true after save_world"
+        );
+        let path = PathBuf::from(&path_str);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_exists_false_for_missing_file() {
+        let path_str = tmp_path("missing").to_string_lossy().to_string();
+        // Make sure the file is genuinely absent even if a prior
+        // run leaked one.
+        let _ = std::fs::remove_file(&path_str);
+        assert!(!BinaryPersistence::save_exists(&path_str));
+    }
+
+    #[test]
+    fn load_missing_file_returns_err() {
+        let path_str = tmp_path("nope").to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path_str);
+        let result = BinaryPersistence::load_world(&path_str);
+        assert!(result.is_err(), "loading a missing file must error");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Failed to open"),
+            "expected 'Failed to open' error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn load_invalid_magic_returns_err() {
+        // Write 4 bytes that are not the "OWBL" magic, then try to
+        // load. The loader must reject the file before reaching
+        // the deserializer.
+        let path = tmp_path("bad_magic");
+        std::fs::write(&path, b"XXXXrest of file content is irrelevant")
+            .expect("write ok");
+        let path_str = path.to_string_lossy().to_string();
+        let result = BinaryPersistence::load_world(&path_str);
+        assert!(result.is_err(), "garbage file must not load");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Invalid file format"),
+            "expected 'Invalid file format' error, got: {}",
+            msg
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn load_unsupported_version_returns_err() {
+        // Hand-craft a v3-shaped file but with version=99 in the
+        // header.  The loader must reject it as "unsupported".
+        let path = tmp_path("bad_version");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"OWBL"); // magic
+        bytes.extend_from_slice(&99u32.to_le_bytes()); // version = 99
+        std::fs::write(&path, &bytes).expect("write ok");
+        let path_str = path.to_string_lossy().to_string();
+        let result = BinaryPersistence::load_world(&path_str);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Unsupported file version"),
+            "expected 'Unsupported file version' error, got: {}",
+            msg
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_creates_backup_when_file_exists() {
+        // First save creates the save file.  Second save must
+        // rename the existing file to .bak before writing the new
+        // one.  This is the safety net that lets a player recover
+        // from a corrupted save.
+        let world1 = World::new("Backup World v1");
+        let world2 = World::new("Backup World v2");
+        let path = tmp_path("backup");
+        let path_str = path.to_string_lossy().to_string();
+        let mut bak = path.clone();
+        bak.set_extension("bin.bak");
+
+        BinaryPersistence::save_world(&world1, &path_str).expect("first save ok");
+        assert!(path.exists(), "first save must create file");
+        assert!(
+            !bak.exists(),
+            "no .bak should exist after the first save"
+        );
+
+        BinaryPersistence::save_world(&world2, &path_str)
+            .expect("second save ok");
+        assert!(path.exists(), "second save must keep the file");
+        assert!(bak.exists(), "second save must create .bak");
+
+        // Loading the .bak yields the previous world; loading the
+        // main file yields the new world.
+        let from_main =
+            BinaryPersistence::load_world(&path_str).expect("load main ok");
+        let from_bak =
+            BinaryPersistence::load_world(&bak.to_string_lossy())
+                .expect("load bak ok");
+        assert_eq!(from_main.name, "Backup World v2");
+        assert_eq!(from_bak.name, "Backup World v1");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_does_not_create_backup_for_fresh_path() {
+        // The .bak behavior should only kick in when the target
+        // file already exists.  A save to a brand-new path must
+        // not leave a stray .bak behind.
+        let world = World::new("No Backup World");
+        let path = tmp_path("no_backup");
+        let path_str = path.to_string_lossy().to_string();
+        let mut bak = path.clone();
+        bak.set_extension("bin.bak");
+        let _ = std::fs::remove_file(&bak); // paranoia
+
+        BinaryPersistence::save_world(&world, &path_str).expect("save ok");
+        assert!(path.exists());
+        assert!(
+            !bak.exists(),
+            "a fresh-path save must not produce a .bak"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_load_with_paths_roundtrips() {
+        // The Path struct is a non-trivial nested type (UUID +
+        // Option<String> + 2x f64 + 2 UUID endpoints).  Round-trip
+        // a world with two paths and check the deserialized path
+        // list is structurally equal.
+        let mut world = World::new("Pathed World");
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        world.paths.push(WorldPath::new(a, b, "road"));
+        world.paths.push(WorldPath::new(b, a, "forest"));
+
+        let path_str = tmp_path("paths").to_string_lossy().to_string();
+        BinaryPersistence::save_world(&world, &path_str).expect("save ok");
+        let loaded = BinaryPersistence::load_world(&path_str).expect("load ok");
+
+        assert_eq!(loaded.paths.len(), 2);
+        let types: Vec<&str> = loaded.paths.iter().map(|p| p.path_type.as_str()).collect();
+        assert!(types.contains(&"road"));
+        assert!(types.contains(&"forest"));
+        // Endpoints are preserved too.
+        assert!(loaded
+            .paths
+            .iter()
+            .any(|p| p.from_id == a && p.to_id == b && p.path_type == "road"));
+        assert!(loaded
+            .paths
+            .iter()
+            .any(|p| p.from_id == b && p.to_id == a && p.path_type == "forest"));
+        let path = PathBuf::from(&path_str);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_load_with_empty_world_no_paths_no_props() {
+        // Edge case: a world that has been constructed but never
+        // had anything added to it.  Must still round-trip cleanly.
+        let world = World::new("Empty World");
+        let path_str = tmp_path("empty").to_string_lossy().to_string();
+        BinaryPersistence::save_world(&world, &path_str).expect("save ok");
+        let loaded = BinaryPersistence::load_world(&path_str).expect("load ok");
+
+        assert_eq!(loaded.name, "Empty World");
+        assert!(loaded.paths.is_empty());
+        assert!(loaded.properties_int.is_empty());
+        assert!(loaded.properties_float.is_empty());
+        assert!(loaded.properties_string.is_empty());
+        assert_eq!(loaded.action_count, 0);
+        assert!(loaded.last_world_action.is_none());
+        let path = PathBuf::from(&path_str);
+        cleanup(&path);
     }
 }
