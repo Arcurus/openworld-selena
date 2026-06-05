@@ -2891,6 +2891,19 @@ async fn process_action_handler(
                 let response = success_json(response_json).into_response();
                 // `entity` and `world` mutable borrows end here.
 
+                // Bump world action counters. These fields are persisted
+                // in save.owbl (see World.rs:114,118 and persistence.rs
+                // read/write), but no code path was ever setting them —
+                // both stayed at their defaults (0 and None) forever.
+                // The API at /api/ always reported "action_count": 0
+                // and "last_world_action": null regardless of activity,
+                // even though world_data/action_history.jsonl had 1958+
+                // entries. This fixes that long-standing observability
+                // bug. Relates to: e23e3910 (P6, World mechanics
+                // improvements).
+                world.action_count = world.action_count.saturating_add(1);
+                world.last_world_action = Some(chrono::Utc::now());
+
                 // Persist world after applying LLM action effects.
                 if let Err(save_err) = BinaryPersistence::save_world(&world, &state.save_path) {
                     eprintln!("[process_action] auto-save failed: {}", save_err);

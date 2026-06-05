@@ -1483,4 +1483,38 @@ mod tests {
             i64::MAX
         );
     }
+
+    // -- action_count + last_world_action (observability) --
+    // Regression guard: the world has had `action_count: u64` and
+    // `last_world_action: Option<DateTime<Utc>>` fields since the
+    // load/save schema was designed, but no code path was ever setting
+    // them — both stayed at their defaults (0 / None) forever. The
+    // /api/ endpoint always reported `"action_count": 0` and
+    // `"last_world_action": null` regardless of activity. process_action
+    // now bumps them on every successful response; this test pins
+    // the new contract from the data side: the field exists on a
+    // fresh world and the typical bump pattern is safe.
+    #[test]
+    fn test_action_count_defaults_to_zero_on_new_world() {
+        let world = World::new("Fresh");
+        assert_eq!(world.action_count, 0);
+        assert!(world.last_world_action.is_none());
+    }
+
+    #[test]
+    fn test_action_count_saturates_instead_of_overflowing() {
+        // saturating_add guards against a hypothetical u64::MAX wrap.
+        let mut world = World::new("Saturate");
+        world.action_count = u64::MAX;
+        world.action_count = world.action_count.saturating_add(1);
+        assert_eq!(world.action_count, u64::MAX);
+    }
+
+    #[test]
+    fn test_last_world_action_can_be_set_and_read() {
+        let mut world = World::new("Ts");
+        let now = chrono::Utc::now();
+        world.last_world_action = Some(now);
+        assert_eq!(world.last_world_action, Some(now));
+    }
 }
