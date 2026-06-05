@@ -270,6 +270,20 @@ def scan_llm_log(log_path: str) -> Dict[str, Any]:
         ("truncated",           "exceeded"),  # generic "exceeded N chars" truncation
         ("old_part_not_found",  "old_part not found"),
         ("old_part_unique",     "occurs more than once"),
+        # Tolerant JSON repair (226e685 + 78ea1ac): the World Clock
+        # entity has been emitting a recurring empty-key malformation
+        # in `history_summary_replace` (e.g. `{"old_part":"...","":"new_part":"..."}`
+        # — a spurious empty-string key whose value is the *name* of
+        # the next real key, then the actual pair appended without a
+        # separator). Strict serde_json rejects the whole response.
+        # The server now runs a conservative regex repair and surfaces
+        # a descriptive warning. Substring matches the start of the
+        # warning string `parse_llm_action_response: LLM response
+        # matched a known malformed pattern and was repaired ...`.
+        # Useful to track so we know whether the bug is still
+        # recurring in production (and how often our repair actually
+        # fires).
+        ("regex_repair",        "parse_llm_action_response: LLM response matched a known"),
         # System-entity protection (c7f3bc27 / d7bf225): the LLM
         # sometimes tries to write effects to the world clock or other
         # system entities; the server correctly rejects those. Expected
@@ -524,6 +538,7 @@ def render_report(rels: List[Dict[str, Any]],
             # is stable run-to-run.
             bucket_order = ["both_dropped", "neither", "truncated",
                             "old_part_not_found", "old_part_unique",
+                            "regex_repair",
                             "system_entity_targeted", "skipped_effect_system",
                             "skipped_effect_magnitude", "other"]
             bucket_labels = {
@@ -532,6 +547,7 @@ def render_report(rels: List[Dict[str, Any]],
                 "truncated":               "Truncated (over cap)",
                 "old_part_not_found":      "old_part not found",
                 "old_part_unique":         "old_part ambiguous (occurs N×)",
+                "regex_repair":            "Regex repair (LLM empty-key bug)",
                 "system_entity_targeted":  "System entity targeted",
                 "skipped_effect_system":   "Skipped effect (system entity)",
                 "skipped_effect_magnitude":"Skipped effect (magnitude cap)",
