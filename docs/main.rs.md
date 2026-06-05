@@ -57,6 +57,7 @@ Loaded from `settings.json`. Key sections:
 | GET | `/api/entities/:id` | Get single entity |
 | PUT | `/api/entities/:id` | Update entity |
 | DELETE | `/api/entities/:id` | Delete entity |
+| POST | `/api/entities/:id/history-summary/replace` | Surgical history edit (see [History Summary Replace Conventions](#history-summary-replace-conventions)) |
 
 ### Entity Actions (LLM-powered)
 | Method | Endpoint | Description |
@@ -113,6 +114,28 @@ Loaded from `settings.json`. Key sections:
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/` | Web client UI (fallback) |
+
+## History Summary Replace Conventions
+
+`POST /api/entities/:id/history-summary/replace` and the LLM-emit
+`history_summary_replace` field in the action response both go through
+the shared function `apply_history_summary_replaces` in `src/main.rs`,
+so the conventions are identical for API, CLI, and LLM callers. Added
+2026-06-04, extended with the `!ALL!` full-replace convention 2026-06-05.
+
+| `old_part` value | Behavior |
+|------------------|----------|
+| `"!ALL!"` | **Full replace** — discard the current summary, set it to `new_part`. Use this when a full restructure is needed and you want to make sure important things don't get lost. No warning. |
+| `""` (empty) | **Append** — `new_part` is added to the end of the current summary, or becomes the new summary if there isn't one yet. No warning. |
+| non-empty, found | **Find-replace** — replace the first occurrence of `old_part` with `new_part`. |
+| non-empty, not found | **Skip + warning** (the chain continues). With the API endpoint, pass `"not_found_is_error": true` in the body to get a 404 instead of a 200-with-warning. |
+
+After the replace, the result is truncated to the entity's effective
+`max_history_summary_chars` cap if it goes over, with a warning logged
+and a `…` appended at the truncation boundary. The LLM template
+(`ai_templates/EntityAction.md`) is the user-facing reference; the
+behavior matrix above is the authoritative one for operators and
+debugging.
 
 ## LLM Integration
 

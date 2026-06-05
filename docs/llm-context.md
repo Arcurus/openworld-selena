@@ -1,7 +1,13 @@
 # LLM Action Context Documentation
 
-**Last Updated:** 2026-04-19 08:52 CEST
+**Last Updated:** 2026-06-05 (history_summary_replace: !ALL! full-replace convention added)
 **File:** `ai_templates/EntityAction.md`
+
+> **Response-format conventions** (what the LLM emits back): see
+> [main.rs.md → History Summary Replace Conventions](./main.rs.md#history-summary-replace-conventions)
+> for the authoritative table of `old_part` values. The LLM-facing
+> examples in `ai_templates/EntityAction.md` are the short version; the
+> matrix there covers every edge case for operators.
 
 ---
 

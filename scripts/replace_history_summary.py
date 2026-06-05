@@ -12,6 +12,9 @@ multi-replace in one go.
 Conventions (mirror the API exactly):
   - old_part is REQUIRED to be non-empty UNLESS new_part is
     also empty (then the whole call is a no-op).
+  - old_part="!ALL!" + non-empty new_part = FULL REPLACE: discard
+    the current summary, set it to new_part. Use this when a full
+    restructure is needed. (Added 2026-06-05 per Arcurus #openworld.)
   - old_part="" + non-empty new_part = APPEND new_part to end
     of current summary (no warning logged).
   - non-empty old_part not found in current summary = WARNING
@@ -30,6 +33,9 @@ cookie or a token-based flow.
 Usage:
   # Find-replace (most common case)
   python3 scripts/replace_history_summary.py <entity_id> --old "old text" --new "new text"
+
+  # Full replace (discard current, set to new)
+  python3 scripts/replace_history_summary.py <entity_id> --old "!ALL!" --new "<complete new summary>"
 
   # Append to end of current summary
   python3 scripts/replace_history_summary.py <entity_id> --old "" --new " (appended note)"

@@ -1241,36 +1241,53 @@ async fn get_entity_history(
 // ---------------------------------------------------------------------------
 //
 // `POST /api/entities/:id/history-summary/replace`
-// Body: { "old_part": "...", "new_part": "..." }
+// Body: { "old_part": "...", "new_part": "...", "not_found_is_error": false }
 //
-// Finds `old_part` in the entity's current `history_summary` (the FIRST
-// occurrence, case-sensitive), replaces it with `new_part`, then truncates
-// the result to the effective cap if it goes over. The cap is the same
-// resolved cap as for process_action (per-world override or global
-// default), and a warning is added to the response if truncation happened.
+// Applies a single `history_summary_replace` operation to the entity's
+// current `history_summary` and persists the result. The actual replace
+// logic lives in `apply_history_summary_replaces` (shared with the
+// LLM-emit path) so the API, CLI, and LLM behaviors stay in lockstep.
+// Conventions (mirrored from the LLM template, ai_templates/EntityAction.md):
+//   - `old_part == "!ALL!"` → full replace: discard current, set the
+//     summary to `new_part`. Use this when a full restructure is needed
+//     and you want to make sure important things don't get lost by
+//     rewriting the whole thing in one shot.
+//   - `old_part == ""`       → append: `new_part` is added to the end of
+//     the current summary (or becomes the new summary if there isn't
+//     one yet). No warning logged.
+//   - `old_part != ""`       → find-replace: replace the first
+//     occurrence of `old_part` with `new_part`. If not found, the call
+//     either returns 404 (when `not_found_is_error = true`) or a
+//     200-success with a warning and no change made (default lenient
+//     behavior; controlled by `not_found_is_error`).
+//   - After the replace, the result is truncated to the effective cap
+//     (per-world override or global default) if it goes over, with a
+//     warning logged.
 //
 // Per Arcurus 2026-06-04 (#openworld): "add a way to replace one part of
 // the history with another one instead of replacing the full one. the
 // replace should also cut if the new summary is too long and log a
 // warning."
 //
-// 2026-06-04: empty `old_part` is now an explicit "append" path
-// (`new_part` goes to the END of the current summary, or becomes the new
-// summary if there isn't one yet). No warning logged for append, per the
-// "no no warning just append" rule. This matches the convention used by
-// the LLM-emit `history_summary_replace` command so the API, CLI, and
-// LLM path all have the same affordances.
+// 2026-06-04: empty `old_part` was made the explicit "append" path,
+// matching the LLM-emit `history_summary_replace` command. API, CLI, and
+// LLM path now have the same affordances.
+//
+// 2026-06-05: `old_part == "!ALL!"` was added as the full-replace
+// convention (per Arcurus). The handler now delegates to
+// `apply_history_summary_replaces` so the !ALL! branch and every other
+// rule is identical for API and LLM callers.
 //
 // Response shape (success):
 //   { success: true, history_summary, history_summary_chars,
-//     truncated: bool, warning: Option<String> }
+//     truncated: bool, warning: Option<String>,
+//     max_chars, max_chars_source }
 //
 // Errors:
 //   404 NOT_FOUND       — entity doesn't exist
 //   404 NOT_FOUND       — `old_part` not found in current summary
-//                         (also returned as success with no-op + warning,
-//                          depending on `not_found_is_error`; default is
-//                          warning for ergonomics)
+//                         (only when `not_found_is_error = true`; the
+//                          default is success + warning for ergonomics)
 //   401 UNAUTHORIZED    — missing/invalid auth cookie
 #[derive(Debug, Deserialize)]
 struct HistorySummaryReplaceRequest {
@@ -1314,7 +1331,15 @@ async fn history_summary_replace_handler(
     // Do all the entity mutations inside a block so the &mut borrow
     // on `entity` is released before we call save_world(&world) and
     // log_error (both of which would conflict with the live borrow).
-    let (final_summary, truncated, entity_name_for_log) = {
+    //
+    // 2026-06-05: this handler now delegates the actual replace logic
+    // to `apply_history_summary_replaces` (the shared function used by
+    // the LLM-emit path), so the API and LLM behaviors are guaranteed
+    // to stay in lockstep — including the `!ALL!` full-replace
+    // convention. The only API-specific logic that remains here is the
+    // `not_found_is_error` toggle, the response shape, and the log
+    // mirror.
+    let (final_summary, truncated, entity_name_for_log, warnings) = {
         let entity = match world.get_entity_mut(&id) {
             Some(e) => e,
             None => return error_json(StatusCode::NOT_FOUND, "Entity not found"),
@@ -1322,78 +1347,53 @@ async fn history_summary_replace_handler(
 
         let current = entity.history_summary.clone().unwrap_or_default();
 
-        // Build the combined string. Two paths:
-        //   1. `old_part` is empty → "append" path. `new_part` is
-        //      added to the end of the current summary (or becomes
-        //      the new summary if `current` is empty). No warning.
-        //   2. `old_part` is non-empty → find-replace path. Locate
-        //      the first occurrence of `old_part` in `current` and
-        //      substitute `new_part`. If not found, fall through to
-        //      the strict/lenient decision.
-        let combined = if req.old_part.is_empty() {
-            // Append convention.
-            if current.is_empty() {
-                // No current summary: new_part IS the new summary.
-                req.new_part.clone()
-            } else {
-                let mut s = String::with_capacity(current.len() + req.new_part.len());
-                s.push_str(&current);
-                s.push_str(&req.new_part);
-                s
-            }
-        } else {
-            // Find-replace path. find() returns a char-boundary by
-            // definition, so the byte index is safe to slice at.
-            let match_byte_idx = current.find(&req.old_part);
-            match match_byte_idx {
-                Some(idx) => {
-                    let end = idx + req.old_part.len();
-                    let mut s = String::with_capacity(current.len() + req.new_part.len());
-                    s.push_str(&current[..idx]);
-                    s.push_str(&req.new_part);
-                    s.push_str(&current[end..]);
-                    s
-                }
-                None => {
-                    // Not found. Strict or lenient?
-                    if req.not_found_is_error {
-                        return error_json(
-                            StatusCode::NOT_FOUND,
-                            &format!(
-                                "old_part not found in current summary (length {})",
-                                current.len()
-                            ),
-                        );
-                    }
-                    // Lenient: no-op, but warn so the caller knows nothing changed.
-                    return success_json(serde_json::json!({
-                        "success": true,
-                        "history_summary": entity.history_summary,
-                        "history_summary_chars": current.len(),
-                        "truncated": false,
-                        "warning": "old_part not found in current summary; no change made",
-                        "max_chars": max_cap,
-                        "max_chars_source": max_source,
-                    })).into_response();
-                }
-            }
-        };
+        // Single-element replace chain. The shared function handles
+        // empty / "!ALL!" / found / not-found / truncation identically
+        // for both API and LLM callers.
+        let result = apply_history_summary_replaces(
+            Some(&current),
+            &[HistorySummaryReplace {
+                old_part: req.old_part.clone(),
+                new_part: req.new_part.clone(),
+            }],
+            max_cap as usize,
+        );
 
-        // Truncate if over cap. Cut from the END (keeps the start + the
-        // freshly inserted new_part intact, which is the part the caller
-        // just edited). Append "…" on the truncation boundary.
-        let (final_summary, truncated) = if combined.chars().count() > max_cap as usize {
-            // Keep the first (cap-1) chars, then append ellipsis.
-            let keep = (max_cap as usize).saturating_sub(1);
-            let cut: String = combined.chars().take(keep).collect();
-            let truncated_str = format!("{}…", cut);
-            (truncated_str, true)
-        } else {
-            (combined, false)
-        };
+        // API-only: map the "not found" warning to either an error
+        // (strict) or a soft no-op warning (lenient), per the
+        // `not_found_is_error` request flag.
+        let not_found = !req.old_part.is_empty()
+            && req.old_part != "!ALL!"
+            && result.warnings.iter().any(|w| w.contains("not found"));
+        if not_found && req.not_found_is_error {
+            return error_json(
+                StatusCode::NOT_FOUND,
+                &format!(
+                    "old_part not found in current summary (length {})",
+                    current.len()
+                ),
+            );
+        }
+        if not_found && !req.not_found_is_error {
+            // Lenient: no-op, but warn so the caller knows nothing changed.
+            return success_json(serde_json::json!({
+                "success": true,
+                "history_summary": entity.history_summary,
+                "history_summary_chars": current.chars().count(),
+                "truncated": false,
+                "warning": "old_part not found in current summary; no change made",
+                "max_chars": max_cap,
+                "max_chars_source": max_source,
+            })).into_response();
+        }
 
-        entity.history_summary = Some(final_summary.clone());
-        (final_summary, truncated, entity.name.clone())
+        // Apply the new summary to the entity. `result.new_summary` is
+        // `None` if the chain produced empty content (kept as None
+        // rather than Some("") to preserve the "never had a summary"
+        // vs "had a summary that was just emptied" distinction).
+        entity.history_summary = result.new_summary.clone();
+        let final_summary = result.new_summary.clone().unwrap_or_default();
+        (final_summary, result.truncated, entity.name.clone(), result.warnings)
         // entity borrow released at end of block
     };
 
@@ -1412,17 +1412,7 @@ async fn history_summary_replace_handler(
         })).into_response();
     }
 
-    // Build a warning string when truncated so the caller can see it
-    // (and the on-disk log gets a matching entry).
-    let mut warnings: Vec<String> = Vec::new();
-    if truncated {
-        warnings.push(format!(
-            "history_summary exceeded {} chars after replace; truncated to {}+'…'",
-            max_cap, max_cap - 1
-        ));
-    }
-
-    // Mirror the warning to the error log so the truncation is
+    // Mirror warnings (truncation, etc.) to the error log so they're
     // discoverable via /api/logs as well as the API response.
     if !warnings.is_empty() {
         if let Ok(mut logger) = state.logger.lock() {
@@ -2164,19 +2154,28 @@ async fn entity_action(
 // single turn. The deserializer uses `#[serde(untagged)]` on an enum
 // to handle both shapes transparently.
 //
-// The full behavior (per Arcurus 2026-06-04):
+// The full behavior (per Arcurus 2026-06-04, extended 2026-06-05):
 //   - Both `history_summary` AND `history_summary_replace` present:
 //     replace wins, `history_summary` is dropped, warning logged.
 //   - Only `history_summary_replace` present: apply chain in order.
 //   - Only `history_summary` present: full replace (existing behavior).
 //   - Neither present: no change to summary, warning logged.
 //   - For each replace:
+//       * `old_part == "!ALL!"`: full replace — set state to `new_part`,
+//         ignoring current. No warning. Subsequent replaces in the
+//         chain still apply (e.g. [!ALL! + append] is valid).
 //       * `old_part == ""`: append `new_part` to current; no warning.
 //         If current is empty, `new_part` becomes the new summary.
 //       * `old_part != ""` + found: replace first occurrence.
 //       * `old_part != ""` + not found: skip, warning logged.
 //       * `old_part != ""` + current is empty: skip, warning logged.
 //   - After chain: truncate to `max_chars` if over (warning logged).
+//
+// Both the LLM-emit path and the `POST /api/entities/:id/history-summary/replace`
+// API endpoint funnel through this function, so the !ALL! convention
+// (and every other rule) is identical for LLM and API callers. The
+// API handler adds the `not_found_is_error` toggle on top of the
+// "not found" warning.
 //
 // The LLM template wording (ai_templates/EntityAction.md) intentionally
 // omits the edge-case semantics above so the instructions stay on-point
@@ -2378,7 +2377,17 @@ pub fn apply_history_summary_replaces(
     let mut state: String = current.unwrap_or("").to_string();
 
     for (i, rep) in replaces.iter().enumerate() {
-        if rep.old_part.is_empty() {
+        if rep.old_part == "!ALL!" {
+            // Full replace convention. The history is rewritten in
+            // full from `new_part`; the existing `state` is discarded.
+            // This is the `old_part == "!ALL!"` branch — the LLM or
+            // API caller uses this when they need to do a full
+            // restructure of the summary (per Arcurus 2026-06-05).
+            // No warning is logged: the call is by design. Subsequent
+            // replaces in the chain still apply (e.g. [!ALL! + append]).
+            state = rep.new_part.clone();
+            continue;
+        } else if rep.old_part.is_empty() {
             // Append path. Per the rule: no warning logged.
             if state.is_empty() {
                 // No current content: new_part IS the new state.
