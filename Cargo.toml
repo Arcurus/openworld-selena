@@ -23,6 +23,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Date/time
 chrono = { version = "0.4", features = ["serde", "clock"] }
 
+# Regex (used in process_action_handler tolerant pre-parse fixup for
+# the LLM's recurring `history_summary_replace` empty-key bug; see
+# fix_known_malformed_patterns in src/main.rs).
+regex = "1"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = "0.3"

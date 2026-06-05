@@ -227,12 +227,30 @@ impl DailyLogger {
             .and_then(|mut f| f.write_all(line.as_bytes()));
     }
     
-    fn log_llm(&mut self, context: &str, response: &str, time_ms: u64, success: bool, parsing_outcome: &str, extra: &str) {
+    /// `call_label` is the per-call identifier embedded in the visually
+    /// scannable header. For `process_action` calls this should be the
+    /// action name (e.g. `"descend_to_boundary_fracture of Velora the
+    /// Undying"`) so the START header in the log file tells you exactly
+    /// which call it is. For the generic `action_llm_handler` (where
+    /// the LLM is *deciding* the action) this is just the entity name.
+    /// The format (per Arcurus 2026-06-05 #openworld):
+    ///   - 3 blank lines as a visual separator from the previous call
+    ///   - `** {label} - {timestamp} **` START header
+    ///   - `Instruction:` line + the prompt that was sent to the LLM
+    ///   - blank line
+    ///   - `** Result: {label} - {timestamp} **` END header
+    ///   - the LLM's response + parse outcome + extra metadata
+    ///   - trailing blank line
+    /// The double-asterisk framing and the "Instruction:" / "Result:"
+    /// labels make it trivial to scan a long log and find call
+    /// boundaries by eye.
+    fn log_llm(&mut self, call_label: &str, context: &str, response: &str, time_ms: u64, success: bool, parsing_outcome: &str, extra: &str) {
         let timestamp = chrono_now_timestamp();
         let success_str = if success { "SUCCESS" } else { "FAILED" };
+        let label = if call_label.is_empty() { "LLM" } else { call_label };
         let lines = format!(
-            "[{}] === LLM Call ===\nSuccess: {}\nTime: {} ms\n--- Context ---\n{}\n--- Response ---\n{}\n--- Parsing ---\n{}\n--- Extra ---\n{}\n====================\n\n",
-            timestamp, success_str, time_ms, context, response, parsing_outcome, extra
+            "\n\n\n** {} - {} **\nInstruction:\n{}\n\n** Result: {} - {} **\nSuccess: {}\nTime: {} ms\n--- Response ---\n{}\n--- Parsing ---\n{}\n--- Extra ---\n{}\n\n",
+            label, timestamp, context, label, timestamp, success_str, time_ms, response, parsing_outcome, extra
         );
         let _ = std::fs::OpenOptions::new()
             .create(true)
@@ -240,6 +258,49 @@ impl DailyLogger {
             .open(&self.llm_file_path)
             .and_then(|mut f| f.write_all(lines.as_bytes()));
     }
+}
+
+/// Best-effort extraction of the `action` field from a (possibly
+/// malformed) LLM JSON response, for use as a visual log label. Returns
+/// `None` if the field can't be located, in which case the caller
+/// should fall back to a less specific label. This is a quick string
+/// scan, not a full JSON parse — the response in this branch is by
+/// definition broken, so trying serde_json::from_str would just fail
+/// and we'd be back where we started.
+fn extract_action_field(response: &str) -> Option<String> {
+    // Look for `"action"` (with optional whitespace) followed by `:`.
+    let needle = "\"action\"";
+    let start = response.find(needle)?;
+    let after_key = &response[start + needle.len()..];
+    // Skip whitespace and the colon.
+    let colon = after_key.find(':')?;
+    let after_colon = &after_key[colon + 1..];
+    // Skip whitespace.
+    let trimmed = after_colon.trim_start();
+    // Expect a `"`.
+    if !trimmed.starts_with('"') {
+        return None;
+    }
+    let value = &trimmed[1..];
+    // Find the closing `"` (not escaped). Bail on the first unescaped one.
+    let mut chars = value.char_indices();
+    let mut current_idx = 0;
+    let mut prev_was_backslash = false;
+    while let Some((i, c)) = chars.next() {
+        current_idx = i;
+        if prev_was_backslash {
+            prev_was_backslash = false;
+            continue;
+        }
+        if c == '\\' {
+            prev_was_backslash = true;
+            continue;
+        }
+        if c == '"' {
+            return Some(value[..current_idx].to_string());
+        }
+    }
+    None
 }
 
 fn chrono_now_date() -> String {
@@ -1638,6 +1699,7 @@ async fn action_llm_handler(
             logger.ensure_today(&PathBuf::from("logs"));
             logger.log_error(&err);
             logger.log_llm(
+                "LLM",
                 &req.context,
                 "",
                 0,
@@ -1703,6 +1765,7 @@ async fn action_llm_handler(
                         logger.ensure_today(&PathBuf::from("logs"));
                         logger.log_error(&err);
                         logger.log_llm(
+                            "LLM",
                             &req.context,
                             &body_text,
                             elapsed_ms,
@@ -1731,6 +1794,7 @@ async fn action_llm_handler(
                             logger.ensure_today(&PathBuf::from("logs"));
                             logger.log_error(&err);
                             logger.log_llm(
+                                "LLM",
                                 &req.context,
                                 &body_text,
                                 elapsed_ms,
@@ -1793,6 +1857,7 @@ async fn action_llm_handler(
                     logger.ensure_today(&PathBuf::from("logs"));
                     logger.log_error(&err);
                     logger.log_llm(
+                        "LLM",
                         &req.context,
                         &body_text,
                         elapsed_ms,
@@ -1814,6 +1879,7 @@ async fn action_llm_handler(
             if let Ok(mut logger) = state.logger.lock() {
                 logger.ensure_today(&PathBuf::from("logs"));
                 logger.log_llm(
+                    "LLM",
                     &req.context,
                     &raw_response,
                     elapsed_ms,
@@ -1887,6 +1953,7 @@ async fn action_llm_handler(
                 logger.ensure_today(&PathBuf::from("logs"));
                 logger.log_error(&err);
                 logger.log_llm(
+                    "LLM",
                     &req.context,
                     "",
                     elapsed_ms,
@@ -2017,6 +2084,7 @@ async fn entity_action(
                     logger.ensure_today(&PathBuf::from("logs"));
                     logger.log_error(&err);
                     logger.log_llm(
+                        &entity.name,
                         &prompt,
                         &body,
                         0,
@@ -2526,8 +2594,72 @@ fn parse_llm_action_response(raw: &str) -> Result<LlmActionResponse, String> {
     } else {
         raw
     };
-    
-    serde_json::from_str(json_str).map_err(|e| format!("JSON parse error: {} - Input: {}", e, json_str))
+
+    // First try the strict parse.
+    match serde_json::from_str::<LlmActionResponse>(json_str) {
+        Ok(parsed) => Ok(parsed),
+        Err(e) => {
+            // Strict parse failed. Try a tolerant fixup pass before
+            // giving up — see `fix_known_malformed_patterns` for the
+            // specific patterns we know how to repair. Per Arcurus
+            // 2026-06-05 #openworld: the World Clock entity has been
+            // emitting a `history_summary_replace` array whose first
+            // element has a spurious `"" : "new_part"` key+value
+            // before the actual `"new_part"` field, e.g.
+            //   {"old_part":"...","":"new_part":"..."}
+            // instead of
+            //   {"old_part":"...","new_part":"..."}
+            // which serde rejects. Rather than rejecting the whole
+            // response (and losing the `action`, `effects`, `narrative`,
+            // and the `history_summary` that often comes with it), we
+            // run a conservative regex repair and retry.
+            let repaired = fix_known_malformed_patterns(json_str);
+            if repaired != json_str {
+                match serde_json::from_str::<LlmActionResponse>(&repaired) {
+                    Ok(parsed) => {
+                        // Successful repair — return the parsed value
+                        // and let the caller log a warning so this
+                        // remains observable.
+                        Ok(parsed)
+                    }
+                    Err(e2) => Err(format!(
+                        "JSON parse error: {} - Input (after repair attempt): {}",
+                        e2, repaired
+                    )),
+                }
+            } else {
+                Err(format!("JSON parse error: {} - Input: {}", e, json_str))
+            }
+        }
+    }
+}
+
+/// Conservative regex-based repair for known LLM JSON malformation
+/// patterns. Only touches the specific shapes we've actually seen in
+/// the field; if a different bug appears later, the strict parse
+/// still fails and we surface the error normally. Returns the
+/// (possibly modified) string. If no repair was needed, returns the
+/// input unchanged.
+///
+/// Currently repairs:
+///   1. `,"":"new_part":"VALUE"` → `,"new_part":"VALUE"`
+///   2. `,"":"old_part":"VALUE"` → `,"old_part":"VALUE"`
+/// i.e. the LLM emitted a spurious empty-string key whose value is
+/// the *name* of the next real key, then forgot the comma and wrote
+/// `: actual_value` directly. This is the World Clock's recurring
+/// `history_summary_replace` bug (per Arcurus 2026-06-05 #openworld).
+fn fix_known_malformed_patterns(s: &str) -> String {
+    // Conservative: only match the two known key names. If the
+    // bogus value is anything else we leave the string alone so
+    // we don't accidentally mangle a real (if weird) object.
+    // No Lazy/OnceLock caching: this only runs on the parse-error
+    // path, which is rare, so the regex construction cost is
+    // negligible. (We avoid pulling in once_cell just for this.)
+    let pattern = regex::Regex::new(r#","":\s*"(old_part|new_part)":"#)
+        .expect("fix_known_malformed_patterns: regex compiles");
+    pattern.replace_all(s, |caps: &regex::Captures| {
+        format!(r#","{}":"#, &caps[1])
+    }).into_owned()
 }
 
 // Process LLM action response - apply effects from raw LLM response
@@ -2886,6 +3018,12 @@ async fn process_action_handler(
                 if let Ok(mut logger) = state.logger.lock() {
                     logger.ensure_today(&PathBuf::from("logs"));
                     logger.log_llm(
+                        // New visual format: label is the action name +
+                        // entity, so the log header reads e.g.
+                        // "** descend_to_boundary_fracture of Velora the
+                        // Undying - 2026-06-05 18:47:59 **" and the call
+                        // boundary is obvious at a glance.
+                        &format!("{} of {}", action_data.action, entity.name),
                         &format!("Process action for entity {}: {}", entity_id, action_data.action),
                         raw_response,
                         0,
@@ -2944,7 +3082,19 @@ async fn process_action_handler(
             if let Ok(mut logger) = state.logger.lock() {
                 logger.ensure_today(&PathBuf::from("logs"));
                 logger.log_error(&err_msg);
+                // Best-effort action-name extraction for the visual
+                // header. The response is malformed (that's why we're
+                // in this branch), but the `"action": "..."` field
+                // is usually intact and parseable up to the point of
+                // failure. Falls back to `entity:{id}` if extraction
+                // fails, so the header is never empty.
+                let action_from_response = extract_action_field(raw_response);
+                let log_label = match action_from_response {
+                    Some(action) => format!("{} of entity:{}", action, req.entity_id),
+                    None => format!("entity:{}", req.entity_id),
+                };
                 logger.log_llm(
+                    &log_label,
                     &format!("Process action for entity {}", req.entity_id),
                     raw_response,
                     0,
@@ -4941,5 +5091,69 @@ mod history_summary_replace_tests {
         assert!(!is_placeholder_summary("…but tomorrow the dragon wakes"));
         // numeric-only is also meaningful (e.g., "12 victories")
         assert!(!is_placeholder_summary("42"));
+    }
+}
+
+#[cfg(test)]
+mod fix_known_malformed_patterns_tests {
+    use super::fix_known_malformed_patterns;
+
+    #[test]
+    fn repairs_empty_key_before_new_part() {
+        // The exact pattern from the 2026-06-05 15:42 World Clock
+        // error log: the LLM emitted
+        //   {"old_part":"...","":"new_part":"..."}
+        // instead of
+        //   {"old_part":"...","new_part":"..."}
+        let broken = r#"{"old_part":"Currently broadcasting...Post-Harmonization Era.","":"new_part":"Now actively collecting..."}"#;
+        let repaired = fix_known_malformed_patterns(broken);
+        let parsed: serde_json::Value = serde_json::from_str(&repaired)
+            .expect("repaired string must parse");
+        assert_eq!(
+            parsed.get("old_part").and_then(|v| v.as_str()),
+            Some("Currently broadcasting...Post-Harmonization Era.")
+        );
+        assert_eq!(
+            parsed.get("new_part").and_then(|v| v.as_str()),
+            Some("Now actively collecting...")
+        );
+    }
+
+    #[test]
+    fn repairs_empty_key_before_old_part() {
+        // Mirror case: the bogus value is "old_part" instead of
+        // "new_part". Same fix shape, just a different key name.
+        // The empty key is here the SECOND key (preceded by
+        // `"new_part"`), so the regex's required leading comma is
+        // present — matching how the bug would actually appear in
+        // the wild.
+        let broken = r#"{"new_part":"newer text","":"old_part":"some text"}"#;
+        let repaired = fix_known_malformed_patterns(broken);
+        let parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(parsed.get("old_part").and_then(|v| v.as_str()), Some("some text"));
+        assert_eq!(parsed.get("new_part").and_then(|v| v.as_str()), Some("newer text"));
+    }
+
+    #[test]
+    fn leaves_valid_json_unchanged() {
+        // Sanity: a well-formed history_summary_replace object
+        // should pass through untouched (the function returns the
+        // input unchanged so the equality check `repaired != json_str`
+        // in `parse_llm_action_response` works correctly).
+        let ok = r#"{"old_part":"a","new_part":"b"}"#;
+        let repaired = fix_known_malformed_patterns(ok);
+        assert_eq!(repaired, ok);
+    }
+
+    #[test]
+    fn does_not_touch_unrelated_empty_keys() {
+        // The regex only matches `,"":"old_part":"` or `,"":"new_part":"`.
+        // An empty key with some other value must NOT be modified
+        // (the caller would then try the strict parse and surface
+        // the error normally, which is the right behavior for a
+        // bug we don't recognize).
+        let unrelated = r#"{"":"unexpected_value","x":"y"}"#;
+        let repaired = fix_known_malformed_patterns(unrelated);
+        assert_eq!(repaired, unrelated);
     }
 }
