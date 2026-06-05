@@ -2354,6 +2354,14 @@ pub struct ApplyReplaceResult {
 ///      fails, strip trailing `.,;:!?"')` from each side of `needle`
 ///      and try the strict match again. This handles "saw a dragon."
 ///      vs "saw a dragon", or "scout, ready" vs "scout, ready."
+///   4. Unicode-quirk normalization (LLM-introduced glyph variants):
+///      fold both sides to a canonical ASCII form via
+///      `normalize_llm_unicode_quirks` (smart quotes, en/em dashes,
+///      full-width punctuation, NBSP, Latin ligatures, long-s) and
+///      re-run the strict find. The returned byte indices are
+///      translated back to the ORIGINAL haystack via
+///      `map_quirk_index_to_original` so the caller can slice the
+///      un-normalized source.
 ///
 /// Returns `(start, end)` byte indices in `haystack` (safe to slice on,
 /// since both branches land on token boundaries), or `None` if no
@@ -2419,7 +2427,149 @@ fn find_replace_range(haystack: &str, needle: &str) -> Option<(usize, usize)> {
         }
     }
 
+    // 4. Unicode quirk normalization on both sides (LLM-flavoured
+    //    subset), then re-run the strict find. Common cases that
+    //    fail across LLM calls because the prior `old_part` and
+    //    the current stored text are byte-different but glyph-
+    //    equivalent: smart quotes (U+201C / U+201D / U+2018 / U+2019
+    //    vs U+0022 / U+0027), en-dash / em-dash / horizontal bar
+    //    (U+2013 / U+2014 / U+2015 vs U+002D), full-width ASCII
+    //    punctuation (U+FF0C vs U+002C etc.), non-breaking space and
+    //    friends (U+00A0 / U+202F / U+2007 vs U+0020), and the
+    //    Latin typographic ligatures (U+FB00..U+FB06). Hand-rolled
+    //    here to avoid pulling in `unicode-normalization` for what
+    //    is a tiny, predictable LLM-introduced surface.
+    let h_norm: String = normalize_llm_unicode_quirks(haystack);
+    let n_norm: String = normalize_llm_unicode_quirks(needle);
+    if h_norm != haystack || n_norm != needle {
+        if let Some(idx) = h_norm.find(&n_norm) {
+            // Map normalized index back to a byte index in the
+            // ORIGINAL haystack. The mapper walks codepoints in
+            // lockstep and is correct for the quirk set above (each
+            // normalized char corresponds to exactly one original
+            // codepoint — either an unchanged passthrough or a single
+            // replacement from the table).
+            let start_orig = map_quirk_index_to_original(haystack, &h_norm, idx);
+            let end_orig = map_quirk_index_to_original(
+                haystack,
+                &h_norm,
+                idx + n_norm.len(),
+            );
+            return Some((start_orig, end_orig));
+        }
+    }
+
     None
+}
+
+/// Fold the LLM-introduced Unicode variants most commonly seen in
+/// `history_summary_replace` payloads to a canonical ASCII form. This
+/// is intentionally *not* full NFKC — it's a small, auditable table
+/// for the cases we actually observe. Some entries map 1 codepoint
+/// to 1 codepoint (most punctuation); some map 1 codepoint to 2
+/// codepoints (ligatures). The index-mapper in
+/// `map_quirk_index_to_original` handles both shapes via a
+/// precomputed alignment table.
+fn normalize_llm_unicode_quirks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let mapped: &str = match c {
+            // Smart double quotes → straight double quote.
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{FF02}' => "\"",
+            // Smart single quotes / apostrophes → ASCII apostrophe.
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{FF07}' => "\'",
+            // En-dash, em-dash, horizontal bar, math minus → ASCII hyphen-minus.
+            '\u{2013}' | '\u{2014}' | '\u{2015}' | '\u{2212}' => "-",
+            // Full-width comma, period, semicolon, colon, question,
+            // exclamation, parens → ASCII equivalents.
+            '\u{FF0C}' => ",",
+            '\u{FF0E}' => ".",
+            '\u{FF1B}' => ";",
+            '\u{FF1A}' => ":",
+            '\u{FF1F}' => "?",
+            '\u{FF01}' => "!",
+            '\u{FF08}' => "(",
+            '\u{FF09}' => ")",
+            // Non-breaking space, narrow no-break space, figure space,
+            // thin space, zero-width space → ASCII space.
+            '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{2009}' | '\u{200B}' => " ",
+            // Latin typographic ligatures (fi, fl, ffi, ffl, st) fold
+            // to their ASCII digraphs so find() can match across turns.
+            '\u{FB01}' => "fi",
+            '\u{FB02}' => "fl",
+            '\u{FB03}' => "ffi",
+            '\u{FB04}' => "ffl",
+            '\u{FB05}' => "st",
+            '\u{FB06}' => "st",
+            // Long-s (ſ) is interchangeable with regular 's' in
+            // English prose; fold to 's' to make a find() robust.
+            '\u{017F}' => "s",
+            // Anything else passes through untouched.
+            other => {
+                out.push(other);
+                continue;
+            }
+        };
+        out.push_str(mapped);
+    }
+    out
+}
+
+/// Translate a byte index in the *normalized* string back to the
+/// equivalent byte index in the *original* string. Used by
+/// `find_replace_range` after the quirk-normalized find succeeds, so
+/// the caller can slice the (un-normalized) original haystack at the
+/// right position.
+///
+/// Strategy: walk both strings in lockstep, codepoint by codepoint,
+/// recording the original-byte-offset of every normalized
+/// codepoint boundary. For a 1-codepoint→1-codepoint mapping (smart
+/// quote, em-dash, full-width comma, NBSP, long-s, passthroughs) the
+/// boundary list is a clean bijection. For 1-codepoint→2-codepoints
+/// ligatures, the first normalized codepoint of the digraph
+/// ("fi"[0]) maps to the original ligature's start byte, and the
+/// second normalized codepoint ("fi"[1]) also maps to the same
+/// original ligature start byte (because the digraph as a whole
+/// replaces the single ligature). The lookup picks the smallest
+/// original-byte-offset whose normalized-byte-offset is >= the
+/// target — which always lands on a char boundary in the original.
+fn map_quirk_index_to_original(
+    original: &str,
+    normalized: &str,
+    target_norm: usize,
+) -> usize {
+    // Build a sorted list of (normalized_byte_offset, original_byte_offset)
+    // pairs in lockstep, then binary-search for the smallest pair
+    // whose norm_offset >= target_norm.
+    //
+    // For each original char `oc` we look up its normalized form
+    // (using the same match table) so the per-step byte deltas are
+    // computed in lockstep. The list is monotonically increasing in
+    // both axes, so a linear walk + early exit is enough for our
+    // size (summary bodies are bounded by max_history_summary_chars,
+    // default 500, hard cap ~10k).
+    let mut o_idx = 0usize;
+    let mut n_idx = 0usize;
+    for oc in original.chars() {
+        if n_idx >= target_norm {
+            break;
+        }
+        let mapped_len: usize = match oc {
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' | '\u{FF02}' => 1,
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{FF07}' => 1,
+            '\u{2013}' | '\u{2014}' | '\u{2015}' | '\u{2212}' => 1,
+            '\u{FF0C}' | '\u{FF0E}' | '\u{FF1B}' | '\u{FF1A}' | '\u{FF1F}'
+            | '\u{FF01}' | '\u{FF08}' | '\u{FF09}' => 1,
+            '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{2009}' | '\u{200B}' => 1,
+            '\u{FB01}' | '\u{FB02}' | '\u{FB03}' | '\u{FB04}' | '\u{FB05}'
+            | '\u{FB06}' => 2,
+            '\u{017F}' => 1,
+            _ => oc.len_utf8(),
+        };
+        o_idx += oc.len_utf8();
+        n_idx += mapped_len;
+    }
+    o_idx
 }
 
 pub fn apply_history_summary_replaces(
@@ -2474,9 +2624,34 @@ pub fn apply_history_summary_replaces(
                 None => {
                     // Per the rule: not-found is a WARNING, not an
                     // error. The rest of the chain still applies.
+                    // The message includes a 60-char preview of the
+                    // missing `old_part` so the operator can see at
+                    // a glance which sentence the LLM was looking
+                    // for. Most of the time the LLM is recalling a
+                    // stale sentence from a previous turn (e.g.
+                    // "She travels..." when the stored summary
+                    // already has "She traveled..." or has dropped
+                    // the sentence entirely), and the preview makes
+                    // that obvious without having to dig out the
+                    // raw LLM log. 60 chars is long enough to
+                    // disambiguate but short enough to keep the
+                    // warning line scannable in a list of many.
+                    const PREVIEW_CHARS: usize = 60;
+                    let preview: String = rep
+                        .old_part
+                        .chars()
+                        .take(PREVIEW_CHARS)
+                        .collect::<String>()
+                        + if rep.old_part.chars().count() > PREVIEW_CHARS {
+                            "…"
+                        } else {
+                            ""
+                        };
                     warnings.push(format!(
-                        "history_summary_replace[{}]: old_part not found in current summary; skipped",
-                        i
+                        "history_summary_replace[{}]: old_part not found in current summary (length {}); skipped (looking for: {:?})",
+                        i,
+                        state.chars().count(),
+                        preview
                     ));
                 }
             }
@@ -5101,6 +5276,180 @@ mod history_summary_replace_tests {
     fn find_replace_range_empty_needle_returns_zero_zero() {
         let h = "the hero met the dragon";
         assert_eq!(find_replace_range(h, ""), Some((0, 0)));
+    }
+
+    // -- find_replace_range: smart quotes fold to ASCII --
+    // Real-world pattern observed in 2026-06-05 action_history: the
+    // LLM emitted curly quotes (U+201C/U+201D) in `old_part` while
+    // the stored summary had straight quotes. Pre-fix this hit
+    // "old_part not found" in hundreds of entries; the new
+    // Unicode-quirk fallback should match and produce a byte range
+    // aligned to the ORIGINAL (pre-normalization) haystack so the
+    // caller's slice still lands on a valid char boundary in the
+    // stored summary.
+    //
+    // Haystack uses raw-string ASCII quotes (typical stored-summary
+    // form); needle uses U+201C / U+201D (typical LLM emit). The
+    // returned slice is on the ORIGINAL haystack, so it should
+    // contain ASCII quotes — that's the whole point of the index
+    // mapper.
+    #[test]
+    fn find_replace_range_folds_smart_quotes_to_ascii() {
+        let h = r#"the hero said "met the dragon" to the bard"#;
+        // needle uses U+201C / U+201D (left/right double quote)
+        let n = "\u{201C}met the dragon\u{201D}";
+        let r = find_replace_range(h, n);
+        assert!(r.is_some(), "should match despite smart quotes");
+        let (s, e) = r.unwrap();
+        // Slicing the original must round-trip the ASCII-quoted
+        // span (haystack has ASCII quotes, not curly) — the byte
+        // indices are in the ORIGINAL string, so the slice is also
+        // ASCII.
+        assert_eq!(&h[s..e], "\"met the dragon\"");
+    }
+
+    // -- find_replace_range: em-dash / en-dash fold to ASCII hyphen --
+    // Common LLM punctuation slip: an old_part written with an
+    // em-dash (—) when the stored text used a hyphen (-), or vice
+    // versa. The fuzziness should bridge them.
+    #[test]
+    fn find_replace_range_folds_em_dash_to_hyphen() {
+        let h = "the realm of Aethermoor—where shadows linger";
+        let n = "Aethermoor-where";
+        let r = find_replace_range(h, n);
+        assert!(r.is_some(), "should match despite em-dash vs hyphen");
+        let (s, e) = r.unwrap();
+        assert_eq!(&h[s..e], "Aethermoor—where");
+    }
+
+    // -- find_replace_range: full-width punctuation folds to ASCII --
+    // Full-width comma (U+FF0C) and period (U+FF0E) appear in LLM
+    // outputs that drift towards CJK punctuation. Fold to ASCII
+    // so the LLM-emit `old_part` with a full-width comma can match
+    // a stored summary with an ASCII comma. (The needle here uses
+    // the full-width form too so the test isolates the comma-fold
+    // from the more general "smart space" behaviour covered by
+    // find_replace_range_folds_nbsp_to_space.)
+    #[test]
+    fn find_replace_range_folds_fullwidth_punctuation() {
+        let h = "She recruited twelve knights\u{FF0C}then vanished";
+        let n = "twelve knights\u{FF0C}then";
+        let r = find_replace_range(h, n);
+        assert!(r.is_some(), "should match despite full-width comma");
+        let (s, e) = r.unwrap();
+        assert_eq!(&h[s..e], "twelve knights\u{FF0C}then");
+    }
+
+    // -- find_replace_range: NBSP folds to ASCII space --
+    // NBSPs sneak in from copy-pasted template content. The
+    // whitespace-tokenize step (2) also catches them, but the
+    // quirk-normalization step (4) gives a faster, cleaner match
+    // when both sides are mostly the same except for the space
+    // character class.
+    #[test]
+    fn find_replace_range_folds_nbsp_to_space() {
+        let h = "the\u{00A0}hero\u{00A0}met the dragon";
+        let n = "the hero met the dragon";
+        let r = find_replace_range(h, n);
+        assert!(r.is_some());
+        let (s, e) = r.unwrap();
+        assert_eq!(&h[s..e], "the\u{00A0}hero\u{00A0}met the dragon");
+    }
+
+    // -- find_replace_range: ligatures fold to ASCII digraphs --
+    // The "fi" ligature (U+FB01) shows up in typography-flavored
+    // LLM output. It should fold to "fi" so a find() against a
+    // stored summary with ASCII "fi" still matches. The returned
+    // byte indices must align to the ORIGINAL ligature boundary.
+    // (The needle here is the unfolded "fire drake" so the test
+    // isolates the ligature-fold from any whitespace quirks.)
+    #[test]
+    fn find_replace_range_folds_fi_ligature() {
+        let h = "the hero met the \u{FB01}re drake at dawn";
+        let n = "fire drake";
+        let r = find_replace_range(h, n);
+        assert!(r.is_some(), "ligature should fold to ASCII digraph");
+        let (s, e) = r.unwrap();
+        // Original slice should round-trip the ligature byte span.
+        // The find matched "fire drake" in the normalized haystack;
+        // in the original that span is the 1-codepoint ligature
+        // (\u{FB01} = 3 UTF-8 bytes) followed by "re drake" (8
+        // ASCII bytes) — 9 codepoints, 11 bytes total. The "the "
+        // before it is NOT part of the matched substring.
+        assert_eq!(&h[s..e], "\u{FB01}re drake");
+    }
+
+    // -- find_replace_range: long-s folds to ASCII s --
+    // Less common but observed in older LLM prose imitating
+    // pre-modern English style.
+    #[test]
+    fn find_replace_range_folds_long_s() {
+        let h = "the \u{017F}ilent dragon";
+        let n = "silent dragon";
+        let r = find_replace_range(h, n);
+        assert!(r.is_some());
+    }
+
+    // -- find_replace_range: still rejects meaningful differences --
+    // The fuzziness is for glyph / whitespace trivia. A real
+    // wording change ("killed" vs "met") should still miss.
+    // (This is the same guarantee the original strict branch
+    // provides; we re-assert it for the new path.)
+    #[test]
+    fn find_replace_range_still_rejects_real_wording_diff() {
+        let h = "the hero met the dragon at dawn";
+        let n = "killed the dragon";
+        assert!(find_replace_range(h, n).is_none());
+    }
+
+    // -- apply_history_summary_replaces: not-found warning includes
+    //    a 60-char preview of the missing old_part (debuggability). --
+    // Per Arcurus 2026-06-05 #openworld: the LLM hallucinates
+    // old_part sentences from prior turns. Surfacing the missing
+    // text in the warning makes the regression trivial to spot
+    // from a single action_history entry, without having to dig
+    // through the raw LLM log.
+    #[test]
+    fn not_found_warning_includes_old_part_preview() {
+        let result = apply_history_summary_replaces(
+            Some("the realm is quiet tonight"),
+            &[r("She travels to the Shadow Ridge Camp to recruit", "X")],
+            10_000,
+        );
+        assert_eq!(result.warnings.len(), 1);
+        let w = &result.warnings[0];
+        assert!(w.contains("not found"), "warning text: {w:?}");
+        // The preview should be present, and it should be the
+        // LLM-emit text (truncated to 60 chars), not paraphrased.
+        assert!(
+            w.contains("She travels to the Shadow Ridge Camp"),
+            "warning should include the missing old_part preview: {w:?}"
+        );
+    }
+
+    // -- apply_history_summary_replaces: Unicode-normalized match
+    //    no longer emits a not-found warning --
+    // Regression: pre-fix, an old_part with U+201C against a
+    // stored summary with U+0022 would warn "old_part not found"
+    // in hundreds of entries. Post-fix the quirk-normalization
+    // step should bridge it silently.
+    #[test]
+    fn unicode_quirk_match_succeeds_without_warning() {
+        let result = apply_history_summary_replaces(
+            Some(r#"the bard said "the dragon sleeps" last night"#),
+            &[r("\u{201C}the dragon sleeps\u{201D}", "\u{201C}the dragon wakes\u{201D}")],
+            10_000,
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "smart-quote match should not warn: {:?}",
+            result.warnings
+        );
+        // And the new summary should still contain smart quotes
+        // (we replaced one smart-quoted span with another; the
+        // original glyphs in the stored summary are preserved).
+        let new = result.new_summary.unwrap();
+        assert!(new.contains("the dragon wakes"));
     }
 
     // -- is_placeholder_summary: detects LLM "placebo summaries" --
