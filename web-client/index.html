@@ -1737,13 +1737,17 @@
         function closeEntityModal() {
             document.getElementById('entityModal').style.display = 'none';
             currentEditEntityId = null;
-            // Defensive re-render: any state drift while the modal was
-            // open (a stale 10s auto-refresh that returned an empty
-            // array, a race with another handler) shouldn't be visible
-            // when the user closes the modal.  Re-render both the list
-            // and the map so they're consistent with the current state.
-            renderEntityList();
-            renderMap();
+            // Note: the original 3f5c809 fix added renderEntityList() +
+            // renderMap() here, but Arcurus 2026-06-05 01:52 reported
+            // that the synchronous re-render on close was causing a
+            // 'click twice to open' regression on his end (modal opened
+            // but the re-render interfered with the next click).  The
+            // root cause of the 'no entities to display' bug was the
+            // auto-refresh emptying the array, which is fixed in
+            // refreshEntities() (see below — empty responses preserve
+            // the last good list).  So we don't need the re-render here.
+            // If the user later sees stale state on close, we can
+            // schedule the re-render via requestAnimationFrame instead.
         }
         
         function openEntityDetails(entityId) {
