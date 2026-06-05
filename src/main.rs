@@ -2124,7 +2124,7 @@ async fn entity_action(
             
             // Parse and apply the LLM response
             match parse_llm_action_response(&raw_response) {
-                Ok(action_data) => {
+                Ok((action_data, repair_warning)) => {
                     // Apply effects to entity
                     drop(world); // Release read lock
                     let mut world = state.world.write().await;
@@ -2144,13 +2144,23 @@ async fn entity_action(
                                 applied_effects.insert(prop_key.clone(), *value - old_value);
                             }
                         }
-                        
+
+                        // Surface the tolerant-repair warning (if any)
+                        // in the response so the auto-call path is
+                        // also observable. Auto-call responses
+                        // historically had no `warnings` field, so
+                        // we add it. It is empty Vec on the common
+                        // (strict-parse-ok) path.
+                        let response_warnings: Vec<String> =
+                            repair_warning.into_iter().collect();
+
                         success_json(serde_json::json!({
                             "success": true,
                             "action": action_data.action,
                             "outcome": action_data.outcome,
                             "effects_applied": applied_effects,
-                            "narrative": action_data.narrative
+                            "narrative": action_data.narrative,
+                            "warnings": response_warnings
                         })).into_response()
                     } else {
                         error_json(StatusCode::NOT_FOUND, "Entity not found")
@@ -2583,7 +2593,19 @@ pub(crate) fn float_oversize(v: f64) -> bool {
 }
 
 // Parse the JSON response from LLM
-fn parse_llm_action_response(raw: &str) -> Result<LlmActionResponse, String> {
+//
+// On success, returns the parsed `LlmActionResponse` together with
+// an optional repair warning. The warning is `Some(_)` when the
+// tolerant `fix_known_malformed_patterns` regex-fixup actually fired
+// and rescued a strict-parse failure, and `None` when the strict
+// `serde_json` parse succeeded on the first try. Returning the
+// warning (rather than swallowing it) keeps the recovery observable:
+// the World Clock's recurring `,"":"old_part"|"new_part"` empty-key
+// malformation (per Arcurus 2026-06-05 #openworld) used to be
+// silently rescued by the regex, which made the bug invisible to
+// the operator. Callers should surface the warning in the response
+// payload and/or in the LLM-call log.
+fn parse_llm_action_response(raw: &str) -> Result<(LlmActionResponse, Option<String>), String> {
     // Try to extract JSON from the response (in case there's extra text)
     let json_str = if let Some(start) = raw.find('{') {
         if let Some(end) = raw.rfind('}') {
@@ -2597,7 +2619,7 @@ fn parse_llm_action_response(raw: &str) -> Result<LlmActionResponse, String> {
 
     // First try the strict parse.
     match serde_json::from_str::<LlmActionResponse>(json_str) {
-        Ok(parsed) => Ok(parsed),
+        Ok(parsed) => Ok((parsed, None)),
         Err(e) => {
             // Strict parse failed. Try a tolerant fixup pass before
             // giving up — see `fix_known_malformed_patterns` for the
@@ -2618,9 +2640,20 @@ fn parse_llm_action_response(raw: &str) -> Result<LlmActionResponse, String> {
                 match serde_json::from_str::<LlmActionResponse>(&repaired) {
                     Ok(parsed) => {
                         // Successful repair — return the parsed value
-                        // and let the caller log a warning so this
-                        // remains observable.
-                        Ok(parsed)
+                        // together with a warning string so the caller
+                        // can surface it in the response and / or the
+                        // LLM-call log. The warning is descriptive
+                        // (says "this was a regex repair of the
+                        // known empty-key bug") so a future operator
+                        // grepping the JSONL log for it can tell at
+                        // a glance how often the World Clock bug
+                        // recurs.
+                        Ok((parsed, Some(format!(
+                            "parse_llm_action_response: LLM response matched a known \
+                             malformed pattern and was repaired (regex fixup of the \
+                             \"\":\"old_part\"|\"new_part\" empty-key bug seen in \
+                             history_summary_replace)."
+                        ))))
                     }
                     Err(e2) => Err(format!(
                         "JSON parse error: {} - Input (after repair attempt): {}",
@@ -2681,7 +2714,7 @@ async fn process_action_handler(
     
     // Parse the LLM response
     match parse_llm_action_response(raw_response) {
-        Ok(action_data) => {
+        Ok((action_data, repair_warning)) => {
             // Apply effects to entity
             let mut world = state.world.write().await;
             // Capture the history-summary cap BEFORE taking a mutable
@@ -2698,6 +2731,17 @@ async fn process_action_handler(
                 let mut applied_effects = std::collections::HashMap::new();
                 let mut new_values = std::collections::HashMap::new();
                 let mut warnings: Vec<String> = Vec::new();
+
+                // Surface the tolerant-repair warning (if any) first
+                // so it shows up at the top of the warnings vec in
+                // the response and the LLM-call log. This makes
+                // the regex-fixup recovery visible to operators
+                // (per Arcurus 2026-06-05 #openworld: the World
+                // Clock's empty-key bug is recurring, and we need
+                // to know when our repair actually fires).
+                if let Some(w) = repair_warning {
+                    warnings.push(w);
+                }
 
                 // System entities (world_clock, meta-tagged) are protected
                 // from LLM-driven property writes to prevent integer/float
@@ -5155,5 +5199,67 @@ mod fix_known_malformed_patterns_tests {
         let unrelated = r#"{"":"unexpected_value","x":"y"}"#;
         let repaired = fix_known_malformed_patterns(unrelated);
         assert_eq!(repaired, unrelated);
+    }
+}
+
+#[cfg(test)]
+mod parse_llm_action_response_repair_warning_tests {
+    //! Tests for the (LlmActionResponse, Option<String>) repair-warning
+    //! return shape added so the tolerant regex-fixup is observable
+    //! to operators. See `parse_llm_action_response` and the
+    //! World-Clock empty-key bug (per Arcurus 2026-06-05 #openworld).
+    use super::parse_llm_action_response;
+
+    #[test]
+    fn strict_parse_ok_returns_none_repair_warning() {
+        // A well-formed LLM response must round-trip cleanly
+        // and signal `None` for the repair warning.
+        let ok = r#"{
+            "action": "study_ancient_tome",
+            "outcome": "Learns a new spell.",
+            "effects": {"knowledge": 1},
+            "narrative": "The scholar pores over the brittle pages.",
+            "history_summary": "Studied ancient magic."
+        }"#;
+        let (parsed, warning) = parse_llm_action_response(ok)
+            .expect("well-formed response must parse");
+        assert_eq!(parsed.action, "study_ancient_tome");
+        assert!(warning.is_none(), "strict-parse-ok path must not emit a repair warning; got {:?}", warning);
+    }
+
+    #[test]
+    fn broken_history_summary_replace_triggers_repair_warning() {
+        // The exact World-Clock 2026-06-05 15:42 malformation:
+        //   {"old_part":"...","":"new_part":"..."}
+        // Strict serde rejects it; the regex fixes it; the
+        // function must return Some(warning) so the caller can
+        // surface it in the response payload.
+        let broken = r#"{
+            "action": "broadcast_chronicle_update",
+            "outcome": "The World Clock's narration shifts.",
+            "effects": {"influence": 0},
+            "narrative": "The clock's tone changes.",
+            "history_summary": "Now collecting era markers.",
+            "history_summary_replace": [{"old_part":"Currently broadcasting...Post-Harmonization Era.","":"new_part":"Now actively collecting..."}]
+        }"#;
+        let (parsed, warning) = parse_llm_action_response(broken)
+            .expect("repaired response must parse");
+        assert_eq!(parsed.action, "broadcast_chronicle_update");
+        let w = warning.expect("repair path must emit a warning");
+        // The warning must be descriptive enough for an operator
+        // grepping the JSONL log to recognize what happened.
+        assert!(w.contains("parse_llm_action_response"), "warning should identify source fn: {}", w);
+        assert!(w.contains("empty-key"), "warning should name the bug class: {}", w);
+    }
+
+    #[test]
+    fn unparseable_garbage_returns_err_with_no_warning() {
+        // Truly broken input (not the known pattern) must still
+        // return Err — the regex is conservative and only fixes
+        // shapes we've actually seen. No `Ok` is possible here,
+        // so we never need to inspect the warning field.
+        let garbage = r#"this is not json at all"#;
+        let result = parse_llm_action_response(garbage);
+        assert!(result.is_err(), "unparseable input must error");
     }
 }
