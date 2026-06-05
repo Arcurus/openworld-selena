@@ -35,6 +35,14 @@ The server starts on `http://localhost:8080`.
 
 On first run, the world is created with the **world clock** (time bookkeeping) + the canonical lore events from `docs/world_lore.md`. Per Arcurus 2026-06-04, fresh worlds do **not** auto-seed sample entities — call `World::seed_sample_entities()` (or the web UI's "Generate sample entities" button, or `POST /api/world/create?generate_sample=true`) to add the 7 canonical sample entities. See [`docs/world_entities.md`](docs/world_entities.md) for the full example roster (18 entities, with UUIDs, descriptions, tags, and properties).
 
+> **Heads up (added 2026-06-06):** worlds created before `World::seed_default_events()` was wired into `World::new()` (i.e. before the 18-entity re-seed on 2026-06-03 21:17) have **0 active events** even though the function exists now. If you load such a world and `GET /api/world/events` returns `[]`, run the helper script to push the 5 canonical "Shadow Awakening" events via the existing POST endpoint:
+>
+> ```bash
+> python3 scripts/seed_default_world_events.py
+> ```
+>
+> The script is **idempotent** (skips events that already exist by name+description match), safe to re-run, and only uses the public API (cookie `openworld_auth=1`).
+
 ---
 
 ## 💾 Persistence
