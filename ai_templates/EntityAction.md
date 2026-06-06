@@ -38,7 +38,7 @@ If the entity already has a property (e.g. `wealth`, `power`, `morale`), use tha
 - Strings (string): `"King Aldric"`, `"frozen"`
 - Booleans: parsed as `1` (true) or `0` (false)
 
-Respond ONLY with valid JSON (no other text before or after). Required fields:
+Respond ONLY with valid JSON (no other text before or after). **Pick exactly ONE of `history_summary` or `history_summary_replace` per turn — do not send both.** See the rules section below for which to pick when.
 
 {{
   "action": "brief action name (verb_noun_target, snake_case)",
@@ -49,7 +49,7 @@ Respond ONLY with valid JSON (no other text before or after). Required fields:
   "history_summary_replace": {{"old_part": "current text to change", "new_part": "what to change it to"}}
 }}
 
-**`history_summary` rules (always include, every turn):**
+**`history_summary` rules (always include exactly ONE of these two fields, every turn):**
 - ≤ {max_history_summary_chars} characters total (hard cap; will be truncated server-side if exceeded).
 - A rolling one-paragraph arc: what this entity has been doing recently, why, and where it's heading.
 - Your summary can reference any past action if it matters for narrative continuity. Space is limited, so the impact of very old actions may be dropped if it won't fit in the summary. You decide what to keep.
@@ -58,16 +58,20 @@ Respond ONLY with valid JSON (no other text before or after). Required fields:
 - **Keep track of relations (2-4 sentences *per relation*, one entry per entity):** for each recently-interacted entity, write 2-4 dense sentences covering who you met, what you exchanged, how the relationship shifted, and whether it's an ally / rival / debt / unknown. Format as separate short lines (e.g. `→ Mira the Scribe: …`). One entry per entity — never duplicate an entity you've already mentioned. If a relation evolves, **update the existing line in place** with the new state (rewriting it, not appending a second `→ X: …`). You may have several relations in the summary; the 2-4-sentence budget applies to *each* one, not the total. Drop stale relations to make room for new ones.
 - Keep it forward-looking: the next call's LLM will read this to plan the next action.
 - Do NOT include the action name of the current turn as if it already happened; write as if it's about to happen or has just been initiated.
-- **Update the history with `history_summary_replace`** (preferred — send the diff, not the full summary). Value is one `{old_part, new_part}` object, or an array of such objects. Each pair replaces the first occurrence of `old_part` with `new_part` in the current summary, in order. An empty `old_part` (`""`) means "append `new_part` to the end". If `old_part` is not found, the change is skipped (with a warning). Result is truncated to {max_history_summary_chars} chars if needed.
+
+**Which field to use (pick exactly ONE):**
+
+- **Surgical edit (preferred for most turns): use `history_summary_replace` ALONE.** Value is one `{old_part, new_part}` object, or an array of such objects. Each pair replaces the first occurrence of `old_part` with `new_part` in the **current stored** summary (NOT in your own draft), in order. An empty `old_part` (`""`) means "append `new_part` to the end". If `old_part` is not found in the current stored summary, that one command is skipped (with a warning) — **the rest of the chain still applies**. Result is truncated to {max_history_summary_chars} chars if needed.
 
   - **Keep edits small and targeted when possible** — single-line corrections, relation updates, status changes. That's the cheap case.
   - **Use a full history replace if a full restructuring is needed** (new arc, new chapter, multiple relations shifting) — in this case make sure important things don't get lost. To do a full replace, set `old_part` to the literal string `"!ALL!"` and put the new full summary in `new_part`.
-  - **You may also still use the legacy `history_summary` field** for a full replace — it works too. Pick whichever shape fits the change.
 
   Examples:
   - Surgical edit: `history_summary_replace: {{"old_part": "met Mira at the gate", "new_part": "reunited with Mira in the capital"}}`
   - Multiple edits in one turn: `history_summary_replace: [{{"old_part": "former ally of the elves", "new_part": "open conflict with the elves"}}, {{"old_part": "", "new_part": " (recent: dragon sighted)"}}]`
   - Append a tail line: `history_summary_replace: {{"old_part": "", "new_part": "World Clock ticks. Era continues."}}`
   - Full restructure: `history_summary_replace: {{"old_part": "!ALL!", "new_part": "<complete new summary here, same length budget as history_summary>"}}`
-</content>
-</invoke>
+
+- **Full rewrite (use `history_summary` ALONE):** if you want to send a complete new summary that fully replaces the old one, set `history_summary` to the new full text and OMIT `history_summary_replace`. Use this when you don't want to think about diffs — it's the simpler shape and it always works (the server will truncate if you go over the cap).
+
+**Why not both?** If you send both, the server drops your `history_summary` (it conflicts with the surgical chain) AND the surgical chain often fails because the `old_part` you recall is from your just-dropped new summary, not the current stored one. The net effect is wasted tokens and the history summary not being updated. So: **always pick exactly ONE.**
