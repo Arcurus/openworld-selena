@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Seed the 5 default lore events into the world via the existing API.
+"""Seed the 6 default lore events into the world via the existing API.
 
 The world was created before World::seed_default_events was added to
 World::new(), so the loaded world has 0 active_events. This is the
-client-side workaround: POST each of the 5 canonical "Shadow Awakening"
-events via /api/world/events.
+client-side workaround: POST each of the 6 canonical events
+(5 "Shadow Awakening" doom-arc + 1 "Spring Festival of Renewal"
+hope-arc) via /api/world/events.
 
-Idempotent: checks GET /api/world/events first; if any of the 5 UUIDs
+Idempotent: checks GET /api/world/events first; if any of the 6 UUIDs
 already exist, skips those.
 """
 import json

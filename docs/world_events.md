@@ -2,11 +2,11 @@
 
 *Active world events that influence entity behavior. Live state: `GET /api/world/events`. Persisted to `world_data/save.owbl` and `docs/world_lore.md`.*
 
-*Last update: 2026-06-04 01:44 CEST — 5 active events.*
+*Last update: 2026-06-06 03:23 CEST — 6 active events.*
 
 ---
 
-## Current Active Events (5)
+## Current Active Events (6)
 
 ### 1. The Shadow Awakens
 **ID:** `e10f8432-2dbe-4b73-9826-2366c7772c9f`
@@ -65,6 +65,18 @@ Travelers near the southern marshlands report hearing bells at dusk. The Sunken 
 
 **How this affects entities:**
 Scholars and sages grow curious. Adventurers plan expeditions. Locals avoid the marshlands. Zephyrus the Oracle speaks in riddles about it, which everyone interprets differently. The realm feels as if something is waking that was meant to stay asleep. The Drowned City, said to be the temple sister, has grown quieter — its silence more ominous than its noise.
+
+---
+
+### 6. The Spring Festival of Renewal
+**ID:** `88ee73fc-69cb-4366-a5ea-481aa175cfab`
+**Status:** ACTIVE
+
+**Description:**
+Despite the spreading shadow, the villages of the realm gather in the Oak Valley green at the height of spring to celebrate survival itself. For three days and nights, the folk of Oak Valley, Silverstream, and the Ironforge trade roads open their gates, lay down old grudges, and remember that hope is something you must tend like a fire. Bards sing, children run free, and even the Shadow Crown's reach seems—impossibly—a little lighter when every hearth in the valley burns at once. Mira the Scribe calls it the only honest currency: shared bread, shared song, shared laughter in the dark.
+
+**How this affects entities:**
+Trade flows more freely for the festival's duration. Factional suspicion eases; the Silver Wardens soften their patrols and even share a cup with passing rangers. Children play without fear, and the realm's surviving heroes feel their burdens lifted. Entities grow reflective rather than reactive, planning for a future they had nearly given up on. The Wandering Bard calls it 'the stubborn ember.' Ironforge forges glow warmer for the celebration. Kira Dawnblade attends for the first time in years.
 
 ---
 

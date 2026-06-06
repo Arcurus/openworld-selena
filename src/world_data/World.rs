@@ -29,9 +29,12 @@ pub struct WorldEvent {
 pub fn default_true() -> bool { true }
 
 /// The canonical set of lore-based default events for a new world.
-/// Mirrors the five "Shadow Awakening" era events documented in
-/// `docs/world_lore.md` and `docs/world_events.md`. Stable UUIDs are
-/// used so a freshly seeded world is reproducible across runs.
+/// Mirrors the six events documented in
+/// `docs/world_lore.md` and `docs/world_events.md`:
+/// five "Shadow Awakening" era events (doom arc) plus the
+/// counterbalancing "Spring Festival of Renewal" (hope arc).
+/// Stable UUIDs are used so a freshly seeded world is reproducible
+/// across runs.
 pub fn default_world_events() -> Vec<WorldEvent> {
     vec![
         WorldEvent {
@@ -67,6 +70,13 @@ pub fn default_world_events() -> Vec<WorldEvent> {
             name: "The Bells of the Sunken Temple".to_string(),
             description: "Travelers near the southern marshlands report hearing bells at dusk. The Sunken Temple — half-submerged since the Second Age and abandoned for a thousand years — has begun to ring. No one has yet dared enter. The Wandering Bard claims to have heard a voice singing along with the bells, in a language no scholar recognizes. Mira the Scribe is taking notes.".to_string(),
             influence: "Scholars and sages grow curious. Adventurers plan expeditions. Locals avoid the marshlands. Zephyrus the Oracle speaks in riddles about it, which everyone interprets differently. The realm feels as if something is waking that was meant to stay asleep. The Drowned City, said to be the temple sister, has grown quieter — its silence more ominous than its noise.".to_string(),
+            active: true,
+        },
+        WorldEvent {
+            id: "88ee73fc-69cb-4366-a5ea-481aa175cfab".to_string(),
+            name: "The Spring Festival of Renewal".to_string(),
+            description: "Despite the spreading shadow, the villages of the realm gather in the Oak Valley green at the height of spring to celebrate survival itself. For three days and nights, the folk of Oak Valley, Silverstream, and the Ironforge trade roads open their gates, lay down old grudges, and remember that hope is something you must tend like a fire. Bards sing, children run free, and even the Shadow Crown's reach seems—impossibly—a little lighter when every hearth in the valley burns at once. Mira the Scribe calls it the only honest currency: shared bread, shared song, shared laughter in the dark.".to_string(),
+            influence: "Trade flows more freely for the festival's duration. Factional suspicion eases; the Silver Wardens soften their patrols and even share a cup with passing rangers. Children play without fear, and the realm's surviving heroes feel their burdens lifted. Entities grow reflective rather than reactive, planning for a future they had nearly given up on. The Wandering Bard calls it 'the stubborn ember.' Ironforge forges glow warmer for the celebration. Kira Dawnblade attends for the first time in years.".to_string(),
             active: true,
         },
     ]
@@ -1032,8 +1042,10 @@ mod tests {
         // since World::create_clock_entity was introduced.)
         assert_eq!(world.entity_count(), 1);
         // New worlds auto-bootstrap with the canonical lore events
-        // (todo e4cc4203). Exactly five, all active.
-        assert_eq!(world.active_events.len(), 5);
+        // (todo e4cc4203). Exactly six, all active: five "Shadow
+        // Awakening" doom-arc events + the counterbalancing
+        // "Spring Festival of Renewal" hope-arc event.
+        assert_eq!(world.active_events.len(), 6);
         assert!(world.active_events.iter().all(|e| e.active));
         let names: Vec<&str> = world
             .active_events
@@ -1045,6 +1057,7 @@ mod tests {
         assert!(names.contains(&"The Shadowmaw Stirs"));
         assert!(names.contains(&"The Silver Wardens Mobilize"));
         assert!(names.contains(&"The Bells of the Sunken Temple"));
+        assert!(names.contains(&"The Spring Festival of Renewal"));
     }
 
     #[test]
