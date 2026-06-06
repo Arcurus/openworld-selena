@@ -2572,6 +2572,106 @@ fn map_quirk_index_to_original(
     o_idx
 }
 
+/// Outcome of the safety-net fallback that triggers when the LLM
+/// confused itself by sending BOTH `history_summary` and
+/// `history_summary_replace`, and the replace chain ended up being a
+/// no-op (new_summary == current).
+///
+/// Why this exists (added 2026-06-06, see todo fa45e5e7 / 06-06 worker
+/// run): 97 of the last 100 actions had a "Both history_summary and
+/// history_summary_replace present; using replace (history_summary
+/// dropped)" warning, and 84 of those 100 ALSO had an "old_part not
+/// found" warning — because the LLM was recalling the `old_part`
+/// from the new (just-dropped) summary, not the current stored one.
+/// The net effect was wasted tokens on the dropped full summary AND
+/// the history_summary update failing silently. This helper recovers
+/// the update by falling back to the dropped `history_summary` value
+/// (truncated to the cap).
+#[derive(Debug, PartialEq)]
+pub struct FallbackResult {
+    /// The new value to store on the entity (None = no summary).
+    pub new_summary: Option<String>,
+    /// True if the result was truncated to fit max_chars.
+    pub truncated: bool,
+    /// Warnings to surface to the operator. Includes a "fell back to
+    /// history_summary" line and any truncation warning.
+    pub warnings: Vec<String>,
+}
+
+/// Returns the new (post-fallback) summary value to use when the
+/// LLM sent BOTH `history_summary` and `history_summary_replace`,
+/// AND the replace chain produced a no-op. Returns None when the
+/// fallback should NOT fire (i.e. when the LLM only sent one
+/// field, or the replace chain made a real change, or the dropped
+/// `history_summary` is itself empty/placeholder). The caller is
+/// expected to keep the replace-chain result in that case.
+///
+/// `dropped_full` is the value of the LLM-emit `history_summary`
+/// that would otherwise be discarded. `current` is the entity's
+/// stored `history_summary` at the time of the LLM call (used to
+/// detect no-op vs real change). `replace_result` is what
+/// `apply_history_summary_replaces` returned.
+pub fn apply_summary_fallback(
+    dropped_full: &str,
+    current: Option<&str>,
+    replace_result_new_summary: Option<&str>,
+    max_chars: usize,
+) -> Option<FallbackResult> {
+    // The replace chain was a no-op iff the result equals current.
+    // In that case, prefer the dropped full summary.
+    let replace_was_noop = match (current, replace_result_new_summary) {
+        (Some(c), Some(r)) => c == r,
+        (None, None) => true,
+        (Some(c), None) => c.is_empty(), // current non-empty but result is None => no-op
+        (None, Some(r)) => r.is_empty(),
+    };
+    if !replace_was_noop {
+        return None;
+    }
+    let trimmed = dropped_full.trim();
+    if trimmed.is_empty() || is_placeholder_summary(trimmed) {
+        // Dropped value is also useless — don't fire the fallback.
+        return None;
+    }
+    let mut warnings: Vec<String> = Vec::new();
+    warnings.push(
+        "history_summary_replace was a no-op; \
+         fell back to the dropped history_summary value".to_string(),
+    );
+    if trimmed.chars().count() > max_chars {
+        let keep = max_chars.saturating_sub(1);
+        let cut: String = trimmed.chars().take(keep).collect();
+        let final_summary = if cut.is_empty() {
+            String::new()
+        } else {
+            format!("{}…", cut)
+        };
+        warnings.push(format!(
+            "LLM history_summary exceeded {} chars; truncated.",
+            max_chars
+        ));
+        if final_summary.is_empty() {
+            Some(FallbackResult {
+                new_summary: None,
+                truncated: true,
+                warnings,
+            })
+        } else {
+            Some(FallbackResult {
+                new_summary: Some(final_summary),
+                truncated: true,
+                warnings,
+            })
+        }
+    } else {
+        Some(FallbackResult {
+            new_summary: Some(trimmed.to_string()),
+            truncated: false,
+            warnings,
+        })
+    }
+}
+
 pub fn apply_history_summary_replaces(
     current: Option<&str>,
     replaces: &[HistorySummaryReplace],
@@ -3118,6 +3218,14 @@ async fn process_action_handler(
                 // We hard-cap the length to max_summary_chars so a
                 // runaway LLM can't bloat the save file. Truncation is
                 // a soft contract (truncate with "…"), not a reject.
+                //
+                // 2026-06-06: as a safety net for the common LLM
+                // confusion "sends BOTH fields", if the LLM sends both
+                // AND the replace chain produces a no-op (new_summary
+                // == current), fall back to the dropped
+                // `history_summary` value (truncated to the cap). This
+                // recovers the update that would otherwise be silently
+                // lost. See todo fa45e5e7 / 06-06 worker run.
                 let mut summary_truncated = false;
                 let applied_summary: Option<String> =
                     if let Some(replaces_one_or_many) = action_data.history_summary_replace {
@@ -3125,7 +3233,8 @@ async fn process_action_handler(
                         // surgical edits). replace wins; if the LLM
                         // also sent a full `history_summary`, drop it
                         // with a warning.
-                        if action_data.history_summary.is_some() {
+                        let llm_also_sent_full = action_data.history_summary.is_some();
+                        if llm_also_sent_full {
                             warnings.push(
                                 "Both history_summary and history_summary_replace present; \
                                  using replace (history_summary dropped)".to_string()
@@ -3150,8 +3259,42 @@ async fn process_action_handler(
                         if result.truncated {
                             summary_truncated = true;
                         }
-                        entity.history_summary = result.new_summary.clone();
-                        result.new_summary
+                        // Safety net: if the LLM confused itself by
+                        // sending BOTH and the replace chain produced a
+                        // no-op (new_summary equals the current stored
+                        // value), prefer the dropped `history_summary`
+                        // — that's almost always what the LLM actually
+                        // meant. Only fires when the LLM also sent the
+                        // full summary, to avoid shadowing a deliberate
+                        // surgical no-op (rare but possible: an LLM
+                        // that just wants to commit an unchanged
+                        // summary by sending an empty replace chain).
+                        // Implementation lives in
+                        // `apply_summary_fallback` so the logic is
+                        // unit-testable.
+                        let fallback = if llm_also_sent_full {
+                            apply_summary_fallback(
+                                action_data.history_summary.as_deref().unwrap_or(""),
+                                entity.history_summary.as_deref(),
+                                result.new_summary.as_deref(),
+                                max_summary_chars,
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(fb) = fallback {
+                            for w in fb.warnings {
+                                warnings.push(w);
+                            }
+                            if fb.truncated {
+                                summary_truncated = true;
+                            }
+                            entity.history_summary = fb.new_summary.clone();
+                            fb.new_summary
+                        } else {
+                            entity.history_summary = result.new_summary.clone();
+                            result.new_summary
+                        }
                     } else if let Some(s) = action_data.history_summary {
                         // Case 2: full replace (existing behavior).
                         let trimmed = s.trim();
@@ -5484,6 +5627,152 @@ mod history_summary_replace_tests {
         assert!(!is_placeholder_summary("…but tomorrow the dragon wakes"));
         // numeric-only is also meaningful (e.g., "12 victories")
         assert!(!is_placeholder_summary("42"));
+    }
+}
+
+// -- apply_summary_fallback: safety net for the LLM-sends-BOTH-fields
+//    confusion. See todo fa45e5e7 / 06-06 worker run. 97 of the last
+//    100 actions had a "Both history_summary and history_summary_replace
+//    present" warning — the LLM was emitting both fields every turn,
+//    the full history_summary was dropped, AND the surgical chain
+//    usually failed too (because the LLM recalled old_part from the
+//    just-dropped new summary, not the current stored one). The
+//    fallback recovers the update by using the dropped full value
+//    when the replace chain was a no-op. --
+#[cfg(test)]
+mod apply_summary_fallback_tests {
+    use super::apply_summary_fallback;
+
+    // The canonical real-world pattern: LLM sent a full new summary
+    // and a replace chain whose old_part is not in the current
+    // stored summary. The replace chain is a no-op (result == current),
+    // so the fallback fires and uses the dropped full summary.
+    #[test]
+    fn falls_back_when_replace_is_noop_and_dropped_is_meaningful() {
+        // Current stored summary.
+        let current = Some("Velora holds the boundary vigil.");
+        // Replace chain: old_part mentions a sentence the LLM thinks
+        // is in the summary but isn't. The chain leaves the summary
+        // unchanged, so result == current.
+        let replace_result = Some("Velora holds the boundary vigil.");
+        // Dropped full summary: the LLM's intended new content.
+        let dropped = "Velora the Undying now actively reinforces the boundary seal, \
+                       inscribing silver sigils at four cardinal points. Her vigilance has \
+                       transitioned from passive watching to active counter-corruption.";
+        let fb = apply_summary_fallback(dropped, current, replace_result, 10_000);
+        let fb = fb.expect("fallback should fire when replace is a no-op and dropped is meaningful");
+        assert_eq!(
+            fb.new_summary.as_deref(),
+            Some(dropped),
+            "fallback should return the dropped full summary"
+        );
+        assert!(!fb.truncated, "should not truncate under cap");
+        // Exactly one warning (no truncation, no placeholder, no both-fields).
+        assert_eq!(fb.warnings.len(), 1);
+        assert!(fb.warnings[0].contains("fell back to the dropped history_summary value"));
+    }
+
+    // Does NOT fire when the replace chain made a real change
+    // (result != current). The full dropped value would lose
+    // information — the surgical chain is the source of truth.
+    #[test]
+    fn does_not_fire_when_replace_made_real_change() {
+        let current = Some("Velora holds the vigil.");
+        let replace_result = Some("Velora is now actively reinforcing the boundary.");
+        let dropped = "completely different full rewrite";
+        let fb = apply_summary_fallback(dropped, current, replace_result, 10_000);
+        assert!(fb.is_none(), "fallback should NOT fire when replace made a change");
+    }
+
+    // Does NOT fire when the dropped value is empty/placeholder —
+    // there's nothing useful to fall back to.
+    #[test]
+    fn does_not_fire_when_dropped_is_empty() {
+        let current = Some("Velora holds the vigil.");
+        let replace_result = Some("Velora holds the vigil.");
+        let dropped = "";
+        let fb = apply_summary_fallback(dropped, current, replace_result, 10_000);
+        assert!(fb.is_none(), "fallback should NOT fire when dropped is empty");
+    }
+
+    #[test]
+    fn does_not_fire_when_dropped_is_placeholder() {
+        let current = Some("Velora holds the vigil.");
+        let replace_result = Some("Velora holds the vigil.");
+        // Placebo values: just "…", "—", ".", or other
+        // non-meaningful content.
+        for placebo in &["…", "… ", "—", ".", " -- ", "  "] {
+            let fb = apply_summary_fallback(placebo, current, replace_result, 10_000);
+            assert!(
+                fb.is_none(),
+                "fallback should NOT fire when dropped is placeholder ({:?})",
+                placebo
+            );
+        }
+    }
+
+    // Truncation: dropped value longer than the cap gets truncated
+    // (with "…") and the warning set includes a truncation line.
+    #[test]
+    fn truncates_dropped_when_over_cap() {
+        let current = Some("short");
+        let replace_result = Some("short");
+        let dropped = "x".repeat(200);
+        let fb = apply_summary_fallback(&dropped, current, replace_result, 100)
+            .expect("fallback should fire");
+        assert!(fb.truncated, "should be truncated");
+        let s = fb.new_summary.expect("truncated value must still be present when cut is non-empty");
+        assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), 100);
+        // 2 warnings: the fell-back line + the truncation line.
+        assert_eq!(fb.warnings.len(), 2);
+        assert!(fb.warnings[0].contains("fell back"));
+        assert!(fb.warnings[1].contains("truncated"));
+    }
+
+    // When the cap is 0 (degenerate), the truncated cut is empty.
+    // The fallback returns new_summary = None rather than Some(""),
+    // matching the "empty-as-None" rule used elsewhere.
+    #[test]
+    fn degenerate_zero_cap_returns_none() {
+        let current = Some("short");
+        let replace_result = Some("short");
+        let dropped = "x".repeat(200);
+        let fb = apply_summary_fallback(&dropped, current, replace_result, 0)
+            .expect("fallback should fire even with zero cap");
+        assert!(fb.truncated);
+        assert_eq!(
+            fb.new_summary, None,
+            "zero-cap degenerate should yield None (empty-as-None rule)"
+        );
+    }
+
+    // Both None: current is empty AND the replace chain returned
+    // None. No-op from the replace's perspective; the fallback can
+    // still fire (and the new_summary is what the dropped value
+    // would be, possibly truncated).
+    #[test]
+    fn noop_with_none_current_still_fires_fallback() {
+        let fb = apply_summary_fallback("fresh start", None, None, 10_000)
+            .expect("fallback should fire when both are None and dropped is meaningful");
+        assert_eq!(fb.new_summary.as_deref(), Some("fresh start"));
+        assert!(!fb.truncated);
+    }
+
+    // Surrounding whitespace in the dropped value is trimmed
+    // (per the existing rule for the legacy history_summary path).
+    #[test]
+    fn trims_dropped_value() {
+        let current = Some("stored");
+        let replace_result = Some("stored");
+        let dropped = "   the new summary content   ";
+        let fb = apply_summary_fallback(dropped, current, replace_result, 10_000)
+            .expect("fallback should fire");
+        assert_eq!(
+            fb.new_summary.as_deref(),
+            Some("the new summary content"),
+            "dropped value should be trimmed"
+        );
     }
 }
 
