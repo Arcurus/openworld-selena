@@ -522,7 +522,8 @@ impl World {
         }
     }
 
-    /// Sanitize int properties on system entities (`is_system_entity()`).
+    /// Sanitize int AND float properties on system entities
+    /// (`is_system_entity()`).
     ///
     /// Background: before `c7f3bc27` (fix(clock): protect system entities
     /// from LLM effect writes), the LLM effect writer occasionally emitted
@@ -537,9 +538,24 @@ impl World {
     /// current `world_time`; for all other system-entity int props the
     /// value is reset to 0.
     ///
-    /// Returns `(entity_id, key, old_value, new_value)` for every repair,
-    /// so callers can log the cleanup. Non-system entities are untouched.
-    pub fn sanitize_system_entities(&mut self) -> Vec<(Uuid, String, i64, i64)> {
+    /// For float properties on system entities, the only well-known key is
+    /// `total_years` — a time counter that legitimately grows without
+    /// bound (1 real minute = 1 game year, so a long-running world
+    /// accumulates millions of years over a few real days). It is clamped
+    /// to `MAX_TOTAL_YEARS` (1e15 — about 31 million real-time millennia
+    /// at 1 real-sec-per-game-year) with the original sign preserved;
+    /// anything beyond that is the LLM garbage signature. All other
+    /// system-entity float keys fall back to the non-system float cap
+    /// (1e7) — defensive default.
+    ///
+    /// Returns `(entity_id, key, old_value, new_value)` for every int
+    /// repair AND `(entity_id, key, old_value, new_value)` (f64-typed)
+    /// for every float repair. The two lists are kept separate so callers
+    /// can log them in distinct streams. Non-system entities are untouched
+    /// (use `sanitize_non_system_entity_properties` for those).
+    pub fn sanitize_system_entities(
+        &mut self,
+    ) -> (Vec<(Uuid, String, i64, i64)>, Vec<(Uuid, String, f64, f64)>) {
         // Sane magnitude bounds per key. Anything beyond these is the LLM
         // garbage signature, not a realistic world value.
         //   day:           < 10M (~27k years)
@@ -556,11 +572,25 @@ impl World {
         const MAX_BOOL: i64 = 1;
         const MAX_GENERAL: i64 = 1_000_000;
 
-        let mut repairs: Vec<(Uuid, String, i64, i64)> = Vec::new();
+        // Float bounds. `total_years` is a *time* counter that grows
+        // without bound (1 real minute = 1 game year, observed running
+        // worlds at 2.1M years after a few real days). The cap is set
+        // high (1e15) to be permissive for legitimate long-running
+        // worlds while still rejecting the LLM "1e18 / -INF" garbage
+        // signature. Other float keys fall back to MAX_GENERAL_FLOAT
+        // (1e7) as a defensive default — we don't expect any other
+        // float on the clock, but a stray key shouldn't survive
+        // unrepaired.
+        const MAX_TOTAL_YEARS: f64 = 1.0e15;
+        const MAX_GENERAL_FLOAT: f64 = 1.0e7;
+
+        let mut int_repairs: Vec<(Uuid, String, i64, i64)> = Vec::new();
+        let mut float_repairs: Vec<(Uuid, String, f64, f64)> = Vec::new();
 
         // Collect (id, key, old_val) first to avoid borrowck issues while
         // mutating the entity map during the loop.
-        let mut to_fix: Vec<(Uuid, String, i64)> = Vec::new();
+        let mut int_to_fix: Vec<(Uuid, String, i64)> = Vec::new();
+        let mut float_to_fix: Vec<(Uuid, String, f64)> = Vec::new();
         for (id, entity) in &self.entities {
             if !entity.is_system_entity() {
                 continue;
@@ -577,12 +607,26 @@ impl World {
                 // Use unsigned magnitude to avoid i64::MIN.abs() overflow.
                 let magnitude = val.unsigned_abs();
                 if magnitude > sane_max as u64 {
-                    to_fix.push((*id, key.clone(), *val));
+                    int_to_fix.push((*id, key.clone(), *val));
+                }
+            }
+            for (key, val) in &entity.properties_float {
+                // Non-finite (NaN / Inf) is always garbage.
+                if !val.is_finite() {
+                    float_to_fix.push((*id, key.clone(), *val));
+                    continue;
+                }
+                let sane_max: f64 = match key.as_str() {
+                    "total_years" => MAX_TOTAL_YEARS,
+                    _ => MAX_GENERAL_FLOAT,
+                };
+                if val.abs() >= sane_max {
+                    float_to_fix.push((*id, key.clone(), *val));
                 }
             }
         }
 
-        for (id, key, old_val) in to_fix {
+        for (id, key, old_val) in int_to_fix {
             let new_val: i64 = match key.as_str() {
                 "day" => self.world_time.day as i64,
                 "hour" => self.world_time.hour as i64,
@@ -592,10 +636,32 @@ impl World {
             if let Some(entity) = self.entities.get_mut(&id) {
                 entity.properties_int.insert(key.clone(), new_val);
             }
-            repairs.push((id, key, old_val, new_val));
+            int_repairs.push((id, key, old_val, new_val));
         }
 
-        repairs
+        for (id, key, old_val) in float_to_fix {
+            // Re-derive the cap here so the clamp matches the per-key
+            // bound used in the detection loop above. This is the
+            // same shape as the non-system sanitizer: clamp to the
+            // per-key sane_max with the original sign, so a -1e18
+            // total_years becomes -1e15 (not 0.0) and preserves the
+            // "negative" semantic for any operator reading it.
+            let sane_max: f64 = match key.as_str() {
+                "total_years" => MAX_TOTAL_YEARS,
+                _ => MAX_GENERAL_FLOAT,
+            };
+            let new_val = if !old_val.is_finite() {
+                0.0
+            } else {
+                old_val.signum() * sane_max
+            };
+            if let Some(entity) = self.entities.get_mut(&id) {
+                entity.properties_float.insert(key.clone(), new_val);
+            }
+            float_repairs.push((id, key, old_val, new_val));
+        }
+
+        (int_repairs, float_repairs)
     }
 
     /// Sanitize int AND float properties on non-system entities.
@@ -1188,11 +1254,11 @@ mod tests {
         }
 
         // world_time default: day=0, hour=8, actions_today=0.
-        let repairs = world.sanitize_system_entities();
+        let (int_repairs, _float_repairs) = world.sanitize_system_entities();
         assert!(
-            repairs.len() >= 6,
+            int_repairs.len() >= 6,
             "expected the sanitizer to flag the garbage clock props, got {} repairs",
-            repairs.len()
+            int_repairs.len()
         );
 
         let clock = world.entities.get(&clock_id).unwrap();
@@ -1217,8 +1283,8 @@ mod tests {
         let hero_id = world.add_entity(hero);
         world.entities.get_mut(&hero_id).unwrap().set_int("power", 5_000_000_000);
 
-        let repairs = world.sanitize_system_entities();
-        assert!(repairs.is_empty(), "non-system entities must not be sanitized");
+        let (int_repairs, _float_repairs) = world.sanitize_system_entities();
+        assert!(int_repairs.is_empty(), "non-system entities must not be sanitized");
         assert_eq!(
             world.entities.get(&hero_id).unwrap().get_int("power").unwrap(),
             5_000_000_000,
@@ -1239,14 +1305,62 @@ mod tests {
             clock.set_int("has_history", 1);
         }
 
-        let repairs = world.sanitize_system_entities();
-        assert!(repairs.is_empty(), "sane clock values must not trigger repairs");
+        let (int_repairs, _float_repairs) = world.sanitize_system_entities();
+        assert!(int_repairs.is_empty(), "sane clock values must not trigger repairs");
 
         let clock = world.entities.get(&clock_id).unwrap();
         assert_eq!(clock.get_int("day").unwrap(), 1234);
         assert_eq!(clock.get_int("hour").unwrap(), 14);
         assert_eq!(clock.get_int("actions_today").unwrap(), 42);
         assert_eq!(clock.get_int("has_history").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_sanitize_system_entities_repairs_garbage_float_total_years() {
+        // The world_clock's `total_years` float is a time counter that
+        // legitimately grows without bound (1 real minute = 1 game year),
+        // but the LLM effect writer occasionally emits the
+        // "1e18 / -INF / NaN" garbage signature. The sanitizer must
+        // detect NaN/Inf and clamp out-of-bounds values to MAX_TOTAL_YEARS
+        // (1e15) with the original sign preserved.
+        let mut world = World::new("Test");
+        let clock_id = clock_entity_id();
+        {
+            let clock = world.entities.get_mut(&clock_id).unwrap();
+            // legitimate long-running value
+            clock.set_float("total_years", 2_100_000.0);
+            // out-of-bounds positive
+            clock.set_float("shadow_reach", 1.0e18);
+            // out-of-bounds negative
+            clock.set_float("influence_radius", -1.0e20);
+            // NaN
+            clock.set_float("view_radius", f64::NAN);
+            // +Inf
+            clock.set_float("hearing_radius", f64::INFINITY);
+            // -Inf
+            clock.set_float("spell_range", f64::NEG_INFINITY);
+        }
+
+        let (_int_repairs, float_repairs) = world.sanitize_system_entities();
+        assert_eq!(
+            float_repairs.len(),
+            5,
+            "expected 5 float repairs (everything except the legitimate 2.1M), got {}",
+            float_repairs.len()
+        );
+
+        let clock = world.entities.get(&clock_id).unwrap();
+        // Legitimate value untouched.
+        assert_eq!(clock.get_float("total_years").unwrap(), 2_100_000.0);
+        // Out-of-bounds clamped to MAX_TOTAL_YEARS = 1e15 with sign preserved.
+        // (shadow_reach is not a known clock key, so it falls under
+        // MAX_GENERAL_FLOAT = 1e7 with sign preserved.)
+        assert_eq!(clock.get_float("shadow_reach").unwrap(), 1.0e7);
+        assert_eq!(clock.get_float("influence_radius").unwrap(), -1.0e7);
+        // NaN / ±Inf reset to 0.0.
+        assert_eq!(clock.get_float("view_radius").unwrap(), 0.0);
+        assert_eq!(clock.get_float("hearing_radius").unwrap(), 0.0);
+        assert_eq!(clock.get_float("spell_range").unwrap(), 0.0);
     }
 
     #[test]
