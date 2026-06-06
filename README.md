@@ -13,7 +13,7 @@ A Rust-based server for a dynamic world simulation where entities evolve, organi
 
 The world is powered by LLMs that drive entity behavior - generating options, selecting factors, and narrating outcomes - while deterministic game logic handles the actual state changes.
 
-**Website:** http://159.195.43.108:8080
+**Website:** http://159.195.43.108:8081
 
 ---
 
@@ -31,7 +31,7 @@ cd open-world
 cargo run
 ```
 
-The server starts on `http://localhost:8080`.
+The server starts on `http://localhost:8081`.
 
 On first run, the world is created with the **world clock** (time bookkeeping) + the canonical lore events from `docs/world_lore.md`. Per Arcurus 2026-06-04, fresh worlds do **not** auto-seed sample entities — call `World::seed_sample_entities()` (or the web UI's "Generate sample entities" button, or `POST /api/world/create?generate_sample=true`) to add the 7 canonical sample entities. See [`docs/world_entities.md`](docs/world_entities.md) for the full example roster (18 entities, with UUIDs, descriptions, tags, and properties).
 
@@ -128,7 +128,7 @@ Edit `settings.json` to customize:
 
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8080 },
+  "server": { "host": "0.0.0.0", "port": 8081 },
   "world": { "name": "Your World Name" },
   "llm": { "model": "...", "max_output_tokens": 50000 },
   "ui": { "title": "Open World", "map_size": { "width": 800, "height": 600 } }
