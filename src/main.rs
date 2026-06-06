@@ -1728,7 +1728,15 @@ async fn action_llm_handler(
     let full_url = format!("{}/v1/messages", api_url.trim_end_matches('/'));
     
     let client = reqwest::Client::new();
-    let system_prompt = "You are the world narrator for the Open World simulation. Respond ONLY with valid JSON (no other text before or after). Format: {\"action\":\"brief action name\",\"outcome\":\"2-3 sentences\",\"effects\":{{\"property_name\":change_value}},\"narrative\":\"story description\"}";
+    // 2026-06-06 (#openworld, Arcurus): effects may now target other
+    // entities that the action impacts, not just the actor. Keys are
+    // "entity_name.property_name" for other entities and
+    // "self.property_name" for the actor. The server expands "self"
+    // to the actor's name, resolves other-entity names to ids, and
+    // for now DRY-RUNS the cross-entity writes (logs what would have
+    // happened, applies only self-effects). The LLM is asked to
+    // emit at least one effect per entity it impacts in the action.
+    let system_prompt = "You are the world narrator for the Open World simulation. Respond ONLY with valid JSON (no other text before or after). Format: {\"action\":\"brief action name\",\"outcome\":\"2-3 sentences\",\"effects\":{{\"entityname.property_name\":change_value}},\"narrative\":\"story description\"} — keys are either self.property_name (the actor) or other_entity_name.property_name (any entity the action impacts); emit at least one effect per impacted entity so each can track it";
     let llm_request = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -2761,7 +2769,8 @@ pub fn apply_history_summary_replaces(
     // Truncate if over cap. Same strategy as the API endpoint: cut
     // from the END (keeps the start + any freshly inserted new_part
     // intact), append "…" on the boundary.
-    let (final_summary, truncated) = if state.chars().count() > max_chars {
+    let pre_truncate_len = state.chars().count();
+    let (final_summary, truncated) = if pre_truncate_len > max_chars {
         let keep = max_chars.saturating_sub(1);
         let cut: String = state.chars().take(keep).collect();
         let truncated_str = format!("{}…", cut);
@@ -2771,9 +2780,23 @@ pub fn apply_history_summary_replaces(
     };
 
     if truncated {
+        // Compute the pre-truncation length so the warning can report
+        // both the over-by amount and the cap explicitly. Most
+        // truncations happen because the LLM's replace chain produced
+        // something over the cap (e.g. the chain's `new_part` was
+        // larger than the cap, or the LLM used `!ALL!` to rewrite a
+        // summary that's now over the cap). The remaining case is
+        // a lowered cap: a previous LLM stored a summary at the old
+        // (higher) cap, and someone changed `default_max_history_summary_chars`
+        // since then. The LLM sees the full old summary (with the
+        // header saying `OVER by N`) and is expected to use
+        // `history_summary_replace` to shrink it; if it doesn't,
+        // we truncate server-side so the entity's stored state
+        // stays bounded.  Arcurus 2026-06-06 #openworld.
+        let over_by = pre_truncate_len.saturating_sub(max_chars);
         warnings.push(format!(
-            "history_summary exceeded {} chars after replace chain; truncated.",
-            max_chars
+            "history_summary was {} chars (over cap of {} by {}); truncated to ≤{} chars. The LLM should use history_summary_replace on a future turn to shrink this to ≤{} chars (e.g. a surgical edit of stale content, or !ALL! for a full rewrite).",
+            pre_truncate_len, max_chars, over_by, max_chars, max_chars
         ));
     }
 
@@ -2867,7 +2890,17 @@ pub(crate) fn float_oversize(v: f64) -> bool {
     !v.is_finite() || v.abs() > MAX_FLOAT_ABS
 }
 
-// Parse the JSON response from LLM
+/// Per-turn cap on the **total absolute magnitude** of all numeric
+/// effects an LLM can apply to a single entity, expressed as a
+/// fraction of the entity's `power` (with a hard floor of 10 on
+/// `power` so power-0 entities still have a small budget).  When
+/// the sum of |Δ| across all effects exceeds this cap, every
+/// numeric effect is scaled down proportionally so the new total
+/// exactly fills the cap.  Negative effects count as positive for
+/// the cap check (the magnitude is what matters).  String effects
+/// are not scaled.  Arcurus 2026-06-06 #openworld.
+pub(crate) const EFFECT_NORMALIZATION_CAP_PCT: f64 = 0.10;
+pub(crate) const EFFECT_NORMALIZATION_MIN_CAP: f64 = 1.0;
 //
 // On success, returns the parsed `LlmActionResponse` together with
 // an optional repair warning. The warning is `Some(_)` when the
@@ -2896,45 +2929,101 @@ fn parse_llm_action_response(raw: &str) -> Result<(LlmActionResponse, Option<Str
     match serde_json::from_str::<LlmActionResponse>(json_str) {
         Ok(parsed) => Ok((parsed, None)),
         Err(e) => {
-            // Strict parse failed. Try a tolerant fixup pass before
-            // giving up — see `fix_known_malformed_patterns` for the
-            // specific patterns we know how to repair. Per Arcurus
-            // 2026-06-05 #openworld: the World Clock entity has been
-            // emitting a `history_summary_replace` array whose first
-            // element has a spurious `"" : "new_part"` key+value
-            // before the actual `"new_part"` field, e.g.
+            // Strict parse failed. Try a chain of tolerant fixup
+            // passes before giving up — each targets a specific
+            // malformation we've actually observed in production
+            // logs.
+            //
+            // **Fixup #1 — empty-key bug in history_summary_replace**
+            // (per Arcurus 2026-06-05 #openworld): the World Clock
+            // entity has been emitting a `history_summary_replace`
+            // array whose first element has a spurious
+            // `"" : "new_part"` key+value before the actual
+            // `"new_part"` field, e.g.
             //   {"old_part":"...","":"new_part":"..."}
             // instead of
             //   {"old_part":"...","new_part":"..."}
             // which serde rejects. Rather than rejecting the whole
-            // response (and losing the `action`, `effects`, `narrative`,
-            // and the `history_summary` that often comes with it), we
-            // run a conservative regex repair and retry.
-            let repaired = fix_known_malformed_patterns(json_str);
-            if repaired != json_str {
-                match serde_json::from_str::<LlmActionResponse>(&repaired) {
-                    Ok(parsed) => {
-                        // Successful repair — return the parsed value
-                        // together with a warning string so the caller
-                        // can surface it in the response and / or the
-                        // LLM-call log. The warning is descriptive
-                        // (says "this was a regex repair of the
-                        // known empty-key bug") so a future operator
-                        // grepping the JSONL log for it can tell at
-                        // a glance how often the World Clock bug
-                        // recurs.
-                        Ok((parsed, Some(format!(
-                            "parse_llm_action_response: LLM response matched a known \
-                             malformed pattern and was repaired (regex fixup of the \
-                             \"\":\"old_part\"|\"new_part\" empty-key bug seen in \
-                             history_summary_replace)."
-                        ))))
-                    }
-                    Err(e2) => Err(format!(
-                        "JSON parse error: {} - Input (after repair attempt): {}",
-                        e2, repaired
-                    )),
+            // response (and losing the `action`, `effects`,
+            // `narrative`, and the `history_summary` that often
+            // comes with it), we run a conservative regex repair.
+            let repaired1 = fix_known_malformed_patterns(json_str);
+            if repaired1 != json_str {
+                if let Ok(parsed) = serde_json::from_str::<LlmActionResponse>(&repaired1) {
+                    // Successful fixup-#1 repair. Return the
+                    // parsed value with a warning string so the
+                    // caller can surface it in the response and
+                    // / or the LLM-call log. The warning is
+                    // descriptive (says "this was a regex repair
+                    // of the known empty-key bug") so a future
+                    // operator grepping the JSONL log for it can
+                    // tell at a glance how often the World Clock
+                    // bug recurs.
+                    return Ok((parsed, Some(format!(
+                        "parse_llm_action_response: LLM response matched a known \
+                         malformed pattern and was repaired (regex fixup of the \
+                         \"\":\"old_part\"|\"new_part\" empty-key bug seen in \
+                         history_summary_replace)."
+                    ))));
                 }
+            }
+
+            // **Fixup #2 — strip `{{`/`}}` wrappers outside JSON
+            // strings** (per Arcurus 2026-06-06 #openworld): the
+            // M2.7-highspeed LLM has been wrapping JSON objects in
+            // `{{` and `}}` (the outer response becomes `{{...}}`
+            // and `"effects": {{...}}`). The root cause is that
+            // the prompt template at `ai_templates/EntityAction.md`
+            // intentionally uses `{{`/`}}` as a "mustache-style
+            // escape" — the LLM is supposed to unescape them in
+            // its response, but M2.7-highspeed doesn't reliably
+            // do that and just copies the literal pattern. See
+            // `strip_double_braces_outside_strings` for the
+            // string-aware collapse algorithm.
+            //
+            // We apply fixup #2 on top of fixup #1's result, so a
+            // response that has *both* bugs (empty-key AND
+            // double-brace wrapping) is also recovered. The
+            // resulting string may then parse successfully; if
+            // not, we surface the most useful error.
+            let candidate = if repaired1 != json_str { repaired1.as_str() } else { json_str };
+            let repaired2 = strip_double_braces_outside_strings(candidate);
+            if repaired2 != candidate {
+                if let Ok(parsed) = serde_json::from_str::<LlmActionResponse>(&repaired2) {
+                    return Ok((parsed, Some(format!(
+                        "parse_llm_action_response: LLM response matched a known \
+                         malformed pattern and was repaired (stripped `{{`/`}}` \
+                         wrappers outside JSON strings — M2.7-highspeed has been \
+                         wrapping JSON objects in double braces; root cause is the \
+                         `{{`/`}}` mustache-style escape in the prompt template at \
+                         ai_templates/EntityAction.md, see 2026-06-06 #openworld)."
+                    ))));
+                }
+            }
+
+            // No fixup produced a parseable string. Surface the
+            // most useful error.
+            if repaired2 != candidate {
+                // The candidate post-fixup-#2 still doesn't parse.
+                // Show the post-fixup-#2 parse error if we can get
+                // one, otherwise fall back to the original error.
+                let e2 = serde_json::from_str::<LlmActionResponse>(&repaired2)
+                    .err()
+                    .unwrap_or(e);
+                Err(format!(
+                    "JSON parse error: {} - Input (after repair attempt): {}",
+                    e2, repaired2
+                ))
+            } else if repaired1 != json_str {
+                // Fixup #1 changed the string but #2 didn't change
+                // it, and the result still doesn't parse.
+                let e2 = serde_json::from_str::<LlmActionResponse>(&repaired1)
+                    .err()
+                    .unwrap_or(e);
+                Err(format!(
+                    "JSON parse error: {} - Input (after repair attempt): {}",
+                    e2, repaired1
+                ))
             } else {
                 Err(format!("JSON parse error: {} - Input: {}", e, json_str))
             }
@@ -2968,6 +3057,73 @@ fn fix_known_malformed_patterns(s: &str) -> String {
     pattern.replace_all(s, |caps: &regex::Captures| {
         format!(r#","{}":"#, &caps[1])
     }).into_owned()
+}
+
+/// Strip `{{` and `}}` wrappers that appear outside of JSON string
+/// literals.
+///
+/// **Background.** The M2.7-highspeed LLM has a recurring bug
+/// (per Arcurus 2026-06-06 #openworld: Velora silver-warden +
+/// scribe-covenant actions) where it wraps each JSON object in
+/// `{{` and `}}` — the outer response becomes `{{...}}` and even
+/// nested objects (e.g. `"effects": {{...}}`) are wrapped. The
+/// root cause is in the prompt template at
+/// `ai_templates/EntityAction.md`, which intentionally uses
+/// `{{` and `}}` as a "mustache-style escape" (see
+/// `entity_action_template_json_example_is_valid_json` in
+/// `context_builder.rs` for the original design intent — the LLM
+/// is supposed to unescape them in its response). M2.7-highspeed
+/// does not consistently do that and just copies the literal
+/// pattern. The strict `serde_json` parse then fails on the
+/// leading `{{`, and we lose the entire LLM response (action,
+/// effects, narrative, history_summary — the lot).
+///
+/// **The fix.** Conservative string-aware collapse:
+/// - We track JSON string boundaries (with backslash-escape
+///   awareness), so a literal `{{` or `}}` that appears *inside*
+///   a string value is left alone.
+/// - Outside of strings, we collapse each `{{` → `{` and
+///   `}}` → `}`. In valid JSON, a `{` outside a string is always
+///   an object-opener and is always followed by `"` (a key) or
+///   `}` (an empty object) — never by another `{`. So `{{` outside
+///   a string is always the LLM bug, not real JSON.
+fn strip_double_braces_outside_strings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escape = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+        // Collapse `{{` (outside string) → `{`.
+        if c == '{' && chars.peek() == Some(&'{') {
+            out.push('{');
+            chars.next(); // consume the second `{`
+            continue;
+        }
+        // Collapse `}}` (outside string) → `}`.
+        if c == '}' && chars.peek() == Some(&'}') {
+            out.push('}');
+            chars.next(); // consume the second `}`
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 // Process LLM action response - apply effects from raw LLM response
@@ -3030,6 +3186,49 @@ async fn process_action_handler(
                         entity.entity_type, entity.tags
                     ));
                 }
+
+                // Effect-normalization pre-pass (Arcurus 2026-06-06
+                // #openworld): compute the total absolute magnitude of
+                // all numeric effects that would actually be applied
+                // (skipping protected entities and magnitude-rejected
+                // deltas), then derive a single scale factor so the
+                // applied total never exceeds 10% of the entity's
+                // effective power (floored at 10, with a hard 1-unit
+                // minimum cap).  Negative deltas count as positive for
+                // the cap check (the magnitude is what matters).
+                // String effects are not scaled (categorical).
+                let raw_power = entity.properties_int.get("power").copied().unwrap_or(0);
+                let effect_cap = (std::cmp::max(10_i64, raw_power) as f64
+                    * EFFECT_NORMALIZATION_CAP_PCT)
+                    .max(EFFECT_NORMALIZATION_MIN_CAP);
+                let mut effect_total_magnitude: f64 = 0.0;
+                for (prop_key, change_val) in &action_data.effects {
+                    if protected_entity {
+                        continue;
+                    }
+                    if magnitude_check(change_val).is_some() {
+                        continue;
+                    }
+                    if let Some(f) = parse_effect_value(change_val) {
+                        if f.is_finite() {
+                            effect_total_magnitude += f.abs();
+                        }
+                    }
+                }
+                let effect_scale: f64 =
+                    if effect_total_magnitude > effect_cap && effect_total_magnitude > 0.0 {
+                        let s = effect_cap / effect_total_magnitude;
+                        warnings.push(format!(
+                            "Effects normalized: total |Δ|={:.3} exceeds cap {:.3} ({}% of max(10, power)={}); scaled by {:.4}.",
+                            effect_total_magnitude, effect_cap,
+                            (EFFECT_NORMALIZATION_CAP_PCT * 100.0) as i64,
+                            std::cmp::max(10, raw_power),
+                            s
+                        ));
+                        s
+                    } else {
+                        1.0
+                    };
 
                 for (prop_key, change_val) in &action_data.effects {
                     if protected_entity {
@@ -3099,7 +3298,17 @@ async fn process_action_handler(
                             continue;
                         }
                     };
-                    
+
+                    // Apply the per-turn effect-normalization scale to
+                    // numeric deltas.  String effects are not scaled
+                    // (they're categorical and there's no magnitude
+                    // to cap).  The scale was computed in the pre-pass
+                    // above; 1.0 means no normalization was needed.
+                    let (int_val, float_val) = (
+                        int_val.map(|v| ((v as f64) * effect_scale).round() as i64),
+                        float_val.map(|v| v * effect_scale),
+                    );
+
                     // Check which property stores this key (int, float, or string)
                     let is_in_int = entity.properties_int.contains_key(prop_key);
                     let is_in_float = entity.properties_float.contains_key(prop_key);
@@ -5046,6 +5255,148 @@ mod effect_guard_tests {
 }
 
 #[cfg(test)]
+mod effect_normalization_tests {
+    //! Unit tests for the per-turn effect normalization that runs
+    //! just before effects are applied to an entity.  The
+    //! normalization is **purely a function of** `(power, effects)`
+    //! — the test harness reimplements the same algorithm so the
+    //! expected scale can be computed without spinning up the full
+    //! apply-pipeline.  See the pre-pass block in
+    //! `process_action_handler` for the canonical implementation.
+
+    use super::*;
+
+    /// The same algorithm the pre-pass uses, lifted out for testing.
+    /// Returns the scale factor (1.0 if no normalization is needed).
+    fn compute_scale(
+        raw_power: i64,
+        effects: &std::collections::HashMap<String, serde_json::Value>,
+        protected_entity: bool,
+    ) -> f64 {
+        if protected_entity {
+            return 1.0; // Protected entities skip effects entirely.
+        }
+        let effect_cap = (std::cmp::max(10_i64, raw_power) as f64
+            * EFFECT_NORMALIZATION_CAP_PCT)
+            .max(EFFECT_NORMALIZATION_MIN_CAP);
+        let mut total: f64 = 0.0;
+        for v in effects.values() {
+            if magnitude_check(v).is_some() {
+                continue;
+            }
+            if let Some(f) = parse_effect_value(v) {
+                if f.is_finite() {
+                    total += f.abs();
+                }
+            }
+        }
+        if total > effect_cap && total > 0.0 {
+            effect_cap / total
+        } else {
+            1.0
+        }
+    }
+
+    fn mk_effects(pairs: &[(&str, f64)]) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut m = std::collections::HashMap::new();
+        for (k, v) in pairs {
+            // Encode as f64 json number, even if integer-valued, so
+            // magnitude_check / parse_effect_value handle it the
+            // same way they do in the pre-pass.
+            m.insert((*k).to_string(), serde_json::json!(v));
+        }
+        m
+    }
+
+    #[test]
+    fn normalization_no_scale_when_under_cap() {
+        // power=100 ⇒ cap = 10.  Total |Δ| = 2+3 = 5 < 10. No scale.
+        let eff = mk_effects(&[("power", 2.0), ("morale", 3.0)]);
+        let s = compute_scale(100, &eff, false);
+        assert!((s - 1.0).abs() < 1e-9, "expected no scale, got {s}");
+    }
+
+    #[test]
+    fn normalization_scales_down_proportionally_when_over_cap() {
+        // power=100 ⇒ cap = 10.  Total |Δ| = 50+30 = 80.  scale = 10/80 = 0.125.
+        let eff = mk_effects(&[("power", 50.0), ("morale", 30.0)]);
+        let s = compute_scale(100, &eff, false);
+        assert!((s - 0.125).abs() < 1e-9, "expected scale 0.125, got {s}");
+        // Verify: after applying the scale, total |Δ| = cap exactly.
+        let new_total: f64 = 50.0 * s + 30.0 * s;
+        assert!((new_total - 10.0).abs() < 1e-6, "post-scale total should equal cap, got {new_total}");
+    }
+
+    #[test]
+    fn normalization_negatives_count_as_positive() {
+        // power=100 ⇒ cap = 10.  Effects: -7 and -5 ⇒ total |Δ| = 12 > 10.
+        // scale = 10/12 ≈ 0.8333.
+        let eff = mk_effects(&[("power", -7.0), ("morale", -5.0)]);
+        let s = compute_scale(100, &eff, false);
+        let expected = 10.0 / 12.0;
+        assert!((s - expected).abs() < 1e-9, "expected scale {expected}, got {s}");
+    }
+
+    #[test]
+    fn normalization_power_zero_uses_floor_ten() {
+        // power=0 ⇒ cap = 10% of 10 = 1 (floored at 1).
+        // Effects: 0.4 and 0.4 ⇒ total |Δ| = 0.8 < 1. No scale.
+        let eff = mk_effects(&[("power", 0.4), ("morale", 0.4)]);
+        let s = compute_scale(0, &eff, false);
+        assert!((s - 1.0).abs() < 1e-9, "expected no scale, got {s}");
+    }
+
+    #[test]
+    fn normalization_power_zero_over_cap_scales_to_one() {
+        // power=0 ⇒ cap = 1.  Effects: 3 and 5 ⇒ total |Δ| = 8.
+        // scale = 1/8 = 0.125. Post-scale total = 1.
+        let eff = mk_effects(&[("power", 3.0), ("morale", 5.0)]);
+        let s = compute_scale(0, &eff, false);
+        assert!((s - 0.125).abs() < 1e-9, "expected scale 0.125, got {s}");
+        let new_total: f64 = 3.0 * s + 5.0 * s;
+        assert!((new_total - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalization_mixed_signs_treated_as_magnitudes() {
+        // power=200 ⇒ cap = 20.  Effects: +15 and -10 ⇒ total |Δ| = 25 > 20.
+        // scale = 20/25 = 0.8. Post-scale: +12 and -8 (total 20).
+        let eff = mk_effects(&[("power", 15.0), ("morale", -10.0)]);
+        let s = compute_scale(200, &eff, false);
+        assert!((s - 0.8).abs() < 1e-9, "expected scale 0.8, got {s}");
+    }
+
+    #[test]
+    fn normalization_protected_entity_skips_all_effects() {
+        // Protected entity — even if effects would exceed cap, scale=1.0
+        // because the effects aren't being applied (the loop skips them).
+        let eff = mk_effects(&[("power", 1000.0), ("morale", 5000.0)]);
+        let s = compute_scale(100, &eff, true);
+        assert!((s - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn normalization_oversize_deltas_excluded_from_total() {
+        // The 1e18 value would be magnitude-rejected, so it doesn't
+        // count toward the total.  With only the small effect,
+        // we're under the cap.
+        let mut eff = mk_effects(&[("power", 5.0)]);
+        eff.insert("evil".to_string(), serde_json::json!(1e18));
+        let s = compute_scale(100, &eff, false);
+        assert!((s - 1.0).abs() < 1e-9, "1e18 must be excluded; expected no scale, got {s}");
+    }
+
+    #[test]
+    fn normalization_constant_values_are_pickable() {
+        // Sanity: the cap formula and minimum cap both compile to
+        // the values we expect.  If these drift, the rest of the
+        // tests above are meaningless.
+        assert!((EFFECT_NORMALIZATION_CAP_PCT - 0.10).abs() < 1e-9);
+        assert!((EFFECT_NORMALIZATION_MIN_CAP - 1.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
 mod history_summary_replace_tests {
     use super::*;
 
@@ -5208,11 +5559,68 @@ mod history_summary_replace_tests {
             100,
         );
         assert!(result.truncated);
-        assert!(result.warnings.iter().any(|w| w.contains("exceeded")));
+        assert!(result.warnings.iter().any(|w| w.contains("over cap")));
+        // The new informative warning should mention the actual
+        // pre-truncation length, the cap, the over-by amount, and
+        // hint at using history_summary_replace to fix it.
+        let warn = result.warnings.iter().find(|w| w.contains("over cap")).unwrap();
+        assert!(warn.contains("200"), "warning should mention the pre-truncate length: {warn}");
+        assert!(warn.contains("100"), "warning should mention the cap: {warn}");
+        assert!(warn.contains("100"), "warning should mention the over-by amount: {warn}");
+        assert!(warn.contains("history_summary_replace"),
+            "warning should hint at the fix path: {warn}");
         // Truncated to cap-1 chars + "…".
         let s = result.new_summary.unwrap();
         assert!(s.ends_with('…'));
         assert_eq!(s.chars().count(), 100);
+    }
+
+    // -- matrix row 11b: cap-lowering scenario (Arcurus 2026-06-06 #openworld).
+    //    A previous LLM wrote a summary under the old (higher) cap.
+    //    An operator lowered the cap. The LLM is shown the full
+    //    over-cap summary in the prompt and asked to shrink; if it
+    //    doesn't, the server truncates and warns. --
+    #[test]
+    fn truncation_when_cap_lowered() {
+        // Simulate: a 150-char summary that was stored under the old
+        // cap of 200. The operator lowered the cap to 100, so the
+        // LLM is now asked to bring the summary under 100 chars.
+        // If the LLM doesn't shrink it (we test the no-op case
+        // here), the server must still bound the stored value to
+        // ≤ 100 chars and warn.
+        let summary = "x".repeat(150);
+        let result = apply_history_summary_replaces(
+            Some(&summary),
+            &[], // LLM sent no replace edits
+            100, // new (lowered) cap
+        );
+        assert!(result.truncated, "stored summary over the new cap must be truncated");
+        let s = result.new_summary.as_ref().unwrap();
+        assert!(s.chars().count() <= 100, "truncated length must be ≤ cap");
+        // The warning should mention:
+        //  - the pre-truncate length (150)
+        //  - the cap (100)
+        //  - the over-by amount (50)
+        //  - the history_summary_replace hint
+        let warn = result.warnings.iter().find(|w| w.contains("over cap")).unwrap();
+        assert!(warn.contains("150"), "warning should mention pre-truncate length: {warn}");
+        assert!(warn.contains("100"), "warning should mention the cap: {warn}");
+        assert!(warn.contains("50"), "warning should mention the over-by amount: {warn}");
+    }
+
+    // -- matrix row 11c: when result is exactly at the cap, no truncation,
+    //    no warning. Edge case. --
+    #[test]
+    fn truncation_exactly_at_cap_no_op() {
+        let result = apply_history_summary_replaces(
+            Some(&"x".repeat(50)),
+            &[],
+            50,
+        );
+        assert!(!result.truncated);
+        // No "over cap" warning when the result fits exactly.
+        assert!(!result.warnings.iter().any(|w| w.contains("over cap")),
+            "exactly-at-cap should not produce an over-cap warning");
     }
 
     // -- matrix row 12: empty result after a successful "delete everything" is treated

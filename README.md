@@ -154,6 +154,11 @@ tar czf open-world-backup-$(date +%Y%m%d-%H%M%S).tar.gz open-world
 | File | Description |
 |------|-------------|
 | README.md | This file — overview, quick start, roadmap |
+| [docs/world-mechanics.md](docs/world-mechanics.md) | **Action selector formula, history formatting, log files, auth, persistence, project topology** (start here) |
+| [docs/llm-context.md](docs/llm-context.md) | What's in the LLM action context (template variables, anti-repetition guidance) |
+| [docs/world_entities.md](docs/world_entities.md) | Current entity roster |
+| [docs/world_events.md](docs/world_events.md) | Active world events |
+| [docs/world_lore.md](docs/world_lore.md) | Realm lore: factions, Shadow Awakening arc, era context |
 | src/main.rs.md | API server, routes, handlers, LLM integration |
 | src/world_data/WorldEntity.rs.md | Entity data model |
 | src/world_data/World.rs.md | World container and entity management |
