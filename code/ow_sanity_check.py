@@ -7,7 +7,7 @@ LLM log for the counts we report (both-rate, multi-replace, parse
 errors, truncation events), and any other worth-reporting signal it
 finds along the way. Never mutates anything; --apply is intentionally
 NOT supported. Posts a Markdown report to a Discord channel (default
-#openworld-log, id 1511711721868230767).
+#openworld-log, id 1511696310984773633 — renumbered 2026-06-06; was 1511711721868230767, deleted by Discord).
 
 Usage:
     python3 code/ow_sanity_check.py                 # scan + print to stdout

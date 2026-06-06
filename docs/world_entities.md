@@ -161,7 +161,7 @@ We never want to lose these entities again. **Four** layers of protection:
    - Copies `save.owbl` to `world_data/backups/save-daily-YYYYMMDD.owbl`
    - Auto-prunes copies older than **30 days**
    - If the new file is suddenly < **50%** the size of the previous daily
-     backup, posts a warning to **#openworld** (`1511711727711031367`)
+     backup, posts a warning to **#openworld** (`1511696307905892393` — renumbered 2026-06-06; was `1511711727711031367`, deleted)
 
 4. **Pre-create snapshot** — every `POST /api/world/create` automatically
    snapshots the existing save to
