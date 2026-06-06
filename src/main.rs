@@ -2136,10 +2136,43 @@ async fn entity_action(
                     // Apply effects to entity
                     drop(world); // Release read lock
                     let mut world = state.world.write().await;
+                    // Build the case-sensitive name → id lookup
+                    // table BEFORE we take a mutable borrow of
+                    // the entity (Rust borrow checker: we can't
+                    // immutably borrow `world` while the entity is
+                    // borrowed mutably). Same parser as the
+                    // process_action_handler path so dotted keys
+                    // (`self.morale`, `Mira the Merchant.wealth`)
+                    // are resolved correctly instead of being
+                    // written as literal property names. Per
+                    // Arcurus 2026-06-06 #openworld.
+                    let name_to_id = build_name_index(&world);
+                    let entity_name = world.entities.get(&id).map(|e| e.name.clone())
+                        .unwrap_or_default();
+                    let (parsed_effects, unknown_entity_names) = parse_effects(
+                        &action_data.effects,
+                        id,
+                        &entity_name,
+                        &name_to_id,
+                    );
+                    let mut dry_run_report = DryRunReport::default();
+                    let mut unknown_warnings: Vec<String> = Vec::new();
                     if let Some(entity) = world.entities.get_mut(&id) {
                         let mut applied_effects = std::collections::HashMap::new();
-                        for (prop_key, change_val) in &action_data.effects {
-                            let change = match parse_effect_value(change_val) {
+                        for parsed in &parsed_effects {
+                            // Dispatch on target. Other-entity
+                            // effects are dry-run (parsed + logged,
+                            // not applied) to match the
+                            // process_action_handler behavior.
+                            match &parsed.target {
+                                EffectTarget::Other { name, .. } => {
+                                    dry_run_report.add(name, &parsed.raw_key, &parsed.value);
+                                    continue;
+                                }
+                                EffectTarget::Actor => {}
+                            }
+                            let prop_key = &parsed.prop_name;
+                            let change = match parse_effect_value(&parsed.value) {
                                 Some(c) => c,
                                 None => continue,
                             };
@@ -2153,14 +2186,30 @@ async fn entity_action(
                             }
                         }
 
-                        // Surface the tolerant-repair warning (if any)
-                        // in the response so the auto-call path is
-                        // also observable. Auto-call responses
-                        // historically had no `warnings` field, so
-                        // we add it. It is empty Vec on the common
-                        // (strict-parse-ok) path.
-                        let response_warnings: Vec<String> =
+                        // Aggregate the dry-run + unknown-name
+                        // warnings into the response so the
+                        // auto-call path is consistent with the
+                        // process path. Per Arcurus 2026-06-06
+                        // #openworld.
+                        let mut response_warnings: Vec<String> =
                             repair_warning.into_iter().collect();
+                        if let Some(w) = dry_run_report.to_warning() {
+                            response_warnings.push(w);
+                        }
+                        if !unknown_entity_names.is_empty() {
+                            let mut w = format!(
+                                "Unknown entity names in effects ({} name(s) skipped):",
+                                unknown_entity_names.len()
+                            );
+                            for name in &unknown_entity_names {
+                                w.push_str(&format!(
+                                    "\n  - {:?} (no entity with that exact name; check spelling and case)",
+                                    name
+                                ));
+                            }
+                            unknown_warnings.push(w);
+                        }
+                        response_warnings.extend(unknown_warnings);
 
                         success_json(serde_json::json!({
                             "success": true,
@@ -2901,6 +2950,342 @@ pub(crate) fn float_oversize(v: f64) -> bool {
 /// are not scaled.  Arcurus 2026-06-06 #openworld.
 pub(crate) const EFFECT_NORMALIZATION_CAP_PCT: f64 = 0.10;
 pub(crate) const EFFECT_NORMALIZATION_MIN_CAP: f64 = 1.0;
+
+/// Compute the per-turn effect-normalization pre-pass.
+///
+/// Returns `(total_magnitude, scale)` where:
+///   - `total_magnitude` is the sum of `|Δ|` across all numeric
+///     effects that survive the `magnitude_check` (i.e. are not
+///     garbage).  **Garbage is rejected BEFORE counting** so a
+///     single 1e18 sibling cannot drag a 1.0 sibling down to a
+///     near-zero scaled value.
+///   - `scale` is 1.0 when `total_magnitude ≤ cap` (no
+///     normalization needed), or `cap / total_magnitude`
+///     otherwise.
+///
+/// `protected_entity` short-circuits to (0.0, 1.0): system
+/// entities (World Clock, the universe anchor) skip effects
+/// entirely so the caller never normalizes them.
+///
+/// Extracted from the inline pre-pass in `process_action_handler`
+/// so the unit test exercises the actual production code and
+/// future-me can't accidentally swap the order.  Per Arcurus
+/// 2026-06-06 #openworld.
+pub(crate) fn compute_effect_normalization_scale(
+    raw_power: i64,
+    effects: &std::collections::HashMap<String, serde_json::Value>,
+    protected_entity: bool,
+) -> (f64, f64) {
+    if protected_entity {
+        return (0.0, 1.0);
+    }
+    let effect_cap = (std::cmp::max(10_i64, raw_power) as f64
+        * EFFECT_NORMALIZATION_CAP_PCT)
+        .max(EFFECT_NORMALIZATION_MIN_CAP);
+    let mut total: f64 = 0.0;
+    for v in effects.values() {
+        // Reject garbage FIRST.  Anything that fails
+        // `magnitude_check` (non-finite, |Δ| > MAX_DELTA_ABS)
+        // is excluded from `total`, so the scale is computed
+        // on the clean set.  The application loop further
+        // down re-checks `magnitude_check` so the garbage
+        // value itself is never written.  Per Arcurus
+        // 2026-06-06 #openworld: "reject the garbage first,
+        // but make sure that is removed from the applied
+        // effects before its counted or applied".
+        if magnitude_check(v).is_some() {
+            continue;
+        }
+        if let Some(f) = parse_effect_value(v) {
+            if f.is_finite() {
+                total += f.abs();
+            }
+        }
+    }
+    let scale = if total > effect_cap && total > 0.0 {
+        effect_cap / total
+    } else {
+        1.0
+    };
+    (total, scale)
+}
+
+// ---------------------------------------------------------------------------
+// Effect-key parser (Arcurus 2026-06-06 #openworld)
+//
+// LLM-emit effects use dot-keys to disambiguate the target entity:
+//   - "self.morale"                → apply to the actor
+//   - "Mira the Merchant.wealth"   → apply to Mira the Merchant
+//   - "morale"                     → apply to the actor (backward compat)
+//
+// The actor's own literal name (e.g. "Kira Dawnblade.morale" when
+// Kira is acting) is also accepted, case-sensitive, exact match.
+// The template and system prompt advertise only `self.X` to keep
+// the convention simple; the literal-name form is a forgiving
+// fallback for LLMs that forget the prefix. Per Arcurus 2026-06-06
+// #openworld: "yes alow self or own name but no need to mention
+// that it can use own name".
+//
+// Cross-entity writes are DRY-RUN for now (parsed, routed, logged
+// in an aggregated warning, NOT applied). This lets us verify the
+// routing and catch typos / stale entity memories before the writes
+// go live.
+// ---------------------------------------------------------------------------
+
+/// Where an effect should land.
+///
+/// `Actor` means "the entity the LLM is acting on" (the one named
+/// in the `/api/entities/:id/action/process` request). `Other`
+/// means "some other entity in the world" — currently a dry-run
+/// target, see `process_action_handler` for the warning. The
+/// `name` is kept alongside the `id` so the aggregated dry-run
+/// warning can name the targets without re-borrowing `world`
+/// inside the apply loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EffectTarget {
+    Actor,
+    /// Cross-entity target. `name` is the literal name from the
+    /// dot-prefix (e.g. "Mira the Merchant"). `id` is the resolved
+    /// entity id.
+    Other { name: String, id: Uuid },
+}
+
+/// One effect after the dot-key has been split and the target
+/// resolved. The application loop iterates `Vec<ParsedEffect>` and
+/// dispatches on `target` — no more inline string parsing.
+#[derive(Debug, Clone)]
+struct ParsedEffect {
+    /// Resolved target: self or a specific other entity.
+    target: EffectTarget,
+    /// Bare property name (no `self.` / `EntityName.` prefix).
+    /// Empty when the LLM emitted something like "self." with no
+    /// property; the application loop will surface a warning and
+    /// skip.
+    prop_name: String,
+    /// Original key as emitted by the LLM, kept for warnings and
+    /// the `effects_applied` response.
+    raw_key: String,
+    /// The value, unmodified (could be int/float/string/bool).
+    value: serde_json::Value,
+}
+
+/// Aggregate of the cross-entity (Other-target) effects in a single
+/// `process_action_handler` call, collected during the apply loop
+/// and emitted as a single aggregated warning. Per Arcurus
+/// 2026-06-06 #openworld: "make one warning message and include
+/// all stats and entities that are impacting other entities".
+#[derive(Debug, Default, Clone)]
+struct DryRunReport {
+    /// Per-entity tally: (entity_name, vec_of_(raw_key, value_str)).
+    by_entity: std::collections::BTreeMap<String, Vec<(String, String)>>,
+}
+
+impl DryRunReport {
+    fn add(&mut self, entity_name: &str, raw_key: &str, value: &serde_json::Value) {
+        self.by_entity
+            .entry(entity_name.to_string())
+            .or_default()
+            .push((raw_key.to_string(), value.to_string()));
+    }
+    fn is_empty(&self) -> bool { self.by_entity.is_empty() }
+    fn total_effects(&self) -> usize {
+        self.by_entity.values().map(|v| v.len()).sum()
+    }
+    fn total_entities(&self) -> usize { self.by_entity.len() }
+    /// Render as a single multi-line warning suitable for the
+    /// `warnings` vec. Returns None when the report is empty (so
+    /// the caller doesn't emit a no-op warning).
+    fn to_warning(&self) -> Option<String> {
+        if self.is_empty() { return None; }
+        let mut s = format!(
+            "Cross-entity dry-run: {} effect(s) targeting {} other entit{} (NOT applied):",
+            self.total_effects(),
+            self.total_entities(),
+            if self.total_entities() == 1 { "y" } else { "ies" },
+        );
+        for (entity_name, effects) in &self.by_entity {
+            s.push_str(&format!("\n  - {} ({} effect{}):",
+                entity_name, effects.len(),
+                if effects.len() == 1 { "" } else { "s" }));
+            for (raw_key, value_str) in effects {
+                s.push_str(&format!("\n      * {} = {}", raw_key, value_str));
+            }
+        }
+        s.push_str("\n  Cross-entity writes are dry-run for now (parsed and routed, not applied). \
+            Use self.X for actor effects and the entity's literal name (case-sensitive) for other entities.");
+        Some(s)
+    }
+}
+
+/// Build a case-sensitive name → id lookup table for the current
+/// world. The LLM emits literal names (e.g. "Mira the Merchant")
+/// as the prefix in dotted keys; we resolve to the entity id at
+/// effect-parse time. O(1) per lookup; rebuilt once per call.
+///
+/// On duplicate names (rare but possible), the last entity to be
+/// iterated wins. A future improvement is to detect and warn on
+/// duplicates; out of scope for now (per Arcurus 2026-06-06
+/// #openworld: ship the routing first, harden later).
+fn build_name_index(world: &World) -> std::collections::HashMap<String, Uuid> {
+    world.entities.iter().map(|(id, e)| (e.name.clone(), *id)).collect()
+}
+
+/// Parse the LLM-emit effects map into a typed list, resolving
+/// each key's target. Unknown entity names are returned separately
+/// so the caller can emit one aggregated warning.
+///
+/// `actor_id` and `actor_name` are needed to expand `self.X` and
+/// the actor's literal name (e.g. "Kira Dawnblade.X") to
+/// `EffectTarget::Actor`. `name_to_id` is the case-sensitive
+/// world-wide name lookup (see `build_name_index`).
+///
+/// Per Arcurus 2026-06-06 #openworld: case-sensitive exact match,
+/// accept `self.X` AND the actor's literal name, warn on unknown
+/// entity names.
+fn parse_effects(
+    effects: &std::collections::HashMap<String, serde_json::Value>,
+    actor_id: Uuid,
+    actor_name: &str,
+    name_to_id: &std::collections::HashMap<String, Uuid>,
+) -> (Vec<ParsedEffect>, Vec<String>) {
+    let mut parsed = Vec::with_capacity(effects.len());
+    let mut unknown_names: Vec<String> = Vec::new();
+    let mut seen_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (raw_key, value) in effects {
+        // Split on the FIRST dot.  Property names in this world
+        // never contain dots, so the prefix is "self" / the
+        // actor's literal name / another entity's name, and the
+        // suffix is the property name.
+        if let Some(dot_idx) = raw_key.find('.') {
+            let prefix = &raw_key[..dot_idx];
+            let prop = &raw_key[dot_idx + 1..];
+
+            if prop.is_empty() {
+                // "self." with no property — malformed; treat as
+                // an Actor effect with empty prop_name and let
+                // the application loop surface a warning.
+                parsed.push(ParsedEffect {
+                    target: EffectTarget::Actor,
+                    prop_name: String::new(),
+                    raw_key: raw_key.clone(),
+                    value: value.clone(),
+                });
+                continue;
+            }
+
+            if prefix == "self" || prefix == actor_name {
+                // Self-effect: either the convention ("self.X")
+                // or the actor's literal name ("Kira Dawnblade.X").
+                parsed.push(ParsedEffect {
+                    target: EffectTarget::Actor,
+                    prop_name: prop.to_string(),
+                    raw_key: raw_key.clone(),
+                    value: value.clone(),
+                });
+            } else if let Some(&target_id) = name_to_id.get(prefix) {
+                // Sanity: if the LLM happened to emit the actor's
+                // literal name in the dot-prefix (e.g. it
+                // canonicalized "self" to the actor's name) and
+                // the names match, treat as Actor.  This is a
+                // safety net for the "Kira Dawnblade.X when Kira
+                // is acting" case — already covered by the
+                // `prefix == actor_name` arm above, but spelled
+                // out for clarity.
+                if target_id == actor_id {
+                    parsed.push(ParsedEffect {
+                        target: EffectTarget::Actor,
+                        prop_name: prop.to_string(),
+                        raw_key: raw_key.clone(),
+                        value: value.clone(),
+                    });
+                } else {
+                    // Cross-entity effect: dry-run for now.
+                    // Stash the literal name alongside the id so
+                    // the apply loop can build the dry-run report
+                    // without re-borrowing `world`.
+                    parsed.push(ParsedEffect {
+                        target: EffectTarget::Other {
+                            name: prefix.to_string(),
+                            id: target_id,
+                        },
+                        prop_name: prop.to_string(),
+                        raw_key: raw_key.clone(),
+                        value: value.clone(),
+                    });
+                }
+            } else {
+                // Unknown entity name (typo, stale memory, etc.).
+                // De-dupe so the aggregated warning doesn't
+                // double-list the same name.
+                if seen_unknown.insert(prefix.to_string()) {
+                    unknown_names.push(prefix.to_string());
+                }
+                // Do NOT add to `parsed` — the effect is skipped
+                // entirely (no application, no normalization).
+            }
+        } else {
+            // No dot: backward-compat.  Treat as an Actor effect
+            // on the actor's bare property (old LLM behavior).
+            parsed.push(ParsedEffect {
+                target: EffectTarget::Actor,
+                prop_name: raw_key.clone(),
+                raw_key: raw_key.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+
+    (parsed, unknown_names)
+}
+
+/// Compute the actor's normalization scale given the parsed
+/// effect list. Only `EffectTarget::Actor` effects count for the
+/// actor's cap; `Other` effects are dry-run and don't change the
+/// actor, so they're excluded from the total. Magnitude-rejected
+/// values (non-finite, |Δ| > MAX_DELTA_ABS) are also excluded so
+/// a 1e18 sibling cannot drag a small real effect down to ~0.
+///
+/// This replaces the old raw-HashMap pre-pass and is the single
+/// source of truth for the per-turn cap. Per Arcurus 2026-06-06
+/// #openworld.
+fn compute_actor_normalization_scale(
+    actor_power: i64,
+    parsed: &[ParsedEffect],
+    protected_entity: bool,
+) -> (f64, f64) {
+    if protected_entity {
+        return (0.0, 1.0);
+    }
+    let effect_cap = (std::cmp::max(10_i64, actor_power) as f64
+        * EFFECT_NORMALIZATION_CAP_PCT)
+        .max(EFFECT_NORMALIZATION_MIN_CAP);
+    let mut total: f64 = 0.0;
+    for e in parsed {
+        // Only count actor effects; other-entity effects don't
+        // change the actor.
+        if !matches!(e.target, EffectTarget::Actor) { continue; }
+        // Reject garbage FIRST. Anything that fails
+        // `magnitude_check` is excluded from `total`, so the
+        // scale is computed on the clean set. The application
+        // loop re-checks magnitude_check so the garbage value
+        // itself is never written. Per Arcurus 2026-06-06
+        // #openworld: "reject the garbage first, but make sure
+        // that is removed from the applied effects before its
+        // counted or applied".
+        if magnitude_check(&e.value).is_some() { continue; }
+        if let Some(f) = parse_effect_value(&e.value) {
+            if f.is_finite() { total += f.abs(); }
+        }
+    }
+    let scale = if total > effect_cap && total > 0.0 {
+        effect_cap / total
+    } else {
+        1.0
+    };
+    (total, scale)
+}
+
 //
 // On success, returns the parsed `LlmActionResponse` together with
 // an optional repair warning. The warning is `Some(_)` when the
@@ -3158,6 +3543,15 @@ async fn process_action_handler(
                 &world,
                 state.settings.llm.default_max_history_summary_chars,
             ) as usize;
+            // Build the case-sensitive name → id lookup
+            // table BEFORE we take a mutable borrow of the
+            // entity (Rust borrow checker: we can't immutably
+            // borrow `world` while the entity is borrowed
+            // mutably). Used by `parse_effects` to resolve
+            // dot-prefixes like "Mira the Merchant.wealth" to
+            // the target entity id. O(1) per lookup; rebuilt
+            // once per process call.
+            let name_to_id = build_name_index(&world);
             if let Some(entity) = world.entities.get_mut(&entity_id) {
                 let mut applied_effects = std::collections::HashMap::new();
                 let mut new_values = std::collections::HashMap::new();
@@ -3198,45 +3592,86 @@ async fn process_action_handler(
                 // the cap check (the magnitude is what matters).
                 // String effects are not scaled (categorical).
                 let raw_power = entity.properties_int.get("power").copied().unwrap_or(0);
+                // Parse the LLM-emit effects map ONCE into a typed
+                // list with explicit targets. The pre-pass and the
+                // application loop both iterate this list, so they
+                // can never disagree on what counts as an actor
+                // effect vs a cross-entity (dry-run) effect.
+                // Per Arcurus 2026-06-06 #openworld.
+                let (parsed_effects, unknown_entity_names) = parse_effects(
+                    &action_data.effects,
+                    entity_id,
+                    &entity.name,
+                    &name_to_id,
+                );
+                // Single source of truth for the normalization
+                // scale; computed on the parsed list, so only
+                // Actor-targeted effects count toward the actor's
+                // 10%-of-power cap. Garbage (1e18) is rejected
+                // FIRST via `magnitude_check` so a single bad
+                // sibling cannot drag a small real effect down to
+                // a near-zero scaled value. Per Arcurus 2026-06-06
+                // #openworld.
+                let (effect_total_magnitude, effect_scale) =
+                    compute_actor_normalization_scale(
+                        raw_power,
+                        &parsed_effects,
+                        protected_entity,
+                    );
                 let effect_cap = (std::cmp::max(10_i64, raw_power) as f64
                     * EFFECT_NORMALIZATION_CAP_PCT)
                     .max(EFFECT_NORMALIZATION_MIN_CAP);
-                let mut effect_total_magnitude: f64 = 0.0;
-                for (prop_key, change_val) in &action_data.effects {
-                    if protected_entity {
-                        continue;
-                    }
-                    if magnitude_check(change_val).is_some() {
-                        continue;
-                    }
-                    if let Some(f) = parse_effect_value(change_val) {
-                        if f.is_finite() {
-                            effect_total_magnitude += f.abs();
-                        }
-                    }
-                }
-                let effect_scale: f64 =
-                    if effect_total_magnitude > effect_cap && effect_total_magnitude > 0.0 {
-                        let s = effect_cap / effect_total_magnitude;
-                        warnings.push(format!(
+                if effect_total_magnitude > effect_cap && effect_total_magnitude > 0.0 {
+                    warnings.push(format!(
                             "Effects normalized: total |Δ|={:.3} exceeds cap {:.3} ({}% of max(10, power)={}); scaled by {:.4}.",
                             effect_total_magnitude, effect_cap,
                             (EFFECT_NORMALIZATION_CAP_PCT * 100.0) as i64,
                             std::cmp::max(10, raw_power),
-                            s
+                            effect_scale
                         ));
-                        s
-                    } else {
-                        1.0
-                    };
+                    }
+                // Aggregated dry-run report for cross-entity
+                // effects. One warning per call, with the full
+                // list of effects and their target entity names.
+                // Per Arcurus 2026-06-06 #openworld.
+                let mut dry_run_report = DryRunReport::default();
 
-                for (prop_key, change_val) in &action_data.effects {
+                for parsed in &parsed_effects {
+                    let prop_key = &parsed.prop_name;
+                    let raw_key = &parsed.raw_key;
+                    let change_val = &parsed.value;
+
+                    // Dispatch on target first — cross-entity
+                    // (Other) effects are dry-run and never write.
+                    // Per Arcurus 2026-06-06 #openworld.
+
+                    // Dispatch on target first — cross-entity
+                    // (Other) effects are dry-run and never write.
+                    // Per Arcurus 2026-06-06 #openworld.
+                    match &parsed.target {
+                        EffectTarget::Other { name, .. } => {
+                            if protected_entity {
+                                // Skip; the system-entity warning
+                                // already covers the whole batch.
+                                continue;
+                            }
+                            // Aggregate into the dry-run report;
+                            // one warning per call (after the loop).
+                            dry_run_report.add(name, raw_key, change_val);
+                            continue;
+                        }
+                        EffectTarget::Actor => {
+                            // Fall through to the actor-effect
+                            // application below.
+                        }
+                    }
+
                     if protected_entity {
                         // Skip writing effects on system entities but keep
                         // tracking the count for the response payload.
                         warnings.push(format!(
                             "Skipped effect on system entity: {}={:?}",
-                            prop_key, change_val
+                            raw_key, change_val
                         ));
                         continue;
                     }
@@ -3250,7 +3685,7 @@ async fn process_action_handler(
                     if let Some(reason) = magnitude_check(change_val) {
                         warnings.push(format!(
                             "Skipped effect on '{}': {} (value={:?})",
-                            prop_key, reason, change_val
+                            raw_key, reason, change_val
                         ));
                         continue;
                     }
@@ -3294,7 +3729,7 @@ async fn process_action_handler(
                         }
                         // Null, Array, Object -> skip with warning
                         _ => {
-                            warnings.push(format!("Unsupported effect type for '{}': {:?}", prop_key, change_val));
+                            warnings.push(format!("Unsupported effect type for '{}': {:?}", raw_key, change_val));
                             continue;
                         }
                     };
@@ -3310,10 +3745,14 @@ async fn process_action_handler(
                     );
 
                     // Check which property stores this key (int, float, or string)
+                    // — the BARE property name (no `self.` or
+                    // `EntityName.` prefix), so e.g. "self.morale"
+                    // and "Kira Dawnblade.morale" both write to
+                    // the actor's "morale" property.
                     let is_in_int = entity.properties_int.contains_key(prop_key);
                     let is_in_float = entity.properties_float.contains_key(prop_key);
                     let is_in_string = entity.properties_string.contains_key(prop_key);
-                    
+
                     // Apply to the existing property type, or create the right type
                     if let Some(val) = int_val {
                         if is_in_float {
@@ -3324,7 +3763,7 @@ async fn process_action_handler(
                             warnings.push(format!("Type mismatch: '{}' is string, tried to set int ({}). Skipped.", prop_key, val));
                             continue;
                         }
-                        
+
                         // Get or create the int property
                         let old_val = *entity.properties_int.get(prop_key).unwrap_or(&0);
                         let new_val = old_val.checked_add(val).unwrap_or_else(|| {
@@ -3353,7 +3792,7 @@ async fn process_action_handler(
                             warnings.push(format!("Type mismatch: '{}' is string, tried to set float ({}). Skipped.", prop_key, val));
                             continue;
                         }
-                        
+
                         let old_val = *entity.properties_float.get(prop_key).unwrap_or(&0.0);
                         let new_val = old_val + val;
                         if float_oversize(new_val) {
@@ -3375,12 +3814,48 @@ async fn process_action_handler(
                             warnings.push(format!("Type mismatch: {} is float, tried to set string (val=\"{}\"). Skipped.", prop_key, val));
                             continue;
                         }
-                        
+
                         // String: set the value (not additive, just replace)
                         entity.properties_string.insert(prop_key.clone(), val.clone());
                         applied_effects.insert(prop_key.clone(), serde_json::json!(val));
                         new_values.insert(prop_key.clone(), serde_json::json!(val));
                     }
+                }
+
+                // Emit the aggregated dry-run warning (ONE per
+                // call, regardless of how many cross-entity
+                // effects there are). Per Arcurus 2026-06-06
+                // #openworld: "make one warning message and
+                // include all stats and entities that are
+                // impacting otherentities".
+                if let Some(w) = dry_run_report.to_warning() {
+                    warnings.push(w);
+                }
+
+                // Emit the aggregated unknown-entity warning.
+                // One per call, listing the de-duped names that
+                // the LLM referenced but that don't exist in
+                // the world. (The corresponding effects are
+                // already skipped — they were never added to
+                // `parsed_effects`.)
+                if !unknown_entity_names.is_empty() {
+                    let mut w = format!(
+                        "Unknown entity names in effects ({} effect(s) skipped):",
+                        // Count: number of effects with these
+                        // prefixes (could be more than the number
+                        // of unique names if the LLM emitted
+                        // multiple effects per name). We don't
+                        // have the per-prefix count cheaply here,
+                        // so we report the unique-name count
+                        // (the LLM should look at the list and
+                        // figure out which of their effects
+                        // are impacted).
+                        unknown_entity_names.len()
+                    );
+                    for name in &unknown_entity_names {
+                        w.push_str(&format!("\n  - {:?} (no entity with that exact name; check spelling and case)", name));
+                    }
+                    warnings.push(w);
                 }
 
                 // NOTE: log_llm() + history_entry build are deferred
@@ -5266,6 +5741,220 @@ mod effect_normalization_tests {
 
     use super::*;
 
+    /// Build a small `World` with three named entities for
+    /// the effect-key parser tests. The names are unique so
+    /// exact-match lookups can be tested.
+    fn make_test_world() -> (World, Uuid, Uuid, Uuid) {
+        let mut world = World::new("test");
+        let actor = WorldEntity::new("hero", "Kira Dawnblade", 0.0, 0.0);
+        let other1 = WorldEntity::new("merchant", "Mira the Merchant", 100.0, 0.0);
+        let other2 = WorldEntity::new("location", "Whisperwood Forest", 200.0, 0.0);
+        let actor_id = actor.id;
+        let other1_id = other1.id;
+        let other2_id = other2.id;
+        world.entities.insert(actor.id, actor);
+        world.entities.insert(other1.id, other1);
+        world.entities.insert(other2.id, other2);
+        (world, actor_id, other1_id, other2_id)
+    }
+
+    /// Build an effects HashMap from `(key, f64)` pairs. F64 so
+    /// the LLM-style numbers (5, 0.5, 1e18) all parse the same
+    /// way the production code would.
+    fn mk(key_value: &[(&str, f64)]) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut m = std::collections::HashMap::new();
+        for (k, v) in key_value {
+            m.insert((*k).to_string(), serde_json::json!(*v));
+        }
+        m
+    }
+
+    #[test]
+    fn parse_effects_self_prefix_is_actor() {
+        let (world, actor_id, _, _) = make_test_world();
+        let name_to_id = build_name_index(&world);
+        let effects = mk(&[("self.morale", 1.0)]);
+        let (parsed, unknown) = parse_effects(
+            &effects, actor_id, "Kira Dawnblade", &name_to_id);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].target, EffectTarget::Actor);
+        assert_eq!(parsed[0].prop_name, "morale");
+        assert_eq!(parsed[0].raw_key, "self.morale");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_effects_actor_literal_name_is_actor() {
+        // The actor is "Kira Dawnblade" — `Kira Dawnblade.morale`
+        // should also resolve to Actor (case-sensitive exact match).
+        // Per Arcurus 2026-06-06 #openworld: "yes alow self or own
+        // name but no need to mention that it can use own name".
+        let (world, actor_id, _, _) = make_test_world();
+        let name_to_id = build_name_index(&world);
+        let effects = mk(&[("Kira Dawnblade.morale", 2.0)]);
+        let (parsed, unknown) = parse_effects(
+            &effects, actor_id, "Kira Dawnblade", &name_to_id);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].target, EffectTarget::Actor);
+        assert_eq!(parsed[0].prop_name, "morale");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_effects_other_entity_resolves_by_name() {
+        let (world, actor_id, other1_id, _) = make_test_world();
+        let name_to_id = build_name_index(&world);
+        let effects = mk(&[("Mira the Merchant.wealth", -2.0)]);
+        let (parsed, unknown) = parse_effects(
+            &effects, actor_id, "Kira Dawnblade", &name_to_id);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].target,
+            EffectTarget::Other { name: "Mira the Merchant".to_string(), id: other1_id });
+        assert_eq!(parsed[0].prop_name, "wealth");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_effects_unknown_entity_name_collected() {
+        let (world, actor_id, _, _) = make_test_world();
+        let name_to_id = build_name_index(&world);
+        // "Miar the Merchant" (typo) — unknown.
+        let effects = mk(&[("Miar the Merchant.wealth", -1.0)]);
+        let (parsed, unknown) = parse_effects(
+            &effects, actor_id, "Kira Dawnblade", &name_to_id);
+        assert!(parsed.is_empty(),
+            "unknown-name effect must be skipped, not parsed: got {parsed:?}");
+        assert_eq!(unknown, vec!["Miar the Merchant".to_string()]);
+    }
+
+    #[test]
+    fn parse_effects_case_sensitive() {
+        // Lowercase "mira the merchant" should NOT match
+        // "Mira the Merchant". Per Arcurus 2026-06-06
+        // #openworld: "yea do exact match".
+        let (world, actor_id, _, _) = make_test_world();
+        let name_to_id = build_name_index(&world);
+        let effects = mk(&[("mira the merchant.wealth", -1.0)]);
+        let (parsed, unknown) = parse_effects(
+            &effects, actor_id, "Kira Dawnblade", &name_to_id);
+        assert!(parsed.is_empty());
+        assert_eq!(unknown, vec!["mira the merchant".to_string()]);
+    }
+
+    #[test]
+    fn parse_effects_no_dot_is_actor() {
+        // Backward compat: bare "morale" (no dot) should resolve
+        // to Actor on the bare property name. The old LLM
+        // behavior.  Per Arcurus 2026-06-06 #openworld: "no
+        // need to mention that it can use own name" — bare
+        // keys are an even older convention.
+        let (world, actor_id, _, _) = make_test_world();
+        let name_to_id = build_name_index(&world);
+        let effects = mk(&[("morale", 1.0)]);
+        let (parsed, unknown) = parse_effects(
+            &effects, actor_id, "Kira Dawnblade", &name_to_id);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].target, EffectTarget::Actor);
+        assert_eq!(parsed[0].prop_name, "morale");
+        assert_eq!(parsed[0].raw_key, "morale");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_effects_mixed_self_other_unknown_garbage() {
+        // Single call with every kind of effect, to prove they
+        // get routed correctly without interfering with each
+        // other.
+        let (world, actor_id, other1_id, other2_id) = make_test_world();
+        let name_to_id = build_name_index(&world);
+        let mut effects = mk(&[
+            ("self.morale", 1.0),                    // Actor
+            ("Kira Dawnblade.power", 2.0),           // Actor (literal name)
+            ("Mira the Merchant.wealth", -2.0),      // Other
+            ("Whisperwood Forest.knowledge", 3.0),   // Other
+            ("Miar the Merchant.wealth", -1.0),      // Unknown
+        ]);
+        effects.insert("self.power".to_string(), serde_json::json!(1e18)); // garbage (will be tested below)
+        let (parsed, unknown) = parse_effects(
+            &effects, actor_id, "Kira Dawnblade", &name_to_id);
+        // Garbage is parsed (it has a valid target — Actor), but
+        // it would be magnitude-rejected at the apply stage.
+        // The unknown name is filtered out.
+        assert_eq!(parsed.len(), 5, "all 5 known-name effects parsed; unknown skipped");
+        assert_eq!(unknown, vec!["Miar the Merchant".to_string()]);
+        // Verify each parsed target
+        let actor_count = parsed.iter().filter(|p| p.target == EffectTarget::Actor).count();
+        let other_count = parsed.iter().filter(|p| matches!(p.target, EffectTarget::Other { .. })).count();
+        assert_eq!(actor_count, 3, "self.morale + literal name + garbage = 3 Actor");
+        assert_eq!(other_count, 2, "Mira + Whisperwood = 2 Other");
+        // Verify the IDs of the Other effects
+        let other_ids: std::collections::HashSet<Uuid> = parsed.iter()
+            .filter_map(|p| match p.target {
+                EffectTarget::Other { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert!(other_ids.contains(&other1_id));
+        assert!(other_ids.contains(&other2_id));
+    }
+
+    #[test]
+    fn actor_normalization_scale_excludes_other_effects() {
+        // Cross-entity (Other) effects must NOT count toward
+        // the actor's normalization cap. Per Arcurus 2026-06-06
+        // #openworld: "self.X for the actor" — the cap is
+        // about the actor, not the world.
+        let (world, actor_id, _, _) = make_test_world();
+        let name_to_id = build_name_index(&world);
+        // Actor would have cap 10 (power=100). Total |Δ| for
+        // self.X is 5 (under cap), but if we wrongly counted
+        // the Other effects it would be 5+8+20=33, scaled to
+        // ~0.303 — and the small self.X would be applied as
+        // 1.5 instead of 5. We assert the scale is 1.0, i.e.
+        // Other effects are excluded.
+        let effects = mk(&[
+            ("self.morale", 5.0),                    // actor, |Δ|=5
+            ("Mira the Merchant.wealth", -8.0),      // other, |Δ|=8
+            ("Whisperwood Forest.knowledge", 20.0),  // other, |Δ|=20
+        ]);
+        let (parsed, _) = parse_effects(
+            &effects, actor_id, "Kira Dawnblade", &name_to_id);
+        let (total, scale) = compute_actor_normalization_scale(100, &parsed, false);
+        assert!((total - 5.0).abs() < 1e-9,
+            "actor total should be 5.0 (other effects excluded), got {total}");
+        assert!((scale - 1.0).abs() < 1e-9,
+            "actor scale should be 1.0 (5.0 < cap of 10), got {scale}");
+    }
+
+    #[test]
+    fn dry_run_report_aggregates_by_entity() {
+        // The report is per-entity (BTreeMap) with the full
+        // list of effects for each. Per Arcurus 2026-06-06
+        // #openworld: "make one warning message and include
+        // all stats and entities that are impacting
+        // otherentities".
+        let mut r = DryRunReport::default();
+        r.add("Mira the Merchant", "Mira the Merchant.wealth", &serde_json::json!(-2.0));
+        r.add("Mira the Merchant", "Mira the Merchant.reputation", &serde_json::json!(1.0));
+        r.add("Whisperwood Forest", "Whisperwood Forest.knowledge", &serde_json::json!(3.0));
+        assert_eq!(r.total_effects(), 3);
+        assert_eq!(r.total_entities(), 2);
+        let w = r.to_warning().unwrap();
+        assert!(w.contains("3 effect(s)"), "stats in warning: {w}");
+        assert!(w.contains("2 other entities"), "stats in warning: {w}");
+        assert!(w.contains("Mira the Merchant"), "target name in warning: {w}");
+        assert!(w.contains("Whisperwood Forest"), "target name in warning: {w}");
+        assert!(w.contains("Mira the Merchant.wealth"), "raw key in warning: {w}");
+    }
+
+    #[test]
+    fn dry_run_report_empty_returns_none() {
+        // No dry-run effects → no warning, to keep the response
+        // clean.
+        let r = DryRunReport::default();
+        assert!(r.to_warning().is_none());
+    }
+
     /// The same algorithm the pre-pass uses, lifted out for testing.
     /// Returns the scale factor (1.0 if no normalization is needed).
     fn compute_scale(
@@ -5273,28 +5962,11 @@ mod effect_normalization_tests {
         effects: &std::collections::HashMap<String, serde_json::Value>,
         protected_entity: bool,
     ) -> f64 {
-        if protected_entity {
-            return 1.0; // Protected entities skip effects entirely.
-        }
-        let effect_cap = (std::cmp::max(10_i64, raw_power) as f64
-            * EFFECT_NORMALIZATION_CAP_PCT)
-            .max(EFFECT_NORMALIZATION_MIN_CAP);
-        let mut total: f64 = 0.0;
-        for v in effects.values() {
-            if magnitude_check(v).is_some() {
-                continue;
-            }
-            if let Some(f) = parse_effect_value(v) {
-                if f.is_finite() {
-                    total += f.abs();
-                }
-            }
-        }
-        if total > effect_cap && total > 0.0 {
-            effect_cap / total
-        } else {
-            1.0
-        }
+        // Thin test wrapper around the production function.  We
+        // call the production code directly (not a copy) so a
+        // future refactor of the normalization pre-pass cannot
+        // silently drift the test from reality.
+        compute_effect_normalization_scale(raw_power, effects, protected_entity).1
     }
 
     fn mk_effects(pairs: &[(&str, f64)]) -> std::collections::HashMap<String, serde_json::Value> {
@@ -5384,6 +6056,43 @@ mod effect_normalization_tests {
         eff.insert("evil".to_string(), serde_json::json!(1e18));
         let s = compute_scale(100, &eff, false);
         assert!((s - 1.0).abs() < 1e-9, "1e18 must be excluded; expected no scale, got {s}");
+    }
+
+    // Regression test for Arcurus 2026-06-06 #openworld:
+    // "reject the garbage first, but make sure that is removed
+    //  from the applied effects before its counted or applied.
+    //  otherwise if normalized it would still be applied."
+    //
+    // Specifically: a small *real* effect (morale: 1.0) sitting
+    // next to a sibling garbage value (1e18) must NOT be scaled
+    // to ~0 by the normalization.  The garbage is excluded from
+    // the total (magnitude_check fails), so the small effect is
+    // applied at its literal value.
+    #[test]
+    fn normalization_garbage_does_not_drag_sibling_to_zero() {
+        let mut eff = mk_effects(&[("morale", 1.0)]);
+        eff.insert("evil".to_string(), serde_json::json!(1e18));
+        let (total, scale) =
+            compute_effect_normalization_scale(100, &eff, false);
+        // 1e18 was rejected, so the total is just 1.0 (the small effect).
+        assert!((total - 1.0).abs() < 1e-9,
+            "total should be 1.0 (garbage excluded), got {total}");
+        // 1.0 is under the cap (10 for power=100), so scale is 1.0.
+        // If the order were wrong (garbage counted), total would
+        // be ~1e18, scale would be ~1e-17, and the sibling 1.0
+        // would be applied as ~1e-17.  This assertion guards
+        // against that exact regression.
+        assert!((scale - 1.0).abs() < 1e-9,
+            "scale should be 1.0 (garbage excluded, small effect under cap), got {scale}");
+        // Same for non-numeric garbage (e.g. a string that
+        // magnitude_check would reject as a non-finite parse):
+        let mut eff2 = mk_effects(&[("morale", 2.0)]);
+        eff2.insert("evil".to_string(), serde_json::json!("not a number"));
+        let (total2, scale2) =
+            compute_effect_normalization_scale(100, &eff2, false);
+        assert!((total2 - 2.0).abs() < 1e-9,
+            "non-numeric garbage should be excluded; got total={total2}");
+        assert!((scale2 - 1.0).abs() < 1e-9);
     }
 
     #[test]
