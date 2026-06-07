@@ -7,6 +7,7 @@
 # Runtime data (at project root only)
 /world_data/
 /logs/
+/backups/
 *.owbl
 *.bak
 

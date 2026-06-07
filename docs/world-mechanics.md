@@ -210,6 +210,21 @@ A single rule of thumb: **negative = hide, positive = expose**.
   being seen. `The Shadow Crown` (an artifact) currently sits
   at `visibility=834`; `Ironforge Clan` at `360`; `Keepers of
   the Eternal Flame` at `293`.
+- **Super-positive visibility (`> 500`)** = *celebrated /
+  conspicuous presence* — the entity is deliberately exposing
+  itself to the world. A figure of legend whose name is on
+  every tongue: a crowned sovereign, a feared warlord, a
+  beloved saint, an artifact that reshaped history. At this
+  tier the entity dominates the nearby-entity lists of
+  *everyone* in its radius regardless of `power`, because the
+  influence formula `max(1, power + visibility) / distance` is
+  dragged up by visibility alone. Use it when the entity's
+  *narrative weight* should outstrip its raw `power` value, or
+  when you want a quiet-but-famous bystander to surface
+  alongside legends. `The Shadow Crown` (834) is the live
+  example: its `power` is small but its `visibility` puts it
+  at the top of every nearby list. The opposite of negative
+  visibility (hiding) is not zero — it's *choosing to be seen*.
 
 ### Where it feeds in
 
