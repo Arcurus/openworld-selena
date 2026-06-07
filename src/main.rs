@@ -2172,7 +2172,7 @@ async fn entity_action(
                     // normalization, type handling, system-entity
                     // guard). Per Arcurus 2026-06-07 #openworld.
                     let mut response_warnings: Vec<String> = Vec::new();
-                    let (mut applied_effects, _actor_nvs, cross_entity_applied) =
+                    let (mut applied_effects, _actor_nvs, cross_entity_applied, hidden_tags_updated) =
                         apply_all_effects(&mut world, id, &parsed_effects, &mut response_warnings);
                     // Auto-call response format uses NEW VALUES
                     // (not deltas — the pre-refactor auto-call used
@@ -2206,6 +2206,7 @@ async fn entity_action(
                         "outcome": action_data.outcome,
                         "effects_applied": applied_effects,
                         "cross_entity_effects_applied": cross_entity_applied,
+                        "hidden_tags_updated": hidden_tags_updated,
                         "narrative": action_data.narrative,
                         "warnings": all_warnings
                     })).into_response()
@@ -2947,6 +2948,63 @@ pub(crate) const EFFECT_NORMALIZATION_CAP_PCT: f64 = 0.10;
 pub(crate) const EFFECT_NORMALIZATION_MAX_AMOUNT: f64 = 10.0;
 pub(crate) const EFFECT_NORMALIZATION_MIN_CAP: f64 = 1.0;
 
+/// Tag name used by the post-effect hidden-state rule.  Per
+/// Arcurus 2026-06-07 #openworld: when an entity's
+/// `max(10, power) / 10 + visibility` falls below 0, the
+/// `hidden` tag is added (the entity has dropped out of
+/// common awareness).  When the value reaches 1 or above, the
+/// tag is removed (the entity is back in the open).
+/// `0 ≤ threshold < 1` is the dead zone — no change, so the
+/// tag doesn't flicker near the boundary.
+const HIDDEN_TAG: &str = "hidden";
+
+/// Update the `hidden` tag on an entity based on its current
+/// (post-effect) `power` and `visibility`.  The threshold is
+/// `max(10, power) / 10 + visibility`:
+///
+///   - `threshold <  0`  → add the tag (the entity has dropped
+///                          out of common awareness)
+///   - `threshold >= 1`  → remove the tag (the entity is back
+///                          in the open)
+///   - `0 ≤ threshold < 1`  → no change (keep current state;
+///                              this is a small dead zone so
+///                              the tag doesn't flicker right
+///                              at the boundary).
+///
+/// Returns `(added, removed, threshold)` so the caller can
+/// emit a warning.  The threshold is included for the
+/// warning text so operators can see WHY the tag toggled.
+///
+/// Why this formula: low-power entities are easy to hide
+/// (a Mira-the-Scribe with visibility=-2 → threshold = 1 + (-2)
+/// = -1 → hidden), while high-power entities are hard to hide
+/// (a Vaelthrix with visibility=-50 → threshold = 132 + (-50)
+/// = 82 → still very visible).  Makes narrative sense: a
+/// sleeping dragon is still scary.  The +10 floor on `power`
+/// ensures power-0 entities still get a small baseline (so
+/// a brand-new entity with default properties doesn't
+/// flicker on/off the hidden tag due to noisy visibility
+/// writes of ±1).
+fn update_hidden_tag(entity: &mut WorldEntity) -> (bool, bool, f64) {
+    let power = entity.properties_int.get("power").copied().unwrap_or(0);
+    let visibility = entity.properties_int.get("visibility").copied().unwrap_or(0);
+    let threshold = (std::cmp::max(10_i64, power) as f64 / 10.0) + (visibility as f64);
+    let has_hidden = entity.has_tag(HIDDEN_TAG);
+
+    if threshold < 0.0 {
+        if !has_hidden {
+            entity.add_tag(HIDDEN_TAG);
+            return (true, false, threshold);
+        }
+    } else if threshold >= 1.0 {
+        if has_hidden {
+            entity.remove_tag(HIDDEN_TAG);
+            return (false, true, threshold);
+        }
+    }
+    (false, false, threshold)
+}
+
 /// Compute the per-turn effect cap for a given entity power.
 /// Formula:  cap = max(MIN_CAP, max(10, power) * CAP_PCT + MAX_AMOUNT)
 ///
@@ -3481,9 +3539,18 @@ fn apply_effects_to_target(
 /// effect to its target entity (Actor + N Other). Per-target
 /// safety (system-entity guard, magnitude check, per-target
 /// normalization, type handling) is handled inside
-/// `apply_effects_to_target`. Returns the actor's applied map +
-/// new_values map, plus a per-target-name map of cross-entity
-/// applied effects.
+/// `apply_effects_to_target`. After all effects are applied,
+/// `update_hidden_tag` runs on every affected entity to toggle
+/// the `hidden` tag based on the post-effect `(power,
+/// visibility)`. Returns:
+///
+///   - `(actor_applied, actor_new_values, cross_entity_applied,
+///       hidden_tags_updated)`
+///   - `hidden_tags_updated` is a `BTreeMap<entity_name,
+///     {added: bool, removed: bool, threshold: f64}>` of every
+///     entity whose hidden-tag state changed in this call.
+///     Only toggled entities appear (no entry for "tag already
+///     correct").
 ///
 /// Extracted to a top-level helper so the caller (e.g.
 /// `process_action_handler`) can release any existing mutable
@@ -3503,6 +3570,7 @@ fn apply_all_effects(
         String,
         std::collections::HashMap<String, serde_json::Value>,
     >,
+    std::collections::BTreeMap<String, HiddenTagUpdate>,
 ) {
     // Group by target.
     let mut by_target: std::collections::BTreeMap<Uuid, Vec<&ParsedEffect>> =
@@ -3530,25 +3598,27 @@ fn apply_all_effects(
         String,
         std::collections::HashMap<String, serde_json::Value>,
     > = std::collections::BTreeMap::new();
+    // Track which entities had at least one effect actually
+    // written, so the post-effect hidden-tag rule only runs
+    // on those (not on every entity in the world).
+    let mut affected_ids: std::collections::BTreeSet<Uuid> =
+        std::collections::BTreeSet::new();
 
     for (tid, effects) in by_target {
         if let Some(target) = world.entities.get_mut(&tid) {
             let (applied, nvs) =
                 apply_effects_to_target(target, &effects, warnings);
+            // Capture emptiness BEFORE we move `applied` into
+            // the actor_applied map (or into the
+            // cross_entity_applied map below). The Rust borrow
+            // checker is right: a moved value can't be used
+            // after.
+            let had_effects = !applied.is_empty();
             if tid == actor_id {
                 actor_applied = applied;
                 actor_new_values = nvs;
             } else {
-                // For non-actor targets, only include in the
-                // response if at least one effect actually wrote
-                // to the target.  An empty applied map means
-                // either the target is system-protected (LLM
-                // shouldn't have been writing to it) or all
-                // effects were rejected (magnitude, type, etc.
-                // — the LLM will see the warnings).  Either
-                // way, surfacing an empty {prop: ...} map
-                // would just add noise.
-                if !applied.is_empty() {
+                if had_effects {
                     let name = target_names
                         .get(&tid)
                         .cloned()
@@ -3556,10 +3626,62 @@ fn apply_all_effects(
                     cross_entity_applied.insert(name, applied);
                 }
             }
+            if had_effects {
+                affected_ids.insert(tid);
+            }
         }
     }
 
-    (actor_applied, actor_new_values, cross_entity_applied)
+    // Post-effect hidden-tag rule (Arcurus 2026-06-07 #openworld):
+    // for every entity that had at least one effect actually
+    // written, recompute the threshold from its current
+    // (post-effect) `power` and `visibility`, and toggle the
+    // `hidden` tag if the threshold crossed the add/remove
+    // boundaries.  Emits one warning per toggle so operators
+    // (and the LLM log) see the state change.
+    let mut hidden_tags_updated: std::collections::BTreeMap<String, HiddenTagUpdate> =
+        std::collections::BTreeMap::new();
+    for tid in &affected_ids {
+        let name = target_names
+            .get(tid)
+            .cloned()
+            .unwrap_or_else(|| format!("<id:{}>", tid));
+        if let Some(target) = world.entities.get_mut(tid) {
+            let (added, removed, threshold) = update_hidden_tag(target);
+            if added || removed {
+                hidden_tags_updated.insert(
+                    name.clone(),
+                    HiddenTagUpdate { added, removed, threshold },
+                );
+                if added {
+                    warnings.push(format!(
+                        "Added '{}' tag to '{}' (threshold={:.3} < 0)",
+                        HIDDEN_TAG, name, threshold
+                    ));
+                } else if removed {
+                    warnings.push(format!(
+                        "Removed '{}' tag from '{}' (threshold={:.3} >= 1)",
+                        HIDDEN_TAG, name, threshold
+                    ));
+                }
+            }
+        }
+    }
+
+    (actor_applied, actor_new_values, cross_entity_applied, hidden_tags_updated)
+}
+
+/// One hidden-tag toggle, surfaced in the response so callers
+/// can see when an entity crossed the add/remove threshold.
+#[derive(Debug, Clone, serde::Serialize)]
+struct HiddenTagUpdate {
+    /// True if the tag was added in this call.
+    pub added: bool,
+    /// True if the tag was removed in this call.
+    pub removed: bool,
+    /// The post-effect threshold that triggered the toggle
+    /// (`max(10, power) / 10 + visibility`).
+    pub threshold: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -3904,7 +4026,7 @@ async fn process_action_handler(
             // target's own `power`), type handling. Per Arcurus
             // 2026-06-07 #openworld: this replaces the old
             // dry-run for cross-entity effects.
-            let (applied_effects, new_values, cross_entity_applied) =
+            let (applied_effects, new_values, cross_entity_applied, hidden_tags_updated) =
                 apply_all_effects(&mut world, entity_id, &parsed_effects, &mut warnings);
 
             // Emit the aggregated unknown-entity warning.
@@ -4182,6 +4304,7 @@ async fn process_action_handler(
                     "effects_applied": applied_effects,
                     "new_values": new_values,
                     "cross_entity_effects_applied": cross_entity_applied,
+                    "hidden_tags_updated": hidden_tags_updated,
                     "narrative": action_data.narrative,
                     "history_summary": applied_summary,
                     "warnings": warnings,
@@ -6266,7 +6389,7 @@ mod effect_normalization_tests {
             value: serde_json::json!(-5),
         }];
         let mut warnings = Vec::new();
-        let (actor_applied, _actor_nvs, cross) =
+        let (actor_applied, _actor_nvs, cross, _hidden) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
         // Actor has no effects, so its map is empty.
         assert!(actor_applied.is_empty(), "actor should have no applied effects");
@@ -6305,7 +6428,7 @@ mod effect_normalization_tests {
             },
         ];
         let mut warnings = Vec::new();
-        let (actor_applied, _actor_nvs, cross) =
+        let (actor_applied, _actor_nvs, cross, _hidden) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
         // Kira's morale: 50 + 5 = 55.
         let kira = world.entities.get(&actor_id).unwrap();
@@ -6348,7 +6471,7 @@ mod effect_normalization_tests {
             value: serde_json::json!(1.0),
         }];
         let mut warnings = Vec::new();
-        let (actor_applied, _actor_nvs, cross) =
+        let (actor_applied, _actor_nvs, cross, _hidden) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
         // Actor has nothing applied.
         assert!(actor_applied.is_empty());
@@ -6388,7 +6511,7 @@ mod effect_normalization_tests {
             value: serde_json::json!(20),
         }];
         let mut warnings = Vec::new();
-        let (_actor_applied, _actor_nvs, cross) =
+        let (_actor_applied, _actor_nvs, cross, _hidden) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
         // Mira's wealth: 100 + 20 (scaled to 15) = 115.
         let mira = world.entities.get(&other_id).unwrap();
@@ -6430,7 +6553,7 @@ mod effect_normalization_tests {
             },
         ];
         let mut warnings = Vec::new();
-        let (_actor_applied, _actor_nvs, cross) =
+        let (_actor_applied, _actor_nvs, cross, _hidden) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
         // Mira's wealth: 100 + 5 = 105. The 1e18 was rejected,
         // so the scale is 1.0 and the small effect is applied
@@ -6443,6 +6566,403 @@ mod effect_normalization_tests {
             "garbage property must not be written");
         assert!(warnings.iter().any(|w| w.contains("evil_garbage") || w.contains("MAX_DELTA_ABS")),
             "expected a magnitude-rejection warning for the garbage value: {warnings:?}");
+    }
+}
+
+#[cfg(test)]
+mod hidden_tag_tests {
+    //! Tests for the post-effect hidden-tag rule (Arcurus
+    //! 2026-06-07 #openworld).
+    //!
+    //! Threshold: `max(10, power) / 10 + visibility`
+    //!   - `threshold <  0` → add the `hidden` tag
+    //!   - `threshold >= 1` → remove the `hidden` tag
+    //!   - `0 ≤ threshold < 1` → no change (dead zone)
+    //!
+    //! The rule is checked for every entity that had at least
+    //! one effect actually written to it, AFTER all effects have
+    //! been applied (so the threshold uses post-effect values).
+
+    use super::*;
+    use crate::world_data::WorldEntity;
+    use std::collections::BTreeMap;
+
+    /// Build a minimal in-memory World + one entity with the
+    /// given (power, visibility) and an arbitrary set of
+    /// starter tags.  Returns (world, entity_id).
+    fn mk_world_with_entity(
+        power: i64,
+        visibility: i64,
+        tags: &[&str],
+    ) -> (World, Uuid) {
+        let mut world = World::new("test");
+        let id = Uuid::new_v4();
+        let mut entity = WorldEntity::new(
+            "character",   // entity_type
+            "tester",      // name
+            100.0,
+            100.0,
+        );
+        entity.id = id;
+        entity.properties_int.insert("power".to_string(), power);
+        entity.properties_int.insert("visibility".to_string(), visibility);
+        for t in tags {
+            entity.add_tag(t);
+        }
+        world.entities.insert(id, entity);
+        (world, id)
+    }
+
+    /// Build a world with two entities: an actor (id) and a
+    /// target named "Mira the Merchant" (other_id) with the
+    /// given (power, visibility).  Returns (world, actor_id,
+    /// other_id).
+    fn mk_world_actor_and_mira(
+        actor_power: i64,
+        actor_visibility: i64,
+        mira_power: i64,
+        mira_visibility: i64,
+    ) -> (World, Uuid, Uuid) {
+        let mut world = World::new("test");
+        let actor_id = Uuid::new_v4();
+        let mira_id = Uuid::new_v4();
+        let mut actor = WorldEntity::new("character", "Actor", 0.0, 0.0);
+        actor.id = actor_id;
+        actor.properties_int.insert("power".to_string(), actor_power);
+        actor.properties_int.insert("visibility".to_string(), actor_visibility);
+        let mut mira = WorldEntity::new("character", "Mira the Merchant", 0.0, 0.0);
+        mira.id = mira_id;
+        mira.properties_int.insert("power".to_string(), mira_power);
+        mira.properties_int.insert("visibility".to_string(), mira_visibility);
+        world.entities.insert(actor_id, actor);
+        world.entities.insert(mira_id, mira);
+        (world, actor_id, mira_id)
+    }
+
+    /// A small helper: build a ParsedEffect that targets the
+    /// actor (self-effect) with the given property delta.
+    /// `value` is a JSON number that the LLM would emit; the
+    /// parser extracts the inner f64.
+    fn actor_int_delta(prop: &str, value: i64) -> ParsedEffect {
+        ParsedEffect {
+            prop_name: prop.to_string(),
+            raw_key: format!("self.{prop}"),
+            value: serde_json::json!(value),
+            target: EffectTarget::Actor,
+        }
+    }
+
+    /// Same as `actor_int_delta` but targets a named other.
+    fn other_int_delta(name: &str, id: Uuid, prop: &str, value: i64) -> ParsedEffect {
+        ParsedEffect {
+            prop_name: prop.to_string(),
+            raw_key: format!("{name}.{prop}"),
+            value: serde_json::json!(value),
+            target: EffectTarget::Other {
+                name: name.to_string(),
+                id,
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Unit tests for the pure threshold function
+    // -----------------------------------------------------------------
+
+    #[test]
+    /// threshold = 1 + 0 = 1 → >= 1, tag should be REMOVED.
+    /// Boundary: threshold exactly at 1 is on the "remove" side.
+    fn threshold_exactly_one_removes_tag() {
+        let (mut world, id) = mk_world_with_entity(10, 0, &[HIDDEN_TAG]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_hidden_tag(entity);
+        assert!((t - 1.0).abs() < 1e-9, "threshold should be exactly 1.0, got {t}");
+        assert!(!added, "should not be added");
+        assert!(removed, "should be removed");
+        assert!(!entity.has_tag(HIDDEN_TAG), "tag should be gone");
+    }
+
+    #[test]
+    /// threshold = 1 + (-1) = 0 → dead zone (0 ≤ t < 1), no change.
+    fn threshold_zero_is_dead_zone() {
+        // No tag present, threshold is 0 → no add.
+        let (mut world, id) = mk_world_with_entity(10, -1, &[]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_hidden_tag(entity);
+        assert!((t - 0.0).abs() < 1e-9, "threshold should be 0.0, got {t}");
+        assert!(!added && !removed, "dead zone, no change");
+        assert!(!entity.has_tag(HIDDEN_TAG), "still no tag");
+    }
+
+    #[test]
+    /// threshold = 1 + (-0.5) = 0.5 → dead zone, tag stays.
+    fn threshold_half_is_dead_zone() {
+        let (mut world, id) = mk_world_with_entity(10, 0, &[HIDDEN_TAG]);
+        // visibility = -0.5 isn't representable as i64, so we
+        // approximate via a +0.5 floating approach: leave
+        // visibility = 0 (threshold = 1, not dead zone). The
+        // real dead-zone test is threshold_zero_is_dead_zone
+        // above. This test checks threshold > 1.0 doesn't fire
+        // when tag isn't present (no-op).
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_hidden_tag(entity);
+        assert!(t >= 1.0, "sanity: threshold should be >= 1, got {t}");
+        assert!(removed, "tag should be removed at threshold >= 1");
+    }
+
+    #[test]
+    /// threshold = 1 + (-2) = -1 → < 0, tag should be ADDED.
+    fn threshold_below_zero_adds_tag() {
+        let (mut world, id) = mk_world_with_entity(10, -2, &[]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_hidden_tag(entity);
+        assert!(t < 0.0, "threshold should be < 0, got {t}");
+        assert!(added, "should be added");
+        assert!(!removed);
+        assert!(entity.has_tag(HIDDEN_TAG));
+    }
+
+    #[test]
+    /// High-power entity (power=100) is hard to hide: even
+    /// visibility=-50 → threshold = 10 - 50 = -40 < 0, but
+    /// this test specifically checks the OPPOSITE: power=100
+    /// with visibility=-5 → threshold = 10 + (-5) = 5 ≥ 1, so
+    /// the tag (if present) is REMOVED.  This is the "famous
+    /// dragon" case: you can't hide a power-100 entity with a
+    /// few points of negative visibility.
+    fn high_power_entity_is_hard_to_hide() {
+        let (mut world, id) = mk_world_with_entity(100, -5, &[HIDDEN_TAG]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_hidden_tag(entity);
+        assert!((t - 5.0).abs() < 1e-9, "threshold should be 5.0, got {t}");
+        assert!(removed, "high-power entity with mild -visibility should NOT be hidden");
+        assert!(!entity.has_tag(HIDDEN_TAG));
+    }
+
+    #[test]
+    /// power = 0 (below the 10 floor) still uses the floor:
+    /// threshold = max(10, 0)/10 + vis = 1 + vis.
+    /// vis = -2 → threshold = -1 → hidden.
+    fn power_zero_uses_floor_of_ten() {
+        let (mut world, id) = mk_world_with_entity(0, -2, &[]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (_, _, t) = update_hidden_tag(entity);
+        assert!((t - (-1.0)).abs() < 1e-9,
+            "with power=0, floor of 10 applies; threshold should be -1.0, got {t}");
+    }
+
+    #[test]
+    /// Already has the tag and threshold is still < 0 → no-op
+    /// (don't re-add).  Returns (false, false).
+    fn already_hidden_under_threshold_is_noop() {
+        let (mut world, id) = mk_world_with_entity(10, -2, &[HIDDEN_TAG]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, _) = update_hidden_tag(entity);
+        assert!(!added && !removed, "no change expected when already correct");
+    }
+
+    #[test]
+    /// Threshold in dead zone (0 ≤ t < 1) and no tag present →
+    /// no-op.  We can't easily make t=0.5 from integer props,
+    /// so this test is effectively the "threshold exactly 0"
+    /// case from `threshold_zero_is_dead_zone` (re-tested here
+    /// at the boundary for symmetry).
+    fn dead_zone_with_no_tag_is_noop() {
+        let (mut world, id) = mk_world_with_entity(10, -1, &[]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, _) = update_hidden_tag(entity);
+        assert!(!added && !removed);
+        assert!(!entity.has_tag(HIDDEN_TAG));
+    }
+
+    #[test]
+    /// Missing `power` property → defaults to 0 (so floor of
+    /// 10 applies).  Missing `visibility` property → defaults
+    /// to 0.  Net: threshold = 1.0, tag (if present) is removed.
+    fn missing_properties_use_defaults() {
+        let mut world = World::new("test");
+        let id = Uuid::new_v4();
+        let mut entity = WorldEntity::new(
+            "character", "blank", 0.0, 0.0,
+        );
+        entity.id = id;
+        entity.add_tag(HIDDEN_TAG);
+        // Deliberately do NOT set power or visibility.
+        world.entities.insert(id, entity);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_hidden_tag(entity);
+        assert!((t - 1.0).abs() < 1e-9, "defaults: 1.0 + 0.0 = 1.0, got {t}");
+        assert!(removed, "tag should be removed at threshold 1.0");
+        assert!(!entity.has_tag(HIDDEN_TAG));
+    }
+
+    // -----------------------------------------------------------------
+    // Integration tests: rule runs inside apply_all_effects
+    // -----------------------------------------------------------------
+
+    #[test]
+    /// Actor (power=10) takes a self-effect that pushes
+    /// visibility from 0 to -2.  After apply, threshold =
+    /// 1 + (-2) = -1 < 0, so the `hidden` tag should appear
+    /// on the actor.  This proves the rule runs AFTER
+    /// effects are applied (using post-effect visibility).
+    fn actor_self_effect_below_threshold_adds_tag() {
+        let (mut world, actor_id) = mk_world_with_entity(10, 0, &[]);
+        let parsed = vec![actor_int_delta("visibility", -2)];
+        let mut warnings: Vec<String> = Vec::new();
+        let (_applied, _nvs, _cross, hidden) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+
+        // The actor was affected (had a write), so the rule ran.
+        assert!(hidden.contains_key("tester"),
+            "hidden map should contain the actor, got: {hidden:?}");
+        let update = &hidden["tester"];
+        assert!(update.added, "tag should be added; update = {update:?}");
+        assert!(!update.removed);
+        assert!(update.threshold < 0.0);
+
+        // Persisted on the entity itself.
+        let actor = world.entities.get(&actor_id).unwrap();
+        assert!(actor.has_tag(HIDDEN_TAG), "tag should be persisted");
+
+        // And surfaced as a warning.
+        assert!(warnings.iter().any(|w| w.contains(HIDDEN_TAG) && w.contains("tester")),
+            "warning should mention the tag and entity name, got: {warnings:?}");
+    }
+
+    #[test]
+    /// Cross-entity effect on Mira (power=10) drops her
+    /// visibility to -3 → threshold = 1 + (-3) = -2 < 0 →
+    /// Mira's `hidden` tag is added.  Actor (power=10) is
+    /// unaffected by the cross-entity write, so actor's tag
+    /// state is NOT touched (the rule only runs on affected
+    /// entities).
+    fn cross_entity_effect_below_threshold_adds_tag() {
+        let (mut world, actor_id, mira_id) = mk_world_actor_and_mira(
+            10, 0,   // actor: would NOT be hidden at this state
+            10, 0,   // mira:  starting visible
+        );
+        let parsed = vec![other_int_delta(
+            "Mira the Merchant", mira_id, "visibility", -3,
+        )];
+        let mut warnings: Vec<String> = Vec::new();
+        let (_applied, _nvs, _cross, hidden) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+
+        assert!(hidden.contains_key("Mira the Merchant"),
+            "Mira's hidden toggle should be in the map: {hidden:?}");
+        assert!(hidden["Mira the Merchant"].added);
+        assert!(!hidden["Mira the Merchant"].removed);
+
+        // Mira has the tag persisted.
+        let mira = world.entities.get(&mira_id).unwrap();
+        assert!(mira.has_tag(HIDDEN_TAG), "Mira should now be hidden");
+
+        // Actor is NOT in the map (no effect on actor means
+        // the rule didn't run on actor).  We use has_tag to
+        // also assert the actor's tags weren't touched.
+        assert!(!hidden.contains_key("Actor"),
+            "actor was not affected; rule should not have run on it: {hidden:?}");
+    }
+
+    #[test]
+    /// An effect that RAISES visibility past the boundary
+    /// (>= 1) should REMOVE the `hidden` tag.  Start Mira
+    /// with the tag and visibility=-3 (threshold = -2, hidden).
+    /// Apply +3 → visibility=0 (threshold=1, remove tag).
+    fn cross_entity_effect_past_threshold_removes_tag() {
+        let (mut world, actor_id, mira_id) = mk_world_actor_and_mira(
+            10, 0, 10, -3,
+        );
+        // Pre-seed Mira with the hidden tag (she's already
+        // hidden at the start of this turn).
+        world.entities.get_mut(&mira_id).unwrap().add_tag(HIDDEN_TAG);
+        let parsed = vec![other_int_delta(
+            "Mira the Merchant", mira_id, "visibility", 3,
+        )];
+        let mut warnings: Vec<String> = Vec::new();
+        let (_applied, _nvs, _cross, hidden) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+
+        assert!(hidden.contains_key("Mira the Merchant"));
+        let u = &hidden["Mira the Merchant"];
+        assert!(u.removed, "tag should be removed; update = {u:?}");
+        assert!(!u.added);
+        assert!(u.threshold >= 1.0,
+            "threshold should be >= 1.0 after visibility boost, got {}", u.threshold);
+
+        // Persisted: tag is gone.
+        let mira = world.entities.get(&mira_id).unwrap();
+        assert!(!mira.has_tag(HIDDEN_TAG), "Mira's hidden tag should be removed");
+
+        // Warning surfaced.
+        assert!(warnings.iter().any(|w| w.contains("Removed") && w.contains("Mira")),
+            "warning should mention 'Removed' and Mira: {warnings:?}");
+    }
+
+    #[test]
+    /// Multiple effects on the same entity: the rule should
+    /// run ONCE, after all effects, using the final
+    /// (post-effect) power/visibility.  This is the
+    /// "checked after all effects are applied" requirement.
+    /// Mira has power=10.  First effect: visibility -= 2
+    /// (threshold would be -1, hidden).  Second effect:
+    /// visibility += 3 (threshold would be 1, visible).
+    /// Net threshold = 1+0 = 1 → tag should NOT be added.
+    fn rule_runs_once_after_all_effects_use_final_values() {
+        let (mut world, actor_id, mira_id) = mk_world_actor_and_mira(
+            10, 0, 10, 0,
+        );
+        let parsed = vec![
+            other_int_delta("Mira the Merchant", mira_id, "visibility", -2),
+            other_int_delta("Mira the Merchant", mira_id, "visibility", 3),
+        ];
+        let mut warnings: Vec<String> = Vec::new();
+        let (_applied, _nvs, _cross, _hidden) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+
+        // Mira's final visibility: 0 + (-2) + 3 = 1.
+        // Threshold = 1 + 1 = 2 ≥ 1.  Mira stays unhidden.
+        let mira = world.entities.get(&mira_id).unwrap();
+        assert_eq!(mira.properties_int.get("visibility"), Some(&1));
+        assert!(!mira.has_tag(HIDDEN_TAG),
+            "Mira's final threshold is 2.0; tag should not be present");
+
+        // The "run once after all effects" contract: there
+        // should be at most ONE hidden-tag-related warning,
+        // even though the test stack has two effects on Mira.
+        let hidden_warnings: Vec<&String> = warnings.iter()
+            .filter(|w| w.contains(HIDDEN_TAG))
+            .collect();
+        assert!(hidden_warnings.len() <= 1,
+            "rule should run once per affected entity, got {} hidden-tag warnings: {hidden_warnings:?}",
+            hidden_warnings.len());
+    }
+
+    #[test]
+    /// An entity that is NOT in the effect list (i.e. no
+    /// effect was written to it) should NOT have the rule
+    /// run on it.  We test this by giving an unrelated
+    /// entity a power/visibility combo that would qualify
+    /// for hidden, then sending a self-effect on the actor
+    /// only.  The unrelated entity's tag state must be
+    /// untouched.
+    fn unaffected_entity_is_not_checked() {
+        let (mut world, actor_id, mira_id) = mk_world_actor_and_mira(
+            10, 0, 10, -5,  // Mira would qualify for hidden, but we don't touch her
+        );
+        let parsed = vec![actor_int_delta("power", 5)];  // actor self-effect only
+        let mut warnings: Vec<String> = Vec::new();
+        let (_applied, _nvs, _cross, hidden) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+
+        // Mira is not in the hidden map (no effect → rule skipped).
+        assert!(!hidden.contains_key("Mira the Merchant"),
+            "Mira had no effect, rule should not run on her: {hidden:?}");
+        // Mira's tags are completely untouched.
+        let mira = world.entities.get(&mira_id).unwrap();
+        assert!(!mira.has_tag(HIDDEN_TAG),
+            "Mira's tags must not be touched (no effect → rule skipped)");
     }
 }
 

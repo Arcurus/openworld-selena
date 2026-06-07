@@ -176,7 +176,15 @@ impl WorldEntity {
             self.updated_at = Utc::now();
         }
     }
-    
+
+    /// Remove a tag (no-op if not present).
+    pub fn remove_tag(&mut self, tag: &str) {
+        if let Some(pos) = self.tags.iter().position(|t| t == tag) {
+            self.tags.remove(pos);
+            self.updated_at = Utc::now();
+        }
+    }
+
     /// Add history entry
     pub fn add_history(&mut self, action: &str, details: &str, outcome: &str) {
         self.history.push(HistoryEntry::new(action, details, outcome));
