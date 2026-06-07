@@ -7,9 +7,10 @@ relationship to the Python scheduler. For LLM context shape, see
 [`world_entities.md`](./world_entities.md); for world events, see
 [`world_events.md`](./world_events.md).*
 
-**Last updated:** 2026-06-06 (added §7 Multi-Entity Effects — dotted-key
-`entityname.property_name` schema, dry-run for cross-entity writes;
-self-effect expansion; per-effect routing report. After the
+**Last updated:** 2026-06-07 (dropped the 150-unit nearby-entity radius;
+each section is now capped at top-5 by its algorithm — Locations
+and Characters by influence score, Factions by distance
+ascending; system entities still filtered. After the
 meta-selector + history-format + nearby-entity split + visibility-doc + nearby-entity metadata-trim (drop visibility + score from the rendered line)
 + history-budget-bump + effect-normalization rewrites).
 
@@ -90,11 +91,25 @@ Two distinct fields. Don't confuse them.
 
 ## 3. Nearby Entities (LLM context)
 
-The "Nearby Entities" block the LLM sees lists other entities within
-**150 units** of the subject, **split into three groups**.
-Locations and Characters are **sorted by influence score**;
-Factions are **sorted by distance ascending** (nearest first)
-and **capped at MAX_NEARBY_FACTIONS (5)**.
+The "Nearby Entities" block the LLM sees lists the **top
+neighbours by significance** for the subject, **split into three
+groups** and **capped per section**.  Per Arcurus 2026-06-07
+#openworld: the previous 150-unit radius was a hidden limit that
+hid legitimate faraway-but-significant entities (a high-power
+legend in the next kingdom wouldn't surface for a village at the
+far end of the map).  The cap is now the per-section top-N, not
+a distance cutoff.  All non-system entities in the world are
+considered; each section's algorithm picks the top N from its
+bucket.
+
+- **Locations** — `entity_type == "location"`.  Top
+  `MAX_NEARBY_LOCATIONS` (5) by influence score, highest first.
+- **Characters** — everything else except `location`, `faction`,
+  and system entities.  Top `MAX_NEARBY_CHARACTERS` (5) by
+  influence score, highest first.
+- **Factions** — `entity_type == "faction"`.  Top
+  `MAX_NEARBY_FACTIONS` (5) by distance ascending (nearest
+  first).
 
 **Code:** `build_nearby_entities_str` in
 `src/world_data/context_builder.rs`.
@@ -103,7 +118,7 @@ and **capped at MAX_NEARBY_FACTIONS (5)**.
 
 ```
 Nearby Entities:
-### Nearby Locations
+### Nearby Locations (top 5 by influence)
 - **Shadow Ridge Camp** (location) — dist 85.4, power 68
   Hidden bandit encampment.
   Properties: visibility: 29, power: 68, wealth: 19
@@ -111,11 +126,14 @@ Nearby Entities:
   ...
   Properties: magical_activity: 0, consciousness_active: 0, visibility: 0
 
-### Nearby Characters
+### Nearby Characters (top 5 by influence)
+- **Kira Dawnblade** (hero) — dist 107.7, power 264
+  A young knight marked by the prophecy. She has seen the end in dreams and now walks the realm searching for the Forgotten Heir.
+  Properties: morale: 464, power: 264, reputation: 112
 - **Mira the Merchant** (character) — dist 120.8, power 20
   Traveling merchant with exotic goods.
   Properties: knowledge: 22, magic_protection: 78, power: 20
-- **Vaelthrix the Endless** (dragon) — dist 60.0, power 1320 💤×0.01
+- **Vaelthrix the Endless** (dragon) — dist 350.0, power 1320 💤×0.01
   An ancient dragon of absolute darkness. Slumbers beneath the Frostpeak.
   Properties: power: 1320, visibility: 0
 
@@ -128,6 +146,13 @@ Nearby Entities:
   Properties: power: 194, smithing_skill: 220, ore_reserves: 800
 ```
 
+Note: the example subject lives in the central realm, so the
+factions and characters here are mostly close.  A subject at
+the far edge of the map (e.g. The Drowned City at the eastern
+coast) would still see the top-5 by score — a sleeping
+Vaelthrix at 350 units could surface, ranked by score not by
+raw distance.  Arcurus 2026-06-07 #openworld.
+
 Each line shows only `name`, `type`, `dist`, and `power` plus the
 optional `💤×0.01` marker for sleeping entities.  The previous
 format also rendered the entity's `visibility` stat and the
@@ -139,17 +164,20 @@ where it's meaningful.  Arcurus 2026-06-07 #openworld.
 
 ### The split
 
-- **Locations** — `entity_type == "location"`. Physical places the
-  subject can visit.
-- **Characters** — everything else except `location` and `faction`:
-  `character`, `hero`, `oracle`, `dragon`, `artifact`,
-  `world_clock`, etc. All agent-like / interactive individuals and
-  items grouped together.
-- **Factions** — `entity_type == "faction"`. Organised groups
-  (orders, clans, guilds) pulled out into their own section so the
-  LLM can reason about them as collective actors. Capped at 5
-  nearest, sorted by distance ascending. If more categories are
-  needed, they go in their own `### Nearby …` section.
+- **Locations** — `entity_type == "location"`.  Physical places
+  the subject can visit.  Top `MAX_NEARBY_LOCATIONS` (5) by
+  influence score.
+- **Characters** — everything else except `location`, `faction`,
+  and system entities (`world_clock`, anything tagged `meta`):
+  `character`, `hero`, `oracle`, `dragon`, `artifact`, etc.  All
+  agent-like / interactive individuals and items grouped
+  together.  Top `MAX_NEARBY_CHARACTERS` (5) by influence score.
+- **Factions** — `entity_type == "faction"`.  Organised groups
+  (orders, clans, guilds) pulled out into their own section so
+  the LLM can reason about them as collective actors.  Top
+  `MAX_NEARBY_FACTIONS` (5) by distance ascending.
+- If more categories are needed, they go in their own
+  `### Nearby …` section with the same shape (cap + algorithm).
 
 ### The sort
 
@@ -189,7 +217,11 @@ score = max(1, power + visibility) / distance
 ### What's NOT in the score
 
 - The subject itself (filtered out).
-- Other `location` entities that don't appear in radius 150.
+- **System entities** (the world clock, anything tagged `meta`).
+  These are bookkeeping entities, not narrative actors; the
+  nearby list is for things the LLM should reason about.  This
+  matches the `include_system=false` filter on the public
+  `/api/entities` endpoint.
 - Entities at the exact same coords as the subject (zero distance
   is skipped to avoid divide-by-zero).
 
@@ -197,12 +229,13 @@ score = max(1, power + visibility) / distance
 
 | Constant | File | Default | Effect of changing |
 |---|---|---|---|
-| `150.0` (radius) | `build_nearby_entities_str` | 150 | Wider radius → more entities to consider, larger LLM context. |
+| `MAX_NEARBY_LOCATIONS` | `build_nearby_entities_str` (constant) | `5` | Higher → more locations in the LLM prompt per action. The cap replaces the previous 150-unit radius as the bound on this section. |
+| `MAX_NEARBY_CHARACTERS` | `build_nearby_entities_str` (constant) | `5` | Higher → more characters in the LLM prompt per action. The cap replaces the previous 150-unit radius as the bound on this section. |
+| `MAX_NEARBY_FACTIONS` | `build_nearby_entities_str` (constant) | `5` | Higher → more factions in the LLM prompt per action. Factions are capped because they tend to be the most context-heavy entries (richer descriptions, larger properties). |
 | `max(1, power + visibility)` floor | `build_nearby_entities_str` | `1` | Lower → distance dominates; higher (e.g. `10`) → power/visibility matter more. |
 | Sleeping multiplier | `build_nearby_entities_str` | `0.01` | Higher → sleeping entities compete more with awake peers. Should stay aligned with `DEPRIO_TAG_MULTIPLIERS["sleeping"]` in `scheduled_actions.py`. |
 | Number of int props shown in each entry | `format_nearby_entry` (`.take(3)`) | 3 | Higher → more props, larger context. |
-| `entity_type` bucketing | `build_nearby_entities_str` | `"location"` and `"faction"` get their own `### Nearby …` sections; everything else stays in Characters | Add a new bucket: create a `match` arm, a `Vec`, a sort, a truncate, and a render block. |
-| `MAX_NEARBY_FACTIONS` | `build_nearby_entities_str` (constant) | `5` | Higher → more factions in the LLM prompt per action. Factions are capped because they tend to be the most context-heavy entries (richer descriptions, larger properties). |
+| `entity_type` bucketing | `build_nearby_entities_str` | `"location"` and `"faction"` get their own `### Nearby …` sections; everything else (except system entities) stays in Characters | Add a new bucket: create a `match` arm, a `Vec`, a sort, a truncate, and a render block. |
 
 ---
 

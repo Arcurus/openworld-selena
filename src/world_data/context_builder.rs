@@ -167,18 +167,36 @@ fn build_property_context(entity: &WorldEntity, type_stats: Option<&EntityTypeSt
 }
 
 fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
-    let nearby = world.get_entities_in_radius(entity.x, entity.y, 150.0);
-    let nearby: Vec<_> = nearby.iter().filter(|e| e.id != entity.id).collect();
+    // No distance cutoff: consider every entity in the world, then
+    // let the per-section algorithm pick the top N.  Per Arcurus
+    // 2026-06-07 #openworld: the previous 150-unit radius was a
+    // hidden limit that hid legitimate faraway-but-significant
+    // entities (e.g. a high-power legend in the next kingdom).
+    // The cap is now per-section (top 5), not per-radius.
+    //
+    // System entities (world_clock, anything tagged 'meta') are
+    // still filtered out — they're bookkeeping entities, not
+    // narrative actors, and the LLM doesn't need them in the
+    // nearby list.  This matches the `include_system=false` filter
+    // on the public /api/entities endpoint.
+    let nearby: Vec<&WorldEntity> = world.entities.values()
+        .filter(|e| e.id != entity.id && !e.is_system_entity())
+        .collect();
     if nearby.is_empty() {
+        // Defensive fallback; in practice the world always has more
+        // than one entity, but keep the message for the single-entity
+        // edge case.
         return String::from("No other entities nearby.");
     }
 
     // Per Arcurus 2026-06-06 (#openworld): split nearby entities
     // into three groups:
-    //   - "Locations"  (entity_type == "location")
-    //   - "Factions"   (entity_type == "faction", top MAX_NEARBY_FACTIONS nearest)
-    //   - "Characters" (everything else — sentient individuals,
-    //                   artifacts, the world clock)
+    //   - "Locations"  (entity_type == "location", top MAX_NEARBY_LOCATIONS
+    //                   by influence score)
+    //   - "Factions"   (entity_type == "faction", top MAX_NEARBY_FACTIONS
+    //                   nearest by distance)
+    //   - "Characters" (everything else, top MAX_NEARBY_CHARACTERS by
+    //                   influence score)
     //
     // Locations and Characters are sorted by influence score so the
     // most relevant neighbours surface first:
@@ -231,23 +249,27 @@ fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
             _ => characters.push((other, dist, score)),
         }
     }
-    // Highest score first (most influential near neighbours).
+    // Highest score first (most influential neighbours), then cap
+    // each section at its top-N.  The cap is what keeps the prompt
+    // bounded now that the radius cutoff is gone.
     locations.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    locations.truncate(MAX_NEARBY_LOCATIONS);
     characters.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    characters.truncate(MAX_NEARBY_CHARACTERS);
     // Factions: nearest first, capped at MAX_NEARBY_FACTIONS.
     factions.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     factions.truncate(MAX_NEARBY_FACTIONS);
 
     let mut s = String::new();
     if !locations.is_empty() {
-        s.push_str("### Nearby Locations\n");
+        s.push_str(&format!("### Nearby Locations (top {} by influence)\n", MAX_NEARBY_LOCATIONS));
         for (other, dist, score) in &locations {
             s.push_str(&format_nearby_entry(other, *dist));
         }
         s.push('\n');
     }
     if !characters.is_empty() {
-        s.push_str("### Nearby Characters\n");
+        s.push_str(&format!("### Nearby Characters (top {} by influence)\n", MAX_NEARBY_CHARACTERS));
         for (other, dist, score) in &characters {
             s.push_str(&format_nearby_entry(other, *dist));
         }
@@ -262,6 +284,18 @@ fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
     }
     s
 }
+
+/// Maximum number of locations to include in the "Nearby Locations"
+/// section of the LLM context.  Locations are sorted by influence
+/// score (highest first) and the top N are kept.  Tunable — see
+/// docs/world-mechanics.md.
+const MAX_NEARBY_LOCATIONS: usize = 5;
+
+/// Maximum number of characters to include in the "Nearby Characters"
+/// section of the LLM context.  Characters are sorted by influence
+/// score (highest first) and the top N are kept.  Tunable — see
+/// docs/world-mechanics.md.
+const MAX_NEARBY_CHARACTERS: usize = 5;
 
 /// Maximum number of factions to include in the "Nearby Factions"
 /// section of the LLM context.  Factions are sorted by distance
@@ -777,6 +811,114 @@ mod tests {
                 positions
             );
         }
+    }
+
+    #[test]
+    fn nearby_entities_includes_faraway_high_power_entities() {
+        // Per Arcurus 2026-06-07 #openworld: the previous 150-unit
+        // radius was a hidden limit.  A high-power entity far from
+        // the subject should still appear, ranked by the influence
+        // score.  Place a legend 500 units away with power=1000;
+        // it should surface in the Characters section above any
+        // closer low-power bystander.
+        let mut world = make_world();
+        let me = make_entity("Me", 10000.0, 10000.0);
+        // Close but weak.
+        let mut weak = make_entity("Bystander", 10010.0, 10010.0);
+        weak.entity_type = "character".to_string();
+        weak.properties_int.insert("power".to_string(), 1);
+        // Far but mighty — 500 units along the x-axis.
+        let mut legend = make_entity("FarLegend", 10500.0, 10000.0);
+        legend.entity_type = "character".to_string();
+        legend.properties_int.insert("power".to_string(), 1000);
+        let me_id = me.id;
+        let weak_id = weak.id;
+        let legend_id = legend.id;
+        world.entities.insert(me_id, me.clone());
+        world.entities.insert(weak_id, weak);
+        world.entities.insert(legend_id, legend);
+        let result = build_nearby_entities_str(&world, &me);
+        // Both should appear; the previous radius-based code would
+        // have hidden FarLegend entirely.
+        let char_section_start = result.find("### Nearby Characters").unwrap();
+        let char_section = &result[char_section_start..];
+        assert!(char_section.contains("**FarLegend**"),
+            "FarLegend (500u away) should appear in the no-radius list: {char_section}");
+        assert!(char_section.contains("**Bystander**"),
+            "Bystander (14u away) should still appear: {char_section}");
+        // FarLegend's score (1000/500 = 2.0) outranks Bystander's
+        // (1/14 ≈ 0.071), so the legend sorts first.
+        let pos_legend = char_section.find("**FarLegend**").unwrap();
+        let pos_bystander = char_section.find("**Bystander**").unwrap();
+        assert!(pos_legend < pos_bystander,
+            "FarLegend should sort above Bystander (higher power outweighs distance)");
+    }
+
+    #[test]
+    fn nearby_entities_caps_locations_at_top_5_by_influence() {
+        // Per Arcurus 2026-06-07 #openworld: each section is now
+        // capped at MAX_NEARBY_LOCATIONS = 5 by influence score,
+        // instead of taking every entity within the 150-radius.
+        // Place 8 locations; only the top 5 by score should appear.
+        let mut world = make_world();
+        let me = make_entity("Me", 10000.0, 10000.0);
+        let me_id = me.id;
+        world.entities.insert(me_id, me.clone());
+        // All 8 locations at the SAME distance (50u) so the score
+        // ranking is purely by power.  Powers span 1..=8 so the
+        // top 5 are the ones with power >= 4.
+        for i in 1..=8 {
+            let mut loc = make_entity(&format!("Loc{}", i), 10050.0, 10000.0);
+            loc.entity_type = "location".to_string();
+            loc.properties_int.insert("power".to_string(), i as i64);
+            let lid = loc.id;
+            world.entities.insert(lid, loc);
+        }
+        let result = build_nearby_entities_str(&world, &me);
+        let loc_section_start = result.find("### Nearby Locations").unwrap();
+        let loc_section = &result[loc_section_start..];
+        // Top 5 by score (highest power) must be present.
+        for i in 4..=8 {
+            assert!(loc_section.contains(&format!("**Loc{}**", i)),
+                "Loc{} (power={}) should be in the top 5: {loc_section}", i, i);
+        }
+        // Bottom 3 (power 1, 2, 3) must be dropped.
+        for i in 1..=3 {
+            assert!(!loc_section.contains(&format!("**Loc{}**", i)),
+                "Loc{} (power={}) should be dropped by the 5-cap: {loc_section}", i, i);
+        }
+        // Header should mention the cap.
+        assert!(loc_section.contains("(top 5 by influence)"),
+            "Locations header should mention the top-5 cap: {loc_section}");
+    }
+
+    #[test]
+    fn nearby_entities_caps_characters_at_top_5_by_influence() {
+        // Same shape as the locations test, but for characters.
+        let mut world = make_world();
+        let me = make_entity("Me", 10000.0, 10000.0);
+        let me_id = me.id;
+        world.entities.insert(me_id, me.clone());
+        for i in 1..=8 {
+            let mut ch = make_entity(&format!("Char{}", i), 10050.0, 10000.0);
+            ch.entity_type = "character".to_string();
+            ch.properties_int.insert("power".to_string(), i as i64);
+            let cid = ch.id;
+            world.entities.insert(cid, ch);
+        }
+        let result = build_nearby_entities_str(&world, &me);
+        let char_section_start = result.find("### Nearby Characters").unwrap();
+        let char_section = &result[char_section_start..];
+        for i in 4..=8 {
+            assert!(char_section.contains(&format!("**Char{}**", i)),
+                "Char{} (power={}) should be in the top 5", i, i);
+        }
+        for i in 1..=3 {
+            assert!(!char_section.contains(&format!("**Char{}**", i)),
+                "Char{} (power={}) should be dropped by the 5-cap", i, i);
+        }
+        assert!(char_section.contains("(top 5 by influence)"),
+            "Characters header should mention the top-5 cap: {char_section}");
     }
 
     #[test]
