@@ -66,6 +66,17 @@ Every entity action is appended to a separate, durable, append-only JSONL log:
 
 Read API lives in `src/world_data/action_history_log.rs` (`append_entry`, `load_for_entity`, `count_for_entity`).
 
+### 🌍 Recent World Actions (cross-entity feed in the LLM prompt)
+
+Per `Arcurus 2026-06-07 (#openworld)`: "add to the world action llm call an insertion of not yet processed world actions".
+
+Every LLM action call now sees a `## Recent World Actions (since your last action)` block in its prompt, listing the most recent cross-entity actions the actor has not yet seen.
+
+- **Source:** `world_data/action_history.jsonl`, filtered to `timestamp > entity.last_action_at` (or all entries if the actor has never acted).
+- **Cap:** 10 most-recent entries, most-recent-first.
+- **Filters:** drops the actor's own most-recent entry (the one it's generating) and any system-entity actions (World Clock / `abstract` / `meta`-tagged).
+- **Renderer:** `build_recent_world_actions_str` in `src/world_data/context_builder.rs`. Reader: `load_recent_world_actions` / `load_recent_world_actions_at` in `src/world_data/action_history_log.rs`. Placeholder: `{recent_world_actions}` in `ai_templates/EntityAction.md`.
+
 ### 📋 History Summary + Anti-Repetition (LLM-owned)
 
 Per `Arcurus 2026-06-04 (#openworld)`: every world action's LLM call also updates a rolling per-entity `history_summary`. Same call, no extra LLM budget.
