@@ -927,6 +927,53 @@ async fn get_world(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// Return the list of internal / operator-only entity
+/// properties.  This is the canonical source of truth
+/// for which properties are LLM-invisible and protected
+/// from LLM-emit effects (see
+/// `world_data::internal_properties` for the rule).  It
+/// is exposed as a small read-only API so external tools
+/// (e.g. `selena-project/code/normalize_stats.py`) can
+/// share the list with the Rust binary instead of
+/// duplicating it.
+///
+/// The response shape is:
+///
+/// ```json
+/// {
+///   "success": true,
+///   "data": {
+///     "int": ["last_processed_other_tick", ...],
+///     "float": [...],
+///     "string": [...]
+///   }
+/// }
+/// ```
+///
+/// Auth: NOT required.  This is a static read of a
+/// compile-time constant; it has no sensitive data and
+/// can be safely exposed on localhost.
+///
+/// Per Arcurus 2026-06-07 (#openworld): "best make a
+/// list that we can then update if we add new, so all
+/// the code that touches properties knows to ignore
+/// them.  ... if we add more we just need it ad to the
+/// list and not change code again."
+async fn get_internal_properties() -> impl IntoResponse {
+    use world_data::internal_properties::{
+        LLM_INTERNAL_FLOAT_PROPERTIES, LLM_INTERNAL_INT_PROPERTIES,
+        LLM_INTERNAL_STRING_PROPERTIES,
+    };
+    success_json(serde_json::json!({
+        "success": true,
+        "data": {
+            "int": LLM_INTERNAL_INT_PROPERTIES,
+            "float": LLM_INTERNAL_FLOAT_PROPERTIES,
+            "string": LLM_INTERNAL_STRING_PROPERTIES,
+        }
+    }))
+}
+
 // Update world properties
 #[derive(Debug, Deserialize)]
 struct UpdateWorldRequest {
@@ -6393,6 +6440,7 @@ async fn main() {
     let app = Router::new()
         // API routes first (take precedence)
         .route("/api/", get(get_world))
+        .route("/api/internal-properties", get(get_internal_properties))
         .route("/api/entities", get(list_entities))
         .route("/api/entities", post(create_entity))
         .route("/api/entities/:id", get(get_entity))
