@@ -2014,19 +2014,60 @@
                 if (countEl) countEl.textContent = entries.length + ' entries (latest first)';
                 el.innerHTML = entries.map(e => {
                     // Render the entry: actor name, action, timestamp,
-                    // outcome, and the effect keys that touch this entity.
-                    // Per Arcurus 2026-06-07 (#openworld): "in the web
-                    // display they seem to be cut.  please display full."
-                    // — so we show the FULL outcome (no truncation), the
-                    // FULL effects list, and let the modal scroll
-                    // naturally.  The old 200-char outcome truncation
-                    // and the nested 280px max-height were both removed.
-                    const effectKeys = Object.keys(e.effects || {});
+                    // outcome, narrative, and the FULL effect footprint
+                    // (key + value, grouped by target entity) — matching
+                    // the action-history modal's "Changes Applied" block.
+                    // Per Arcurus 2026-06-07 (#openworld): "can you display
+                    // also the amount the property impact in History
+                    // from Other Entities similar to how you do in the
+                    // Action History".
+                    const effects = e.effects || {};
                     const ts = e.timestamp ? e.timestamp.replace('T', ' ').replace('Z', ' UTC') : '?';
                     const name = e.entity_name || '<unknown>';
                     const action = e.action || '<no action>';
                     const outcome = e.outcome || '';
                     const narrative = e.details || '';
+                    // Group effects by target name.  The effect keys
+                    // are dotted as "TargetName.property_name"
+                    // (or "self.property_name" for the actor's own
+                    // effects).  Split on the FIRST '.' to separate
+                    // target from prop.  An entry with a bare
+                    // "self.something" key gets the synthetic target
+                    // name "self (the actor)" so it groups cleanly.
+                    const byTarget = {};
+                    for (const [k, v] of Object.entries(effects)) {
+                        const dot = k.indexOf('.');
+                        const target = dot >= 0 ? k.substring(0, dot) : '(other)';
+                        const prop = dot >= 0 ? k.substring(dot + 1) : k;
+                        if (!byTarget[target]) byTarget[target] = [];
+                        byTarget[target].push({ prop, val: v });
+                    }
+                    // Render the effects section using the same
+                    // CSS classes as the action-history modal
+                    // (`.action-section`, `.action-section-title`,
+                    // `.properties-preview`, `.cross-entity-block`,
+                    // `.cross-entity-target`, `.action-effect`).
+                    let effectsHtml = '';
+                    const targetNames = Object.keys(byTarget);
+                    if (targetNames.length > 0) {
+                        effectsHtml += '<div class="action-section" style="margin-top: 8px;">';
+                        effectsHtml += '<div class="action-section-title">🌐 Property impact</div>';
+                        effectsHtml += '<div class="properties-preview">';
+                        for (const target of targetNames) {
+                            const label = target === 'self' ? 'self (the actor)' : target;
+                            effectsHtml += '<div class="cross-entity-block">';
+                            effectsHtml += '<div class="cross-entity-target">' + escapeHtml(label) + ':</div>';
+                            for (const { prop, val } of byTarget[target]) {
+                                const isNeg = val < 0;
+                                const sign = val >= 0 ? '+' : '';
+                                const cls = 'action-effect' + (isNeg ? ' negative' : '');
+                                effectsHtml += '<span class="' + cls + '">' + escapeHtml(prop) + ': ' + sign + val + '</span>';
+                            }
+                            effectsHtml += '</div>';
+                        }
+                        effectsHtml += '</div>';
+                        effectsHtml += '</div>';
+                    }
                     return '<div style="background: rgba(15,30,60,0.5); border: 1px solid rgba(100,150,255,0.15); border-radius: 4px; padding: 8px 12px; margin-bottom: 6px; font-size: 12px; line-height: 1.45;">'
                         + '<div style="display: flex; gap: 6px; align-items: center; margin-bottom: 4px;">'
                         +   '<span style="color: #c084fc; font-weight: 600;">' + escapeHtml(name) + '</span>'
@@ -2035,9 +2076,7 @@
                         + '<div style="color: #e0e0e0; margin-bottom: 4px;"><span style="color: #fbbf24;">action:</span> ' + escapeHtml(action) + '</div>'
                         + (outcome ? '<div style="color: #cbd5e1; margin-bottom: 4px; white-space: pre-wrap;">' + escapeHtml(outcome) + '</div>' : '')
                         + (narrative ? '<div style="color: #94a3b8; font-style: italic; margin-bottom: 4px; white-space: pre-wrap;">' + escapeHtml(narrative) + '</div>' : '')
-                        + (effectKeys.length > 0
-                            ? '<div style="color: #5a7a9a; font-size: 10px; margin-top: 4px;">effects: ' + effectKeys.map(k => '<code style="background: rgba(100,150,255,0.1); padding: 1px 4px; border-radius: 3px;">' + escapeHtml(k) + '</code>').join(' ') + '</div>'
-                            : '')
+                        + effectsHtml
                         + '</div>';
                 }).join('');
             } catch (e) {
