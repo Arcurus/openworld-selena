@@ -195,6 +195,7 @@ fn warn_tracking_once(msg: &str) {
 struct DailyLogger {
     error_file_path: PathBuf,
     llm_file_path: PathBuf,
+    stats_change_file_path: PathBuf,
     today_date: String,
 }
 
@@ -204,6 +205,7 @@ impl DailyLogger {
         Self {
             error_file_path: log_dir.join(format!("error-log-{}.log", today)),
             llm_file_path: log_dir.join(format!("llm-log-{}.log", today)),
+            stats_change_file_path: log_dir.join(format!("stats-change-log-{}.log", today)),
             today_date: today,
         }
     }
@@ -214,6 +216,7 @@ impl DailyLogger {
             self.today_date = today.clone();
             self.error_file_path = log_dir.join(format!("error-log-{}.log", today));
             self.llm_file_path = log_dir.join(format!("llm-log-{}.log", today));
+            self.stats_change_file_path = log_dir.join(format!("stats-change-log-{}.log", today));
         }
     }
     
@@ -257,6 +260,63 @@ impl DailyLogger {
             .append(true)
             .open(&self.llm_file_path)
             .and_then(|mut f| f.write_all(lines.as_bytes()));
+    }
+    
+    /// Log a single stats change (one property write).  Per
+    /// Arcurus 2026-06-07 #openworld: "track the stats changes
+    /// additionally in a stat change log, so that we can easily
+    /// look into them?  make also here a new log per day and
+    /// apply same name day formatting."
+    ///
+    /// Line format (one per write, append-mode, UTF-8):
+    ///
+    ///   [2026-06-07T10:23:45.123Z] entity=Velora the Undying (f26dd963)
+    ///       prop=morale old=487 new=535 delta=+48 actor=Velora the Undying
+    ///       cross=false warnings=2
+    ///
+    /// Each field is on its own continuation line (prefixed by
+    /// 6 spaces) for scannability; the first line is the
+    /// timestamp + entity.  `cross` is true for cross-entity
+    /// writes, false for self-effects.  `warnings` is the
+    /// count of warnings the apply_all_effects call surfaced
+    /// (so the operator can grep for `warnings=0` to find
+    /// clean writes).
+    fn log_stats_change(
+        &mut self,
+        entity_name: &str,
+        entity_id: &Uuid,
+        prop: &str,
+        old_value: i64,
+        new_value: i64,
+        cross: bool,
+        actor_name: &str,
+        warnings_count: usize,
+    ) {
+        let timestamp = chrono_now_timestamp();
+        let delta = new_value - old_value;
+        let delta_str = if delta >= 0 {
+            format!("+{}", delta)
+        } else {
+            format!("{}", delta)
+        };
+        let line = format!(
+            "[{}] entity={} ({})\n      prop={} old={} new={} delta={} actor={} cross={} warnings={}\n",
+            timestamp,
+            entity_name,
+            &entity_id.to_string()[..8],
+            prop,
+            old_value,
+            new_value,
+            delta_str,
+            actor_name,
+            cross,
+            warnings_count,
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.stats_change_file_path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
     }
 }
 
@@ -823,6 +883,27 @@ fn snapshot_save(label: &str) -> Result<std::path::PathBuf, String> {
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let dest = backup_dir.join(format!("save-{}-{}.owbl", label, ts));
     std::fs::copy(save_path, &dest).map_err(|e| format!("copy: {}", e))?;
+
+    // Also snapshot the durable action_history.jsonl so a
+    // backup captures the FULL world state (entity + property
+    // + history) in one go.  Per Arcurus 2026-06-07
+    // #openworld: "make a backup of the history before you
+    // make changes to file history files (or any other
+    // files)".  Filename includes the same timestamp so a
+    // restore can pair the .owbl with the .jsonl from the
+    // same instant.
+    let history_path = std::path::Path::new("world_data/action_history.jsonl");
+    if history_path.exists() {
+        let hist_dest = backup_dir.join(format!("action_history-{}-{}.jsonl", label, ts));
+        // Best-effort: a copy failure here is logged but
+        // does not fail the save.owbl backup (we'd rather
+        // get a save.owbl snapshot with no history than no
+        // snapshot at all).
+        if let Err(e) = std::fs::copy(history_path, &hist_dest) {
+            eprintln!("[snapshot_save] warning: could not snapshot action_history.jsonl: {}", e);
+        }
+    }
+
     Ok(dest)
 }
 
@@ -1270,6 +1351,98 @@ async fn get_entity_history(
         "total_in_log": total_in_log,
         "limit": limit,
         "entries": log_entries,
+    })).into_response()
+}
+
+/// `GET /api/entities/:id/history-from-others` (auth required)
+///
+/// Returns history entries from OTHER entities whose effects
+/// touch this entity.  Used by the web UI to show "History
+/// from Other Entities (Impacting This One)" after the
+/// entity's own history.  Per Arcurus 2026-06-07 #openworld.
+///
+/// An effect "touches" this entity if the effect key is
+///   - `"<EntityName>.<prop>"` (exact name match), OR
+///   - `"self.<prop>"` from a different actor AND the
+///     effect would land on this entity (rare; only if the
+///     parser misroutes), OR
+///   - the entry's actor is this entity (treated as
+///     "self" — the operator asked for "other", so we
+///     exclude same-actor entries even if the effect
+///     string happens to mention the entity).
+///
+/// Reads from the durable action_history.jsonl (same
+/// source as `get_entity_history`).  Most recent first.
+/// `limit` defaults to 50, max 500.
+async fn get_entity_history_from_others(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+    let limit: usize = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50)
+        .min(500);
+
+    // Confirm the entity exists; surface 404 if not.
+    let entity_name = {
+        let world = state.world.read().await;
+        match world.get_entity(&id) {
+            Some(e) => e.name.clone(),
+            None => return error_json(StatusCode::NOT_FOUND, "Entity not found"),
+        }
+    };
+    let entity_id_str = id.to_string();
+
+    // We need the FULL action history (not just the
+    // entries for this entity_id) because we're scanning
+    // for cross-entity effects.  Load recent N entries
+    // from the durable JSONL log, then filter.
+    // Practical bound: 1000 most recent entries (covers
+    // roughly the last few days of activity).
+    let all_recent: Vec<ActionHistoryEntry> =
+        action_history_log::load_recent_world_actions(1000, None);
+    let mut matching: Vec<&ActionHistoryEntry> = all_recent
+        .iter()
+        .filter(|e| {
+            // Exclude same-actor entries (the operator
+            // asked for "other" entities, not self).
+            if e.entity_id == entity_id_str {
+                return false;
+            }
+            // Check if any effect key starts with
+            // "<EntityName>." OR is the dotted-key form
+            // that exactly matches the entity.
+            let prefix_self = format!("{}.", entity_name);
+            let prefix_self_dot = format!("{entity_name}.");
+            for key in e.effects.keys() {
+                if key.starts_with(&prefix_self) || key.starts_with(&prefix_self_dot) {
+                    return true;
+                }
+                // Also: an effect "self.<prop>" from
+                // actor==other doesn't target this entity
+                // by name, so it shouldn't count.  We only
+                // count dotted-name references.
+            }
+            false
+        })
+        .collect();
+    matching.truncate(limit);
+
+    success_json(serde_json::json!({
+        "success": true,
+        "entity_id": entity_id_str,
+        "entity_name": entity_name,
+        "count": matching.len(),
+        "limit": limit,
+        "entries": matching,
     })).into_response()
 }
 
@@ -2191,7 +2364,7 @@ async fn entity_action(
                     // guard). Per Arcurus 2026-06-07 #openworld.
                     let mut response_warnings: Vec<String> = Vec::new();
                     let (mut applied_effects, _actor_nvs, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated) =
-                        apply_all_effects(&mut world, id, &parsed_effects, &mut response_warnings);
+                        apply_all_effects(&mut world, id, &parsed_effects, &mut response_warnings, Some(&state.logger));
                     // Auto-call response format uses NEW VALUES
                     // (not deltas — the pre-refactor auto-call used
                     // deltas but the cleaner form is the same as
@@ -3502,6 +3675,9 @@ fn apply_effects_to_target(
     target: &mut WorldEntity,
     effects: &[&ParsedEffect],
     warnings: &mut Vec<String>,
+    stats_log: Option<&std::sync::Mutex<DailyLogger>>,
+    actor_name: &str,
+    is_actor: bool,
 ) -> (
     std::collections::HashMap<String, serde_json::Value>,
     std::collections::HashMap<String, serde_json::Value>,
@@ -3518,10 +3694,25 @@ fn apply_effects_to_target(
     // writes were dry-run); now that cross-entity writes are
     // live, we need the explicit check.
     if target.is_system_entity() {
+        // Distinguish abstract entities (e.g. the world
+        // clock) from the broader "system" guard, so the
+        // operator sees the SPECIFIC reason the write was
+        // blocked.  Per Arcurus 2026-06-07 #openworld: "keep
+        // for now all writes blocked to abstract entities,
+        // but record as warning when an effect tries to
+        // change a property of an abstract entity
+        // (property name, change value, and entity name)".
+        let reason = if target.entity_type == "abstract"
+            || target.entity_type == "world_clock"
+        {
+            "abstract entities are write-protected"
+        } else {
+            "system entities are protected"
+        };
         for e in effects {
             warnings.push(format!(
-                "Skipped effect on system entity '{}': {}={:?} (system entities are protected)",
-                target.name, e.raw_key, e.value
+                "Skipped effect on abstract/system entity '{}' (entity_type={}, reason='{}'): property='{}', value={:?}",
+                target.name, target.entity_type, reason, e.prop_name, e.value
             ));
         }
         return (applied, new_values);
@@ -3655,6 +3846,20 @@ fn apply_effects_to_target(
             target.properties_int.insert(prop_key.clone(), new_val);
             applied.insert(prop_key.clone(), serde_json::json!(new_val));
             new_values.insert(prop_key.clone(), serde_json::json!(new_val));
+            if let Some(logger) = stats_log {
+                if let Ok(mut l) = logger.lock() {
+                    l.log_stats_change(
+                        &target.name,
+                        &target.id,
+                        prop_key,
+                        old_val,
+                        new_val,
+                        !is_actor,
+                        actor_name,
+                        warnings.len(),
+                    );
+                }
+            }
         } else if let Some(val) = float_val {
             if is_in_int {
                 warnings.push(format!(
@@ -3682,6 +3887,20 @@ fn apply_effects_to_target(
             target.properties_float.insert(prop_key.clone(), new_val);
             applied.insert(prop_key.clone(), serde_json::json!(new_val));
             new_values.insert(prop_key.clone(), serde_json::json!(new_val));
+            if let Some(logger) = stats_log {
+                if let Ok(mut l) = logger.lock() {
+                    l.log_stats_change(
+                        &target.name,
+                        &target.id,
+                        prop_key,
+                        old_val as i64,
+                        new_val as i64,
+                        !is_actor,
+                        actor_name,
+                        warnings.len(),
+                    );
+                }
+            }
         } else if let Some(ref val) = string_val {
             if is_in_int {
                 warnings.push(format!(
@@ -3741,6 +3960,7 @@ fn apply_all_effects(
     actor_id: Uuid,
     parsed_effects: &[ParsedEffect],
     warnings: &mut Vec<String>,
+    stats_log: Option<&std::sync::Mutex<DailyLogger>>,
 ) -> (
     std::collections::HashMap<String, serde_json::Value>,
     std::collections::HashMap<String, serde_json::Value>,
@@ -3762,12 +3982,18 @@ fn apply_all_effects(
         by_target.entry(tid).or_default().push(parsed);
     }
 
-    // Pre-collect target names (immutable borrow; released
-    // before the apply loop).
+    // Pre-collect target names + the actor's name for the
+    // stats-change log.  Immutable borrow; released before
+    // the apply loop.
     let target_names: std::collections::HashMap<Uuid, String> = by_target
         .keys()
         .filter_map(|tid| world.entities.get(tid).map(|e| (*tid, e.name.clone())))
         .collect();
+    let actor_name: String = world
+        .entities
+        .get(&actor_id)
+        .map(|e| e.name.clone())
+        .unwrap_or_else(|| format!("<actor-id:{}>", actor_id));
 
     let mut actor_applied: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
@@ -3784,9 +4010,17 @@ fn apply_all_effects(
         std::collections::BTreeSet::new();
 
     for (tid, effects) in by_target {
+        let is_actor = tid == actor_id;
         if let Some(target) = world.entities.get_mut(&tid) {
             let (applied, nvs) =
-                apply_effects_to_target(target, &effects, warnings);
+                apply_effects_to_target(
+                    target,
+                    &effects,
+                    warnings,
+                    stats_log,
+                    &actor_name,
+                    is_actor,
+                );
             // Capture emptiness BEFORE we move `applied` into
             // the actor_applied map (or into the
             // cross_entity_applied map below). The Rust borrow
@@ -4257,7 +4491,7 @@ async fn process_action_handler(
             // 2026-06-07 #openworld: this replaces the old
             // dry-run for cross-entity effects.
             let (applied_effects, new_values, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated) =
-                apply_all_effects(&mut world, entity_id, &parsed_effects, &mut warnings);
+                apply_all_effects(&mut world, entity_id, &parsed_effects, &mut warnings, Some(&state.logger));
 
             // Emit the aggregated unknown-entity warning.
                 // One per call, listing the de-duped names that
@@ -5441,6 +5675,8 @@ async fn list_logs_handler(
                     "llm"
                 } else if name.starts_with("error-log-") {
                     "error"
+                } else if name.starts_with("stats-change-log-") {
+                    "stats-change"
                 } else {
                     "other"
                 };
@@ -5482,7 +5718,7 @@ async fn get_log_file_tail_handler(
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     if filename.contains('/') || filename.contains('\\') || filename.contains("..")
-        || !(filename.starts_with("llm-log-") || filename.starts_with("error-log-"))
+        || !(filename.starts_with("llm-log-") || filename.starts_with("error-log-") || filename.starts_with("stats-change-log-"))
         || !filename.ends_with(".log")
     {
         return error_json(StatusCode::BAD_REQUEST, "Invalid log filename");
@@ -6067,6 +6303,7 @@ async fn main() {
         .route("/api/entities/:id", put(update_entity))
         .route("/api/entities/:id", axum::routing::delete(delete_entity))
         .route("/api/entities/:id/history", get(get_entity_history))
+        .route("/api/entities/:id/history-from-others", get(get_entity_history_from_others))
         .route("/api/entities/:id/history-summary/replace", post(history_summary_replace_handler))
         .route("/api/entities/:id/action", post(entity_action))
         .route("/api/entities/:id/action/context", get(action_context_handler))
@@ -6628,7 +6865,7 @@ mod effect_normalization_tests {
         }];
         let mut warnings = Vec::new();
         let (actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Actor has no effects, so its map is empty.
         assert!(actor_applied.is_empty(), "actor should have no applied effects");
         // Mira's wealth went from 100 to 95.
@@ -6667,7 +6904,7 @@ mod effect_normalization_tests {
         ];
         let mut warnings = Vec::new();
         let (actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Kira's morale: 50 + 5 = 55.
         let kira = world.entities.get(&actor_id).unwrap();
         assert_eq!(kira.properties_int.get("morale"), Some(&55));
@@ -6710,7 +6947,7 @@ mod effect_normalization_tests {
         }];
         let mut warnings = Vec::new();
         let (actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Actor has nothing applied.
         assert!(actor_applied.is_empty());
         // Cross-entity map should NOT contain the clock.
@@ -6722,8 +6959,17 @@ mod effect_normalization_tests {
         assert_eq!(clock_before, clock_after,
             "system-entity write must be rejected (no change to clock)");
         // Warning emitted.
-        assert!(warnings.iter().any(|w| w.contains("Skipped effect on system entity")),
-            "expected a 'Skipped effect on system entity' warning, got: {warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("Skipped effect on abstract/system entity")),
+            "expected a 'Skipped effect on abstract/system entity' warning, got: {warnings:?}");
+        // Per Arcurus 2026-06-07 #openworld: the warning now
+        // includes the property name, the change value, and
+        // the entity name (all three) so the operator can
+        // triage the LLM's intent without digging deeper.
+        let w = warnings.iter().find(|w| w.contains("Skipped effect on abstract/system entity")).unwrap();
+        assert!(w.contains("'World Clock'"), "warning should name the entity: {w}");
+        assert!(w.contains("'history_entries'"), "warning should name the property: {w}");
+        assert!(w.contains("Number(1.0)") || w.contains("1.0"),
+            "warning should include the change value: {w}");
         assert!(warnings.iter().any(|w| w.contains(&clock_name)),
             "warning should name the system entity: {warnings:?}");
     }
@@ -6750,7 +6996,7 @@ mod effect_normalization_tests {
         }];
         let mut warnings = Vec::new();
         let (_actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Mira's wealth: 100 + 20 (scaled to 15) = 115.
         let mira = world.entities.get(&other_id).unwrap();
         assert_eq!(mira.properties_int.get("wealth"), Some(&115),
@@ -6792,7 +7038,7 @@ mod effect_normalization_tests {
         ];
         let mut warnings = Vec::new();
         let (_actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Mira's wealth: 100 + 5 = 105. The 1e18 was rejected,
         // so the scale is 1.0 and the small effect is applied
         // at its literal value.
@@ -7049,7 +7295,7 @@ mod hidden_tag_tests {
         let parsed = vec![actor_int_delta("visibility", -2)];
         let mut warnings: Vec<String> = Vec::new();
         let (_applied, _nvs, _cross, hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         // The actor was affected (had a write), so the rule ran.
         assert!(hidden.contains_key("tester"),
@@ -7085,7 +7331,7 @@ mod hidden_tag_tests {
         )];
         let mut warnings: Vec<String> = Vec::new();
         let (_applied, _nvs, _cross, hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(hidden.contains_key("Mira the Merchant"),
             "Mira's hidden toggle should be in the map: {hidden:?}");
@@ -7120,7 +7366,7 @@ mod hidden_tag_tests {
         )];
         let mut warnings: Vec<String> = Vec::new();
         let (_applied, _nvs, _cross, hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(hidden.contains_key("Mira the Merchant"));
         let u = &hidden["Mira the Merchant"];
@@ -7157,7 +7403,7 @@ mod hidden_tag_tests {
         ];
         let mut warnings: Vec<String> = Vec::new();
         let (_applied, _nvs, _cross, _hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         // Mira's final visibility: 0 + (-2) + 3 = 1.
         // Threshold = 1 + 1 = 2 ≥ 1.  Mira stays unhidden.
@@ -7192,7 +7438,7 @@ mod hidden_tag_tests {
         let parsed = vec![actor_int_delta("power", 5)];  // actor self-effect only
         let mut warnings: Vec<String> = Vec::new();
         let (_applied, _nvs, _cross, hidden, _corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         // Mira is not in the hidden map (no effect → rule skipped).
         assert!(!hidden.contains_key("Mira the Merchant"),
@@ -7412,7 +7658,7 @@ mod corrupted_tag_tests {
         let parsed = vec![actor_int_delta("corruption", 15)];
         let mut warnings: Vec<String> = Vec::new();
         let (_applied, _nvs, _cross, _hidden, corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(corrupted.contains_key("tester"),
             "corrupted map should contain the actor, got: {corrupted:?}");
@@ -7440,7 +7686,7 @@ mod corrupted_tag_tests {
         )];
         let mut warnings: Vec<String> = Vec::new();
         let (_applied, _nvs, _cross, _hidden, corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(corrupted.contains_key("Mira the Merchant"),
             "Mira's corrupted toggle should be in the map: {corrupted:?}");
@@ -7474,7 +7720,7 @@ mod corrupted_tag_tests {
         )];
         let mut warnings: Vec<String> = Vec::new();
         let (_applied, _nvs, _cross, _hidden, corrupted) =
-            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(corrupted.contains_key("Mira the Merchant"),
             "Mira's corrupted toggle should be in the map: {corrupted:?}");
@@ -7509,7 +7755,7 @@ mod corrupted_tag_tests {
         let parsed1 = vec![actor_int_delta("visibility", -3)];
         let mut w1: Vec<String> = Vec::new();
         let (_a1, _n1, _c1, hidden, _cor1) =
-            apply_all_effects(&mut world, actor_id, &parsed1, &mut w1);
+            apply_all_effects(&mut world, actor_id, &parsed1, &mut w1, None);
         assert!(hidden.contains_key("tester"),
             "call 1 (visibility) should populate the hidden map: {hidden:?}");
 
@@ -7521,7 +7767,7 @@ mod corrupted_tag_tests {
         let parsed2 = vec![actor_int_delta("corruption", 15)];
         let mut w2: Vec<String> = Vec::new();
         let (_a2, _n2, _c2, _hid2, corrupted) =
-            apply_all_effects(&mut world2, actor_id2, &parsed2, &mut w2);
+            apply_all_effects(&mut world2, actor_id2, &parsed2, &mut w2, None);
         assert!(corrupted.contains_key("tester"),
             "call 2 (corruption) should populate the corrupted map: {corrupted:?}");
         assert!(corrupted["tester"]);

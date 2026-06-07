@@ -1937,6 +1937,24 @@
             html += '</div>';
             html += '</div>';
 
+            // History from OTHER entities (impacting this one).
+            // Per Arcurus 2026-06-07 #openworld: "after the
+            // history entries, display the history entries
+            // that affected this entity but came from other
+            // entities."  This is a server-side filter: the
+            // server scans all entities' history for entries
+            // whose effect keys start with "<this name>."
+            // and returns the matches.
+            html += '<div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid rgba(100,150,255,0.15);">';
+            html += '<div style="display: flex; gap: 10px; align-items: center; margin-bottom: 8px;">';
+            html += '<label style="font-size: 12px; color: #cbd5e1; font-weight: 600;">🌍 History from Other Entities (impacting this one):</label>';
+            html += '<span id="otherHistoryCount" style="color: #5a7a9a; font-size: 11px;">loading…</span>';
+            html += '</div>';
+            html += '<div id="entityOtherHistoryList" style="max-height: 280px; overflow-y: auto; border: 1px solid rgba(100,150,255,0.2); border-radius: 6px; background: rgba(15,30,60,0.4); padding: 8px;">';
+            html += '<div style="color: #5a7a9a; font-size: 11px; text-align: center; padding: 12px;">Loading cross-entity history…</div>';
+            html += '</div>';
+            html += '</div>';
+
             // Action Buttons
             html += '<div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; padding-top: 15px; border-top: 1px solid rgba(100,150,255,0.2);">';
             html += '<button class="btn btn-secondary" onclick="closeEntityModal()">Cancel</button>';
@@ -1952,6 +1970,76 @@
             setHistoryLimitDefault();
             loadEntityHistory(entity.id);
             loadEntityHistorySummary(entity.id);
+            loadEntityHistoryFromOthers(entity.id);
+        }
+
+        /**
+         * Fetch + render history entries from OTHER entities
+         * whose effects touch this entity.  Per Arcurus 2026-06-07
+         * #openworld: "after the history entries, display the
+         * history entries that affected this entity but came
+         * from other entities."  Uses the
+         * GET /api/entities/:id/history-from-others endpoint
+         * (server-side filter of the global action_history.jsonl
+         * by effect-key prefix match).
+         */
+        async function loadEntityHistoryFromOthers(entityId) {
+            const el = document.getElementById('entityOtherHistoryList');
+            const countEl = document.getElementById('otherHistoryCount');
+            if (!el) return;
+            try {
+                const r = await fetch('api/entities/' + encodeURIComponent(entityId) + '/history-from-others?limit=50', {
+                    credentials: 'include'
+                });
+                if (!r.ok) {
+                    if (r.status === 401) {
+                        el.innerHTML = '<div style="color: #fbbf24; font-size: 11px; text-align: center; padding: 6px;">🔒 Auth required to view cross-entity history</div>';
+                        if (countEl) countEl.textContent = '';
+                        if (typeof showPasswordUnlockDialog === 'function') {
+                            showPasswordUnlockDialog(() => loadEntityHistoryFromOthers(entityId));
+                        }
+                        return;
+                    }
+                    el.innerHTML = '<div style="color: #f87171; font-size: 11px; text-align: center; padding: 6px;">Failed to load (HTTP ' + r.status + ')</div>';
+                    if (countEl) countEl.textContent = '';
+                    return;
+                }
+                const data = await r.json();
+                const entries = data.entries || [];
+                if (entries.length === 0) {
+                    el.innerHTML = '<div style="color: #5a7a9a; font-size: 11px; text-align: center; padding: 12px;">No cross-entity history yet (no other entity has written to this one)</div>';
+                    if (countEl) countEl.textContent = '0 entries';
+                    return;
+                }
+                if (countEl) countEl.textContent = entries.length + ' entries (latest first)';
+                el.innerHTML = entries.map(e => {
+                    // Render the entry: actor name, action, timestamp,
+                    // and the effect keys that touch this entity.
+                    const effectKeys = Object.keys(e.effects || {});
+                    const ts = e.timestamp ? e.timestamp.replace('T', ' ').replace('Z', ' UTC') : '?';
+                    const name = e.entity_name || '<unknown>';
+                    const action = e.action || '<no action>';
+                    const outcome = e.outcome || '';
+                    // The effect keys that are directed at this entity
+                    // (those that start with our entity's name) are
+                    // the most relevant; the rest are the actor's
+                    // self-effects and other cross-entity effects.
+                    return '<div style="background: rgba(15,30,60,0.5); border: 1px solid rgba(100,150,255,0.15); border-radius: 4px; padding: 6px 10px; margin-bottom: 4px; font-size: 11px;">'
+                        + '<div style="display: flex; gap: 6px; align-items: center; margin-bottom: 3px;">'
+                        +   '<span style="color: #c084fc; font-weight: 600;">' + escapeHtml(name) + '</span>'
+                        +   '<span style="color: #5a7a9a; font-size: 10px;">' + escapeHtml(ts) + '</span>'
+                        + '</div>'
+                        + '<div style="color: #e0e0e0; margin-bottom: 3px;"><span style="color: #fbbf24;">action:</span> ' + escapeHtml(action) + '</div>'
+                        + (outcome ? '<div style="color: #cbd5e1; margin-bottom: 3px;">' + escapeHtml(outcome.substring(0, 200)) + (outcome.length > 200 ? '…' : '') + '</div>' : '')
+                        + (effectKeys.length > 0
+                            ? '<div style="color: #5a7a9a; font-size: 10px;">effects: ' + effectKeys.map(k => '<code style="background: rgba(100,150,255,0.1); padding: 1px 4px; border-radius: 3px;">' + escapeHtml(k) + '</code>').join(' ') + '</div>'
+                            : '')
+                        + '</div>';
+                }).join('');
+            } catch (e) {
+                el.innerHTML = '<div style="color: #f87171; font-size: 11px; text-align: center; padding: 6px;">Error: ' + escapeHtml(e.message) + '</div>';
+                if (countEl) countEl.textContent = '';
+            }
         }
 
         /**
@@ -4154,19 +4242,45 @@
                     html += '<div class="action-result">' + escapeHtml(data.narrative || data.outcome || 'Action completed.') + '</div>';
                     html += '</div>';
                     
-                    // Effects
+                    // Effects (self)
                     const effects = data.effects_applied || data.effects || {};
                     const newValues = data.new_values || {};
                     const effectEntries = Object.entries(effects);
                     if (effectEntries.length > 0) {
                         html += '<div class="action-section">';
-                        html += '<div class="action-section-title">📊 Changes Applied</div>';
+                        html += '<div class="action-section-title">📊 Changes Applied (self)</div>';
                         html += '<div class="properties-preview">';
                         effectEntries.forEach(([key, val]) => {
                             const isNeg = val < 0;
                             const newVal = newValues[key];
                             const newValStr = newVal !== undefined ? ' (now: ' + newVal + ')' : '';
                             html += '<span class="action-effect' + (isNeg ? ' negative' : '') + '">' + key + ': ' + (val >= 0 ? '+' : '') + val + newValStr + '</span>';
+                        });
+                        html += '</div>';
+                        html += '</div>';
+                    }
+
+                    // Cross-entity effects (Per Arcurus 2026-06-07
+                    // #openworld: also display in the UI where the
+                    // self effects are shown, so the operator sees
+                    // the full effect footprint of the action.)
+                    const crossEffects = data.cross_entity_effects_applied || {};
+                    const crossEntries = Object.entries(crossEffects);
+                    if (crossEntries.length > 0) {
+                        html += '<div class="action-section">';
+                        html += '<div class="action-section-title">🌐 Changes Applied (cross-entity)</div>';
+                        html += '<div class="properties-preview">';
+                        crossEntries.forEach(([targetName, targetEffects]) => {
+                            // targetEffects is a map of {prop: new_value}
+                            const inner = Object.entries(targetEffects);
+                            if (inner.length === 0) return;
+                            html += '<div class="cross-entity-block">';
+                            html += '<div class="cross-entity-target">' + escapeHtml(targetName) + ':</div>';
+                            inner.forEach(([prop, val]) => {
+                                const isNeg = val < 0;
+                                html += '<span class="action-effect' + (isNeg ? ' negative' : '') + '">' + prop + ': ' + (val >= 0 ? '+' : '') + val + '</span>';
+                            });
+                            html += '</div>';
                         });
                         html += '</div>';
                         html += '</div>';
