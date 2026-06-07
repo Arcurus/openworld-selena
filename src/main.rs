@@ -2958,6 +2958,107 @@ pub(crate) const EFFECT_NORMALIZATION_MIN_CAP: f64 = 1.0;
 /// tag doesn't flicker near the boundary.
 const HIDDEN_TAG: &str = "hidden";
 
+// ---------------------------------------------------------------------------
+// Stats-cap rule (Arcurus 2026-06-07 #openworld)
+// ---------------------------------------------------------------------------
+//
+// Steady-state "is this entity over-powered?" cap.  Sums ALL
+// `properties_int` values (including power itself) and compares
+// against `max(1, power * 5) + 100`.  If the entity is over the
+// cap, every value is scaled down proportionally so the new
+// sum equals the cap (the standalone script does this; the
+// runtime effect path only warns to avoid disrupting
+// mid-action).
+//
+// Power-multiplier rationale: a power-1 entity has 105 of
+// budget (enough for a small starter), a power-10 entity has
+// 150, a power-100 entity has 600, a power-1000 entity has
+// 5100.  The +100 baseline gives every entity room to grow
+// before the cap kicks in.  The +5 multiplier means higher-
+// power entities get proportionally more total "stuff"
+// (matching the world-building intuition that stronger
+// characters have more total resources).
+//
+// Why the cap is keyed on the ORIGINAL (pre-normalize) power:
+// normalizing scales power too, but the cap must be computed
+// BEFORE scaling — otherwise re-normalizing the scaled values
+// would re-trigger with a smaller cap and shrink power
+// again, leading to a death spiral.
+pub(crate) const STATS_CAP_POWER_MULTIPLIER: i64 = 5;
+pub(crate) const STATS_CAP_BASE: i64 = 100;
+pub(crate) const STATS_CAP_POWER_FLOOR: i64 = 1;
+
+/// Compute the steady-state stats cap for a given entity
+/// power.  Formula:  cap = max(STATS_CAP_POWER_FLOOR, power *
+/// STATS_CAP_POWER_MULTIPLIER) + STATS_CAP_BASE
+fn compute_stats_cap(power: i64) -> i64 {
+    let prop = std::cmp::max(STATS_CAP_POWER_FLOOR, power) * STATS_CAP_POWER_MULTIPLIER;
+    prop + STATS_CAP_BASE
+}
+
+/// Signed sum of all integer properties on an entity
+/// (including power, since the cap counts the entity's
+/// "total stuff").  Used by the stats-cap check.
+fn stats_sum(entity: &WorldEntity) -> i64 {
+    entity.properties_int.values().copied().sum()
+}
+
+/// If the entity's `stats_sum` is over its stats cap, scale
+/// every integer property down proportionally so the new sum
+/// exactly equals the cap.  Returns `Some((old_sum, cap,
+/// scale))` if a change was made, or `None` if the entity was
+/// already within budget.
+///
+/// Sign-preserving: negative values stay negative (we scale
+/// by a positive factor, so a wealth=200, visibility=-50
+/// entity becomes wealth=143, visibility=-36 when scaled by
+/// 0.714).  This matches the effect-normalization semantics
+/// (magnitudes shrink, signs don't flip).
+///
+/// Power is included in the scaling because the cap counts
+/// it.  The cap is computed from the ORIGINAL power, so
+/// post-scaling the entity's power will be lower, but we
+/// don't re-normalize again — `compute_stats_cap` would now
+/// return a smaller cap, but the entity's NEW sum exactly
+/// matches the OLD cap, so it stays within the (now-smaller)
+/// new cap as well.  No death spiral.
+fn normalize_entity_stats(entity: &mut WorldEntity) -> Option<(i64, i64, f64)> {
+    let power = entity.properties_int.get("power").copied().unwrap_or(0);
+    let cap = compute_stats_cap(power);
+    let sum = stats_sum(entity);
+    if sum > cap && sum != 0 {
+        let scale = cap as f64 / sum as f64;
+        for v in entity.properties_int.values_mut() {
+            *v = ((*v as f64) * scale).round() as i64;
+        }
+        Some((sum, cap, scale))
+    } else {
+        None
+    }
+}
+
+/// Check the stats cap on an entity and append a warning if
+/// the entity is over budget.  Does NOT normalize — that's
+/// the standalone script's job.  Per Arcurus 2026-06-07
+/// #openworld: the runtime effect path warns only, so a
+/// single big effect doesn't silently shrink the entity
+/// mid-action.
+fn check_stats_cap_warn(
+    entity: &WorldEntity,
+    warnings: &mut Vec<String>,
+) {
+    let power = entity.properties_int.get("power").copied().unwrap_or(0);
+    let cap = compute_stats_cap(power);
+    let sum = stats_sum(entity);
+    if sum > cap {
+        let overage = sum - cap;
+        warnings.push(format!(
+            "Stats cap exceeded for '{}': sum={} > cap={} (overage={}, cap formula = max(1, {}*5) + 100 = {}). Run `python3 code/normalize_stats.py normalize` to fix.",
+            entity.name, sum, cap, overage, power, cap
+        ));
+    }
+}
+
 /// Update the `hidden` tag on an entity based on its current
 /// (post-effect) `power` and `visibility`.  The threshold is
 /// `max(10, power) / 10 + visibility`:
@@ -3665,6 +3766,21 @@ fn apply_all_effects(
                     ));
                 }
             }
+        }
+    }
+
+    // Post-effect stats-cap rule (Arcurus 2026-06-07 #openworld):
+    // for every entity that had at least one effect actually
+    // written, check if its steady-state `properties_int` sum
+    // has exceeded the cap of `max(1, power*5) + 100`.  If so,
+    // emit a warning that names the entity, the sum, the cap,
+    // and the overage.  We do NOT normalize here — that's the
+    // standalone script's job.  A single big effect shouldn't
+    // silently shrink the entity mid-action; the operator
+    // reviews the warning and runs the script when ready.
+    for tid in &affected_ids {
+        if let Some(target) = world.entities.get(tid) {
+            check_stats_cap_warn(target, warnings);
         }
     }
 
@@ -6963,6 +7079,233 @@ mod hidden_tag_tests {
         let mira = world.entities.get(&mira_id).unwrap();
         assert!(!mira.has_tag(HIDDEN_TAG),
             "Mira's tags must not be touched (no effect → rule skipped)");
+    }
+}
+
+#[cfg(test)]
+mod stats_cap_tests {
+    //! Tests for the steady-state stats-cap rule (Arcurus
+    //! 2026-06-07 #openworld).
+    //!
+    //! Cap: `max(1, power*5) + 100`
+    //! Sum: signed sum of all `properties_int` values
+    //! (including power itself).
+    //!
+    //! The standalone script (`selena-project/code/
+    //! normalize_stats.py`) calls `normalize_entity_stats` to
+    //! scale all values proportionally when the cap is
+    //! exceeded.  The runtime effect path only calls
+    //! `check_stats_cap_warn`, which emits a warning without
+    //! mutating the entity.
+
+    use super::*;
+    use crate::world_data::WorldEntity;
+
+    fn mk_entity(
+        entity_type: &str,
+        name: &str,
+        props: &[(&str, i64)],
+    ) -> WorldEntity {
+        let mut e = WorldEntity::new(entity_type, name, 0.0, 0.0);
+        for (k, v) in props {
+            e.properties_int.insert((*k).to_string(), *v);
+        }
+        e
+    }
+
+    // -----------------------------------------------------------------
+    // Cap formula
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cap_formula_basic() {
+        // power=10 → max(1, 10*5) + 100 = 50 + 100 = 150
+        assert_eq!(compute_stats_cap(10), 150);
+        // power=100 → 500 + 100 = 600
+        assert_eq!(compute_stats_cap(100), 600);
+        // power=1 → 5 + 100 = 105
+        assert_eq!(compute_stats_cap(1), 105);
+        // power=0 → max(1, 0)*5 + 100 = 5 + 100 = 105 (the +1
+        // floor on the power multiplier kicks in so a
+        // brand-new entity still gets a proportional cap, not
+        // 100).
+        assert_eq!(compute_stats_cap(0), 105);
+        // power=-5 → max(1, -5)*5 + 100 = 5 + 100 = 105 (the
+        // floor also kicks in for negative power; this can
+        // happen if a buggy effect subtracts too much from
+        // power).
+        assert_eq!(compute_stats_cap(-5), 105);
+    }
+
+    // -----------------------------------------------------------------
+    // Sum
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sum_includes_power_and_uses_signed() {
+        let e = mk_entity("character", "Tester", &[
+            ("power", 10),
+            ("morale", 50),
+            ("wealth", 30),
+            ("visibility", -5),
+        ]);
+        // 10 + 50 + 30 + (-5) = 85
+        assert_eq!(stats_sum(&e), 85);
+    }
+
+    #[test]
+    fn sum_of_empty_entity_is_zero() {
+        let e = mk_entity("character", "Blank", &[]);
+        assert_eq!(stats_sum(&e), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // normalize_entity_stats
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn under_cap_is_noop() {
+        let mut e = mk_entity("character", "Within", &[
+            ("power", 10),
+            ("morale", 50),
+            ("wealth", 30),
+        ]);
+        // sum=90, cap=150 → no change.
+        let result = normalize_entity_stats(&mut e);
+        assert!(result.is_none(), "under-cap entity should not be normalized");
+        assert_eq!(e.properties_int.get("power"), Some(&10));
+        assert_eq!(e.properties_int.get("morale"), Some(&50));
+    }
+
+    #[test]
+    fn over_cap_scales_proportionally() {
+        let mut e = mk_entity("character", "Over", &[
+            ("power", 10),
+            ("morale", 200),
+            ("wealth", 100),
+        ]);
+        // sum=310, cap=150.  scale = 150/310 = 0.4838…
+        // After rounding:
+        //   power: 10 * 0.4838 = 4.838 → 5
+        //   morale: 200 * 0.4838 = 96.77 → 97
+        //   wealth: 100 * 0.4838 = 48.38 → 48
+        // New sum = 5 + 97 + 48 = 150 ✓
+        let result = normalize_entity_stats(&mut e);
+        assert!(result.is_some(), "over-cap entity should be normalized");
+        let (old_sum, cap, scale) = result.unwrap();
+        assert_eq!(old_sum, 310);
+        assert_eq!(cap, 150);
+        assert!((scale - 0.4838).abs() < 0.001, "scale ≈ 0.4838, got {scale}");
+        let new_sum: i64 = e.properties_int.values().sum();
+        assert_eq!(new_sum, cap, "post-normalize sum should equal cap, got {new_sum}");
+    }
+
+    #[test]
+    fn normalize_is_sign_preserving() {
+        // Negative values must stay negative.
+        let mut e = mk_entity("character", "Mixed", &[
+            ("power", 100),
+            ("wealth", 800),
+            ("visibility", -200),
+        ]);
+        // sum = 100 + 800 + (-200) = 700, cap = 600.  Over.
+        // scale = 600/700 = 0.8571.
+        // power: 100*0.8571 = 85.71 → 86
+        // wealth: 800*0.8571 = 685.71 → 686
+        // visibility: -200*0.8571 = -171.43 → -171
+        // New sum = 86 + 686 + (-171) = 601 (rounding noise,
+        // very close to cap=600).
+        let result = normalize_entity_stats(&mut e);
+        assert!(result.is_some());
+        assert!(
+            e.properties_int.get("visibility").copied().unwrap() < 0,
+            "visibility must stay negative after scaling, got {:?}",
+            e.properties_int.get("visibility")
+        );
+    }
+
+    #[test]
+    fn sum_zero_is_noop_not_div_by_zero() {
+        // All-zero properties → sum=0, can't compute scale
+        // (would be cap/0).  We must NOT panic.
+        let mut e = mk_entity("character", "AllZero", &[
+            ("power", 0),
+            ("morale", 0),
+        ]);
+        let result = normalize_entity_stats(&mut e);
+        assert!(result.is_none(), "zero-sum must be a no-op, not a panic");
+    }
+
+    #[test]
+    fn power_is_included_in_sum() {
+        // Big-power entity: cap is generous, but a single
+        // large stat can still push it over.
+        let mut e = mk_entity("faction", "BigFaction", &[
+            ("power", 197),
+            ("morale", 900),
+            ("wealth", 200),
+        ]);
+        // sum = 197 + 900 + 200 = 1297, cap = max(1, 197)*5 +
+        // 100 = 985 + 100 = 1085.  Over.
+        let result = normalize_entity_stats(&mut e);
+        assert!(result.is_some(), "197-power entity with 900 morale should be over cap");
+        let (old_sum, cap, _) = result.unwrap();
+        assert_eq!(old_sum, 1297);
+        assert_eq!(cap, 1085);
+        // Power is scaled down too (it counts in the sum).
+        let new_power = e.properties_int.get("power").copied().unwrap();
+        assert!(new_power < 197, "power should be scaled down, got {new_power}");
+    }
+
+    // -----------------------------------------------------------------
+    // check_stats_cap_warn (runtime, warn-only path)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn warn_emitted_when_over_cap() {
+        let e = mk_entity("character", "Over", &[
+            ("power", 10),
+            ("morale", 200),
+            ("wealth", 50),
+        ]);
+        // sum=260, cap=150.  Over.
+        let mut warnings: Vec<String> = Vec::new();
+        check_stats_cap_warn(&e, &mut warnings);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Over"));
+        assert!(warnings[0].contains("sum=260"));
+        assert!(warnings[0].contains("cap=150"));
+        assert!(warnings[0].contains("overage=110"));
+    }
+
+    #[test]
+    fn no_warn_when_under_cap() {
+        let e = mk_entity("character", "Fine", &[
+            ("power", 10),
+            ("morale", 50),
+            ("wealth", 30),
+        ]);
+        // sum=90, cap=150.  Under.
+        let mut warnings: Vec<String> = Vec::new();
+        check_stats_cap_warn(&e, &mut warnings);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn no_warn_at_exact_cap() {
+        // Boundary: sum == cap is fine (not over).  Only sum >
+        // cap triggers a warning.
+        let e = mk_entity("character", "Exactly", &[
+            ("power", 10),
+            ("morale", 50),
+            ("wealth", 30),
+            ("visibility", 60),
+        ]);
+        // sum = 10 + 50 + 30 + 60 = 150, cap = 150.  NOT over.
+        let mut warnings: Vec<String> = Vec::new();
+        check_stats_cap_warn(&e, &mut warnings);
+        assert!(warnings.is_empty(),
+            "sum == cap should not trigger a warning, got: {warnings:?}");
     }
 }
 
