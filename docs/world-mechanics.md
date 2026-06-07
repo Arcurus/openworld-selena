@@ -91,8 +91,10 @@ Two distinct fields. Don't confuse them.
 ## 3. Nearby Entities (LLM context)
 
 The "Nearby Entities" block the LLM sees lists other entities within
-**150 units** of the subject, **split into two groups** and
-**sorted by influence score**.
+**150 units** of the subject, **split into three groups**.
+Locations and Characters are **sorted by influence score**;
+Factions are **sorted by distance ascending** (nearest first)
+and **capped at MAX_NEARBY_FACTIONS (5)**.
 
 **Code:** `build_nearby_entities_str` in
 `src/world_data/context_builder.rs`.
@@ -113,17 +115,29 @@ Nearby Entities:
 - **Mira the Merchant** (character) — dist 120.8, power 20, visibility 12, score 0.26
   Traveling merchant with exotic goods.
   Properties: knowledge: 22, magic_protection: 78, power: 20
+
+### Nearby Factions (5 nearest)
+- **Keepers of the Eternal Flame** (faction) — dist 92.3, power 138, visibility 80, score 2.3625
+  Ancient order guarding the balance between light and shadow.
+  Properties: power: 138, visibility: 80, mana_reserves: 450
+- **Ironforge Clan** (faction) — dist 128.1, power 194, visibility 0, score 1.5144
+  Dwarven smiths who forge weapons for the realm.
+  Properties: power: 194, smithing_skill: 220, ore_reserves: 800
 ```
 
 ### The split
 
 - **Locations** — `entity_type == "location"`. Physical places the
   subject can visit.
-- **Characters** — everything else: `character`, `hero`, `oracle`,
-  `dragon`, `faction`, `artifact`, `world_clock`, etc. All
-  agent-like / interactive things grouped together for now. If
-  more categories are needed, they go in their own
-  `### Nearby …` section.
+- **Characters** — everything else except `location` and `faction`:
+  `character`, `hero`, `oracle`, `dragon`, `artifact`,
+  `world_clock`, etc. All agent-like / interactive individuals and
+  items grouped together.
+- **Factions** — `entity_type == "faction"`. Organised groups
+  (orders, clans, guilds) pulled out into their own section so the
+  LLM can reason about them as collective actors. Capped at 5
+  nearest, sorted by distance ascending. If more categories are
+  needed, they go in their own `### Nearby …` section.
 
 ### The sort
 
@@ -175,7 +189,8 @@ score = max(1, power + visibility) / distance
 | `max(1, power + visibility)` floor | `build_nearby_entities_str` | `1` | Lower → distance dominates; higher (e.g. `10`) → power/visibility matter more. |
 | Sleeping multiplier | `build_nearby_entities_str` | `0.01` | Higher → sleeping entities compete more with awake peers. Should stay aligned with `DEPRIO_TAG_MULTIPLIERS["sleeping"]` in `scheduled_actions.py`. |
 | Number of int props shown in each entry | `format_nearby_entry` (`.take(3)`) | 3 | Higher → more props, larger context. |
-| `entity_type` bucketing for "Locations" | `build_nearby_entities_str` | `"location"` only | Easy to split out factions/artifacts/etc. into their own `### Nearby …` sections. |
+| `entity_type` bucketing | `build_nearby_entities_str` | `"location"` and `"faction"` get their own `### Nearby …` sections; everything else stays in Characters | Add a new bucket: create a `match` arm, a `Vec`, a sort, a truncate, and a render block. |
+| `MAX_NEARBY_FACTIONS` | `build_nearby_entities_str` (constant) | `5` | Higher → more factions in the LLM prompt per action. Factions are capped because they tend to be the most context-heavy entries (richer descriptions, larger properties). |
 
 ---
 

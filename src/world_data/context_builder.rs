@@ -174,13 +174,22 @@ fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
     }
 
     // Per Arcurus 2026-06-06 (#openworld): split nearby entities
-    // into "Locations" (entity_type == "location") and "Characters"
-    // (everything else — sentient individuals, factions, artifacts,
-    // the world clock).  Within each group, sort by influence
-    // score so the most relevant neighbours surface first:
+    // into three groups:
+    //   - "Locations"  (entity_type == "location")
+    //   - "Factions"   (entity_type == "faction", top MAX_NEARBY_FACTIONS nearest)
+    //   - "Characters" (everything else — sentient individuals,
+    //                   artifacts, the world clock)
+    //
+    // Locations and Characters are sorted by influence score so the
+    // most relevant neighbours surface first:
     //
     //     score = max(1, power + visibility) / distance
     //             × (sleeping multiplier, 0.01 if "sleeping" in tags else 1.0)
+    //
+    // Factions are sorted by DISTANCE ASCENDING (nearest first)
+    // and capped at MAX_NEARBY_FACTIONS, so the LLM gets a tight
+    // "here are the closest organised groups" picture without
+    // context-bloat.  Arcurus 2026-06-07 #openworld.
     //
     // The `max(1, ...)` floor keeps distance from dominating the
     // sort (otherwise a low-power bystander right next to the
@@ -197,6 +206,7 @@ fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
     // prioritized over awake, present neighbours just because of
     // its title.  Arcurus 2026-06-06 #openworld.
     let mut locations: Vec<(&WorldEntity, f64, f64)> = Vec::new();
+    let mut factions: Vec<(&WorldEntity, f64, f64)> = Vec::new();
     let mut characters: Vec<(&WorldEntity, f64, f64)> = Vec::new();
     for other in &nearby {
         let dist = ((other.x - entity.x).powi(2) + (other.y - entity.y).powi(2)).sqrt();
@@ -215,15 +225,18 @@ fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
             1.0
         };
         let score = (numerator as f64 / dist) * sleeping_mult;
-        if other.entity_type == "location" {
-            locations.push((other, dist, score));
-        } else {
-            characters.push((other, dist, score));
+        match other.entity_type.as_str() {
+            "location" => locations.push((other, dist, score)),
+            "faction" => factions.push((other, dist, score)),
+            _ => characters.push((other, dist, score)),
         }
     }
     // Highest score first (most influential near neighbours).
     locations.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     characters.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    // Factions: nearest first, capped at MAX_NEARBY_FACTIONS.
+    factions.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    factions.truncate(MAX_NEARBY_FACTIONS);
 
     let mut s = String::new();
     if !locations.is_empty() {
@@ -240,8 +253,21 @@ fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
         }
         s.push('\n');
     }
+    if !factions.is_empty() {
+        s.push_str(&format!("### Nearby Factions ({} nearest)\n", MAX_NEARBY_FACTIONS));
+        for (other, dist, score) in &factions {
+            s.push_str(&format_nearby_entry(other, *dist, *score));
+        }
+        s.push('\n');
+    }
     s
 }
+
+/// Maximum number of factions to include in the "Nearby Factions"
+/// section of the LLM context.  Factions are sorted by distance
+/// ascending (nearest first), so this is "the N closest factions
+/// to the subject."  Tunable — see docs/world-mechanics.md.
+const MAX_NEARBY_FACTIONS: usize = 5;
 
 /// Format one nearby-entity row for the LLM context.
 /// Shows the same name/type/distance/description/props that the
@@ -638,6 +664,98 @@ mod tests {
             .trim_end();
         let score: f64 = score_str.parse().expect("score should parse as f64");
         assert!(score > 0.0, "score for hidden entity should be positive, got: {score}");
+    }
+
+    #[test]
+    fn nearby_entities_splits_factions_from_characters() {
+        // Faction must appear in the new "Nearby Factions" section,
+        // NOT in the "Nearby Characters" catch-all.  A regular
+        // character next to it must still appear in the Characters
+        // section.
+        let mut world = make_world();
+        let me = make_entity("Me", 10000.0, 10000.0);
+        let mut a_faction = make_entity("Ironforge Clan", 10010.0, 10010.0);
+        a_faction.entity_type = "faction".to_string();
+        a_faction.properties_int.insert("power".to_string(), 200);
+        let mut a_char = make_entity("Stranger", 10020.0, 10020.0);
+        a_char.entity_type = "character".to_string();
+        a_char.properties_int.insert("power".to_string(), 5);
+        let me_id = me.id;
+        let faction_id = a_faction.id;
+        let char_id = a_char.id;
+        world.entities.insert(me_id, me.clone());
+        world.entities.insert(faction_id, a_faction);
+        world.entities.insert(char_id, a_char);
+        let result = build_nearby_entities_str(&world, &me);
+        // The new section header must be present.
+        assert!(result.contains("### Nearby Factions"));
+        // The faction lives in the Factions section, not the Characters one.
+        let faction_section_start = result.find("### Nearby Factions").unwrap();
+        let faction_section = &result[faction_section_start..];
+        assert!(faction_section.contains("**Ironforge Clan**"));
+        assert!(!faction_section.contains("**Stranger**"));
+        // The character lives in the Characters section as before.
+        assert!(result.contains("### Nearby Characters"));
+        let char_section_start = result.find("### Nearby Characters").unwrap();
+        let char_section = &result[char_section_start..faction_section_start];
+        assert!(char_section.contains("**Stranger**"));
+        assert!(!char_section.contains("**Ironforge Clan**"));
+    }
+
+    #[test]
+    fn nearby_entities_factions_sorted_nearest_first_and_capped_at_5() {
+        // Place 7 factions around the subject at varying distances.
+        // The section should keep only the 5 closest, in ascending
+        // distance order, and drop the two farthest.
+        let mut world = make_world();
+        let me = make_entity("Me", 10000.0, 10000.0);
+        let me_id = me.id;
+        world.entities.insert(me_id, me.clone());
+
+        // Distances 10, 20, 30, 40, 50, 200, 300 from me (offsets
+        // along the +x axis are fine for Euclidean distance).
+        let distances = [10.0_f64, 20.0, 30.0, 40.0, 50.0, 200.0, 300.0];
+        let mut faction_ids: Vec<uuid::Uuid> = Vec::new();
+        for (i, d) in distances.iter().enumerate() {
+            let mut f = make_entity(&format!("Faction{}", i), 10000.0 + d, 10000.0);
+            f.entity_type = "faction".to_string();
+            f.properties_int.insert("power".to_string(), 100);
+            let fid = f.id;
+            faction_ids.push(fid);
+            world.entities.insert(fid, f);
+        }
+        let result = build_nearby_entities_str(&world, &me);
+        // The two farthest (Faction5 at 200, Faction6 at 300) must be dropped.
+        assert!(!result.contains("**Faction5**"), "Faction5 (200u) should be dropped (cap 5)");
+        assert!(!result.contains("**Faction6**"), "Faction6 (300u) should be dropped (cap 5)");
+        // The five closest must be present.
+        for i in 0..5 {
+            assert!(
+                result.contains(&format!("**Faction{}**", i)),
+                "Faction{} ({}u) should be present in the Factions section",
+                i, distances[i]
+            );
+        }
+        // Header should mention "5 nearest".
+        assert!(result.contains("(5 nearest)"), "header should indicate the cap of 5: {}", result);
+        // Nearest-first order: Faction0 (10u) must come before Faction1 (20u),
+        // which must come before Faction2 (30u), etc.
+        let faction_section_start = result.find("### Nearby Factions").unwrap();
+        let faction_section = &result[faction_section_start..];
+        let positions: Vec<usize> = (0..5)
+            .map(|i| {
+                faction_section
+                    .find(&format!("**Faction{}**", i))
+                    .unwrap_or_else(|| panic!("Faction{} missing from section", i))
+            })
+            .collect();
+        for w in positions.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "Factions should appear in ascending distance order; positions: {:?}",
+                positions
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # LLM Action Context Documentation
 
-**Last Updated:** 2026-06-05 (history_summary_replace: !ALL! full-replace convention added)
+**Last Updated:** 2026-06-07 (nearby entities: added "Nearby Factions" section — top 5 nearest, distance-asc; per Arcurus #openworld 2026-06-07)
 **File:** `ai_templates/EntityAction.md`
 
 > **Response-format conventions** (what the LLM emits back): see
@@ -20,7 +20,7 @@
 | Power tier | `{power_tier}` | ✅ Implemented | Power classification (e.g., "Low", "Medium", "High", "Legendary") |
 | Property context | `{property_context}` | ✅ Implemented | Entity properties relative to other entities of same type |
 | Entity history | `{entity_history}` | ✅ Implemented | Past actions and events for this entity |
-| Nearby entities | `{nearby_entities}` | ✅ Implemented | Other entities within proximity (150 units) |
+| Nearby entities | `{nearby_entities}` | ✅ Implemented | Other entities within proximity (150 units), split into three groups: Locations (entity_type=location), Characters (everything else), and Factions (entity_type=faction, top 5 nearest, distance-asc). See [world-mechanics.md §3](./world-mechanics.md#3-nearby-entities-llm-context) for the full formula. |
 | World events | `{world_events}` | ✅ Implemented | Active world events affecting the simulation |
 | Faction context | `{faction_context}` | ❌ NOT in Context | Faction relationships (ally/enemy/neutral) |
 | Custom relationships | `{relationships}` | ❌ NOT in Context | Entity-specific relationships |
@@ -32,7 +32,7 @@
 
 | Feature | Priority | Notes |
 |---------|----------|-------|
-| Faction relationships (ally/enemy/neutral) | HIGH | Need to add faction context to prompts |
+| Faction relationships (ally/enemy/neutral) | HIGH | Geographic proximity of factions is now in context (Nearby Factions section); the political ally/enemy/neutral *graph* between factions is still NOT. This row tracks the graph, not the proximity list. |
 | Entity-specific relationships | MEDIUM | Relationships stored separately |
 | Power-weighted nearby calculation | MEDIUM | Use `power / (distance + 1)` formula |
 | Multi-target action support | LOW | LLM can already target other entities by name |
