@@ -47,7 +47,7 @@ If the entity already has a property (e.g. `wealth`, `power`, `morale`), use tha
 
 **`visibility` (story signal only):**
 - A high `visibility` means this entity is *exposed* — it stands out, its presence is felt, and other entities will be very aware of it.
-- A low (or negative) `visibility` means the entity is *hiding* — withdrawn, concealed, easy to overlook. Other entities will be less aware of it.
+- A negative `visibility` means the entity is *hiding* — withdrawn, concealed, easy to overlook. Other entities will be less aware of it.
 - Use it as a narrative cue: how present or absent does this entity feel in the world right now?
 
 Respond ONLY with valid JSON (no other text before or after). **Always include a `history_summary_replace` field — it is the ONLY way to update the entity's rolling history summary.** See the rules section below for how to use it.
