@@ -242,21 +242,21 @@ fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
     if !locations.is_empty() {
         s.push_str("### Nearby Locations\n");
         for (other, dist, score) in &locations {
-            s.push_str(&format_nearby_entry(other, *dist, *score));
+            s.push_str(&format_nearby_entry(other, *dist));
         }
         s.push('\n');
     }
     if !characters.is_empty() {
         s.push_str("### Nearby Characters\n");
         for (other, dist, score) in &characters {
-            s.push_str(&format_nearby_entry(other, *dist, *score));
+            s.push_str(&format_nearby_entry(other, *dist));
         }
         s.push('\n');
     }
     if !factions.is_empty() {
         s.push_str(&format!("### Nearby Factions ({} nearest)\n", MAX_NEARBY_FACTIONS));
         for (other, dist, score) in &factions {
-            s.push_str(&format_nearby_entry(other, *dist, *score));
+            s.push_str(&format_nearby_entry(other, *dist));
         }
         s.push('\n');
     }
@@ -270,22 +270,25 @@ fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
 const MAX_NEARBY_FACTIONS: usize = 5;
 
 /// Format one nearby-entity row for the LLM context.
-/// Shows the same name/type/distance/description/props that the
-/// previous flat-list version used, plus the influence score
-/// (`max(1, power + visibility) / distance * (sleeping ? 0.01 : 1)`)
-/// and the raw `power` + `visibility` values that fed into it.
-fn format_nearby_entry(other: &WorldEntity, dist: f64, score: f64) -> String {
+/// Shows name/type/distance/power/description/props.  Per Arcurus
+/// 2026-06-07 (#openworld): the previous version also rendered
+/// `visibility` and the internal influence `score` here, but those
+/// are sort-internal details, not facts the LLM needs to act on.
+/// The LLM already has the sorted list order, so the score was
+/// redundant, and the visibility stat is more useful in the
+/// per-entity `Properties:` block (when present) than as a
+/// metadata field next to the name.  The `💤×0.01` marker is kept
+/// because the sleeping state is a real semantic signal the LLM
+/// should see.
+fn format_nearby_entry(other: &WorldEntity, dist: f64) -> String {
     let power = other.properties_int.get("power").copied().unwrap_or(0);
-    let visibility = other.properties_int.get("visibility").copied().unwrap_or(0);
     let is_sleeping = other.tags.iter().any(|t| t == "sleeping");
     let mut s = format!(
-        "- **{}** ({}) — dist {:.1}, power {}, visibility {}, score {:.4}{}\n",
+        "- **{}** ({}) — dist {:.1}, power {}{}\n",
         other.name,
         other.entity_type,
         dist,
         power,
-        visibility,
-        score,
         if is_sleeping { " 💤×0.01" } else { "" },
     );
     if !other.description.is_empty() {
@@ -487,11 +490,14 @@ mod tests {
         let result = build_nearby_entities_str(&world, &me);
         assert!(result.contains("**Neighbor**"));
         assert!(!result.contains("**Me**"));
-        // New format: section header + the score line that includes
-        // the power + visibility + score (visibility defaults to 0).
+        // Format: section header + the metadata line that now shows
+        // `dist` and `power` only (visibility + score were removed
+        // per Arcurus 2026-06-07 — they were sort-internal noise
+        // the LLM doesn't need).
         assert!(result.contains("### Nearby Characters"));
         assert!(result.contains("power 10"));
-        assert!(result.contains("visibility 0"));
+        assert!(!result.contains("visibility 0"), "visibility stat was removed from the metadata line");
+        assert!(!result.contains("score "), "internal influence score was removed from the metadata line");
         assert!(result.contains("Properties: power: 10"));
     }
 
@@ -597,9 +603,19 @@ mod tests {
     }
 
     #[test]
-    fn nearby_entities_sleeping_score_is_one_hundredth_of_baseline() {
-        // Same entity, two tests: once with the sleeping tag, once
-        // without.  The score should differ by exactly 100×.
+    fn nearby_entities_sleeping_appears_after_awake_equivalent() {
+        // Two equivalent entities at the same position, equal power,
+        // equal visibility.  The only difference is the `sleeping`
+        // tag on one of them.  Awake must appear before sleeping in
+        // the rendered output (sort still works the same way; we
+        // just no longer print the score that proved it).
+        //
+        // Replaces the previous
+        // `nearby_entities_sleeping_score_is_one_hundredth_of_baseline`
+        // test, which used to verify the 100× ratio in the printed
+        // score string.  After visibility/score were removed from
+        // the metadata line (Arcurus 2026-06-07), the test was
+        // rewritten to verify the same effect via list order.
         let mut world = make_world();
         let me = make_entity("Me", 10000.0, 10000.0);
         let mut e_awake = make_entity("TestEntity", 10030.0, 10030.0);
@@ -616,26 +632,37 @@ mod tests {
         world.entities.insert(awake_id, e_awake);
         world.entities.insert(sleeping_id, e_sleeping);
         let result = build_nearby_entities_str(&world, &me);
-        // Extract the two score values.
-        let line_awake = result.lines().find(|l| l.contains("**TestEntity**") && !l.contains("💤")).unwrap();
-        let line_sleeping = result.lines().find(|l| l.contains("**TestEntity**") && l.contains("💤")).unwrap();
-        let score_awake: f64 = line_awake.rsplit("score ").next().unwrap().trim().parse().unwrap();
-        let score_sleeping: f64 = line_sleeping.rsplit("score ").next().unwrap().trim().split_whitespace().next().unwrap().parse().unwrap();
-        // Sleeping score should be exactly 1/100 of the awake score
-        // (the only difference between the two is the sleeping tag).
-        // Allow for {:.4} display rounding — the ratio should be
-        // within ~2% of 100 (one part in 50 from the smallest value).
-        let ratio = score_awake / score_sleeping;
-        let drift = (ratio - 100.0).abs() / 100.0;
-        assert!(drift < 0.02,
-            "expected ratio ≈ 100 (±2%), got {ratio:.4} (awake={score_awake}, sleeping={score_sleeping}, drift={:.2}%)", drift * 100.0);
+        // Pull out the Characters section and verify the awake
+        // line precedes the sleeping one.  Both lines are tagged
+        // with the same entity name (`**TestEntity**`); we
+        // distinguish them by the 💤 marker.
+        let char_section_start = result.find("### Nearby Characters").unwrap();
+        let char_section = &result[char_section_start..];
+        let pos_awake = char_section
+            .find("**TestEntity**")
+            .expect("awake line missing");
+        let pos_sleeping = char_section
+            .rfind("**TestEntity**")
+            .expect("sleeping line missing");
+        assert!(
+            pos_awake < pos_sleeping,
+            "awake line should appear before sleeping line (positions: awake={pos_awake}, sleeping={pos_sleeping})"
+        );
+        // Sleeping row should still carry the 💤 marker.
+        assert!(result.contains("💤×0.01"), "sleeping row should keep the 💤×0.01 marker");
     }
 
     #[test]
-    fn nearby_entities_score_floors_negative_visibility_at_one() {
-        // Entity with power=2 and visibility=-10 (sum=-8) should
-        // still get a positive score (numerator floored to 1), not
-        // a negative one.
+    fn nearby_entities_negative_visibility_does_not_crash_sort() {
+        // Entity with power=2 and visibility=-10 (sum=-8) used to be
+        // at risk of producing a negative sort score.  The
+        // `max(1, power + visibility)` floor protects against that.
+        // We no longer print the score, but the sort must still
+        // produce a valid output and the entity must still appear.
+        //
+        // Replaces the previous
+        // `nearby_entities_score_floors_negative_visibility_at_one`
+        // test, which used to parse the score from the printed line.
         let mut world = make_world();
         let me = make_entity("Me", 10000.0, 10000.0);
         let mut hidden = make_entity("Hidden", 10050.0, 10050.0);
@@ -647,23 +674,17 @@ mod tests {
         world.entities.insert(me_id, me.clone());
         world.entities.insert(hidden_id, hidden);
         let result = build_nearby_entities_str(&world, &me);
-        // Raw values are still shown in the line.
+        // Power stat is still shown in the metadata line.
+        assert!(result.contains("**Hidden**"));
         assert!(result.contains("power 2"));
-        assert!(result.contains("visibility -10"));
-        // The score line should show a positive number, not "-8 ...".
-        // We extract the trailing "score X.XX" substring and verify
-        // it parses to a positive value.
-        let line = result
-            .lines()
-            .find(|l| l.contains("**Hidden**"))
-            .expect("no Hidden line in result");
-        let score_str = line
-            .rsplit("score ")
-            .next()
-            .unwrap()
-            .trim_end();
-        let score: f64 = score_str.parse().expect("score should parse as f64");
-        assert!(score > 0.0, "score for hidden entity should be positive, got: {score}");
+        // The entity is still listed under Characters.
+        let char_section_start = result.find("### Nearby Characters").unwrap();
+        let char_section = &result[char_section_start..];
+        assert!(char_section.contains("**Hidden**"));
+        // No negative score substring should have leaked into the
+        // output (we don't print score anymore, but a regression
+        // could in theory introduce it; this is a sanity check).
+        assert!(!result.contains("score -"), "no negative score should appear in the rendered output");
     }
 
     #[test]

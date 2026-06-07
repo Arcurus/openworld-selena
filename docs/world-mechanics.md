@@ -10,7 +10,7 @@ relationship to the Python scheduler. For LLM context shape, see
 **Last updated:** 2026-06-06 (added §7 Multi-Entity Effects — dotted-key
 `entityname.property_name` schema, dry-run for cross-entity writes;
 self-effect expansion; per-effect routing report. After the
-meta-selector + history-format + nearby-entity split + visibility-doc
+meta-selector + history-format + nearby-entity split + visibility-doc + nearby-entity metadata-trim (drop visibility + score from the rendered line)
 + history-budget-bump + effect-normalization rewrites).
 
 ---
@@ -104,26 +104,38 @@ and **capped at MAX_NEARBY_FACTIONS (5)**.
 ```
 Nearby Entities:
 ### Nearby Locations
-- **Shadow Ridge Camp** (location) — dist 85.4, power 68, visibility 29, score 1.14
+- **Shadow Ridge Camp** (location) — dist 85.4, power 68
   Hidden bandit encampment.
   Properties: visibility: 29, power: 68, wealth: 19
-- **The Sunken Temple** (location) — dist 86.0, power 0, visibility 0, score 0.01
+- **The Sunken Temple** (location) — dist 86.0, power 0
   ...
   Properties: magical_activity: 0, consciousness_active: 0, visibility: 0
 
 ### Nearby Characters
-- **Mira the Merchant** (character) — dist 120.8, power 20, visibility 12, score 0.26
+- **Mira the Merchant** (character) — dist 120.8, power 20
   Traveling merchant with exotic goods.
   Properties: knowledge: 22, magic_protection: 78, power: 20
+- **Vaelthrix the Endless** (dragon) — dist 60.0, power 1320 💤×0.01
+  An ancient dragon of absolute darkness. Slumbers beneath the Frostpeak.
+  Properties: power: 1320, visibility: 0
 
 ### Nearby Factions (5 nearest)
-- **Keepers of the Eternal Flame** (faction) — dist 92.3, power 138, visibility 80, score 2.3625
+- **Keepers of the Eternal Flame** (faction) — dist 92.3, power 138
   Ancient order guarding the balance between light and shadow.
   Properties: power: 138, visibility: 80, mana_reserves: 450
-- **Ironforge Clan** (faction) — dist 128.1, power 194, visibility 0, score 1.5144
+- **Ironforge Clan** (faction) — dist 128.1, power 194
   Dwarven smiths who forge weapons for the realm.
   Properties: power: 194, smithing_skill: 220, ore_reserves: 800
 ```
+
+Each line shows only `name`, `type`, `dist`, and `power` plus the
+optional `💤×0.01` marker for sleeping entities.  The previous
+format also rendered the entity's `visibility` stat and the
+internal influence `score` here, but those were sort-internal
+details the LLM doesn't need — the score is redundant with the
+list order, and `visibility` is still surfaced through the
+`Properties:` block (when it lands in the top 3) for any entity
+where it's meaningful.  Arcurus 2026-06-07 #openworld.
 
 ### The split
 
