@@ -16,7 +16,7 @@ This file is **loaded into every action prompt** at the
 If you rename a property or change its semantics, update this
 file too — the LLM learns the schema here.
 
-## `visibility` (story signal only)
+## `visibility` (story signal)
 
 A high `visibility` means this entity is *exposed* — it stands
 out, its presence is felt, and other entities will be very
@@ -29,15 +29,7 @@ less aware of it.
 Use it as a narrative cue: how present or absent does this
 entity feel in the world right now?
 
-The post-effect **hidden-tag rule** auto-toggles a `hidden`
-tag on entities whose `(max(10, power) / 10 + visibility)`
-threshold falls below 0 (deep hider) and removes it when the
-threshold rises to 1 or above. A small dead zone `[0, 1)`
-prevents flicker near the boundary. See
-[`docs/world-mechanics.md` §4](../../docs/world-mechanics.md#4-the-visibility-property)
-for the full mechanics.
-
-## `corruption` (story signal only)
+## `corruption` (story signal)
 
 A high `corruption` means this entity is *corrupted* — its
 essence has been twisted, its actions serve darker ends, and
@@ -52,30 +44,13 @@ that has been ritually restored.
 
 Neutral is `0` — the entity is neither corrupted nor purified.
 
-The post-effect **corrupted-tag rule** auto-toggles a
-`corrupted` tag on entities whose `(max(1, power) - corruption)`
-threshold falls below 0 (corruption has overtaken the entity's
-own strength) and removes it when the threshold rises to 1 or
-above. A small dead zone `[0, 1)` prevents flicker near the
-boundary.
-
-Why this formula: low-power entities are easy to corrupt (a
-power-10 entity with `corruption: 15` → threshold = `10 - 15 =
--5` → tagged `corrupted`), while high-power entities are hard
-to corrupt (a power-100 entity needs `corruption > 100` before
-the tag appears). Mirrors the hidden-tag rule's "famous dragon
-is still scary" intuition — a legendary evil entity resists
-corruption's pull on its identity, while a freshly-minted
-cultist can fall to it in a single bad turn.
-
-## Common generic properties (no special tag rule)
+## Common generic properties
 
 These appear in many entities and are worth recognising by
-name; they have no auto-tag rule.
+name.
 
 - `power` — entity's overall strength tier; the cap for many
-  other mechanics (effect normalization, stats cap, etc.).
-  Almost universal.
+  other mechanics. Almost universal.
 - `wealth` — money, treasure, material resources. Used by
   factions, merchants, kingdoms.
 - `morale` — fighting spirit, hope, determination. Can go
@@ -87,16 +62,15 @@ name; they have no auto-tag rule.
   they here" signal, `reputation` is a longer-term
   "what do people think of them" signal.
 
-## Writing effects for these properties
+## Writing effects
 
 In your `effects` block, use the dot-prefix form for both
 self-effects and cross-entity effects. Server-side per-target
-safety nets still apply: magnitude cap (no single delta > 1e6),
-per-target normalization (each target's effect budget is keyed
-on its own `power`, with a +10 max-amount baseline), and the
-system-entity guard (the World Clock and anything tagged `meta`
-cannot be written to). Negative values are fine (corruption,
-visibility, morale) — they're signed i64.
+safety nets still apply: magnitude cap, per-target
+normalization, and the system-entity guard (the World Clock
+and anything tagged `meta` cannot be written to). Negative
+values are fine (corruption, visibility, morale) — they're
+signed integers.
 
 ```json
 "effects": {
