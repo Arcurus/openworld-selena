@@ -2942,14 +2942,36 @@ pub(crate) fn float_oversize(v: f64) -> bool {
 /// Per-turn cap on the **total absolute magnitude** of all numeric
 /// effects an LLM can apply to a single entity, expressed as a
 /// fraction of the entity's `power` (with a hard floor of 10 on
-/// `power` so power-0 entities still have a small budget).  When
-/// the sum of |Δ| across all effects exceeds this cap, every
+/// `power` so power-0 entities still have a small budget) PLUS a
+/// flat `EFFECT_NORMALIZATION_MAX_AMOUNT` (+10) max-amount term.
+/// When the sum of |Δ| across all effects exceeds this cap, every
 /// numeric effect is scaled down proportionally so the new total
 /// exactly fills the cap.  Negative effects count as positive for
 /// the cap check (the magnitude is what matters).  String effects
-/// are not scaled.  Arcurus 2026-06-06 #openworld.
+/// are not scaled.  Arcurus 2026-06-06 + 2026-06-07 #openworld.
+///
+/// The +10 max-amount term is the carve-out for "a single full
+/// effect on a low-power entity" — without it, the pure fraction
+/// would cap a power-10 entity at 1.0 of total |Δ| per turn, too
+/// tight for a meaningful single change.  With it, even a
+/// power-0 entity has 11 of budget (1% of 10 + 10), enough for
+/// e.g. a +5 morale and a +6 power, or a single +10 spike.
 pub(crate) const EFFECT_NORMALIZATION_CAP_PCT: f64 = 0.10;
+pub(crate) const EFFECT_NORMALIZATION_MAX_AMOUNT: f64 = 10.0;
 pub(crate) const EFFECT_NORMALIZATION_MIN_CAP: f64 = 1.0;
+
+/// Compute the per-turn effect cap for a given entity power.
+/// Formula:  cap = max(MIN_CAP, max(10, power) * CAP_PCT + MAX_AMOUNT)
+///
+/// The `max(10, power)` floor ensures power-0 entities still get
+/// a proportional slice; the `MAX_AMOUNT` addend gives a flat
+/// baseline of room for a single full effect.  See the docstring
+/// on `EFFECT_NORMALIZATION_CAP_PCT` for the full rationale.
+fn compute_effect_normalization_cap(raw_power: i64) -> f64 {
+    let proportional = std::cmp::max(10_i64, raw_power) as f64
+        * EFFECT_NORMALIZATION_CAP_PCT;
+    (proportional + EFFECT_NORMALIZATION_MAX_AMOUNT).max(EFFECT_NORMALIZATION_MIN_CAP)
+}
 
 /// Compute the per-turn effect-normalization pre-pass.
 ///
@@ -2979,9 +3001,7 @@ pub(crate) fn compute_effect_normalization_scale(
     if protected_entity {
         return (0.0, 1.0);
     }
-    let effect_cap = (std::cmp::max(10_i64, raw_power) as f64
-        * EFFECT_NORMALIZATION_CAP_PCT)
-        .max(EFFECT_NORMALIZATION_MIN_CAP);
+    let effect_cap = compute_effect_normalization_cap(raw_power);
     let mut total: f64 = 0.0;
     for v in effects.values() {
         // Reject garbage FIRST.  Anything that fails
@@ -3257,9 +3277,7 @@ fn compute_actor_normalization_scale(
     if protected_entity {
         return (0.0, 1.0);
     }
-    let effect_cap = (std::cmp::max(10_i64, actor_power) as f64
-        * EFFECT_NORMALIZATION_CAP_PCT)
-        .max(EFFECT_NORMALIZATION_MIN_CAP);
+    let effect_cap = compute_effect_normalization_cap(actor_power);
     let mut total: f64 = 0.0;
     for e in parsed {
         // Only count actor effects; other-entity effects don't
@@ -3618,15 +3636,14 @@ async fn process_action_handler(
                         &parsed_effects,
                         protected_entity,
                     );
-                let effect_cap = (std::cmp::max(10_i64, raw_power) as f64
-                    * EFFECT_NORMALIZATION_CAP_PCT)
-                    .max(EFFECT_NORMALIZATION_MIN_CAP);
+                let effect_cap = compute_effect_normalization_cap(raw_power);
                 if effect_total_magnitude > effect_cap && effect_total_magnitude > 0.0 {
                     warnings.push(format!(
-                            "Effects normalized: total |Δ|={:.3} exceeds cap {:.3} ({}% of max(10, power)={}); scaled by {:.4}.",
+                            "Effects normalized: total |Δ|={:.3} exceeds cap {:.3} ({}% of max(10, power)={} + max-amount={}); scaled by {:.4}.",
                             effect_total_magnitude, effect_cap,
                             (EFFECT_NORMALIZATION_CAP_PCT * 100.0) as i64,
                             std::cmp::max(10, raw_power),
+                            EFFECT_NORMALIZATION_MAX_AMOUNT as i64,
                             effect_scale
                         ));
                     }
@@ -6010,52 +6027,81 @@ mod effect_normalization_tests {
 
     #[test]
     fn normalization_scales_down_proportionally_when_over_cap() {
-        // power=100 ⇒ cap = 10.  Total |Δ| = 50+30 = 80.  scale = 10/80 = 0.125.
-        let eff = mk_effects(&[("power", 50.0), ("morale", 30.0)]);
-        let s = compute_scale(100, &eff, false);
-        assert!((s - 0.125).abs() < 1e-9, "expected scale 0.125, got {s}");
+        // power=100 ⇒ cap = max(1, 10% of 10 + 10) = max(1, 11) = 11.  Hmm,
+        // that's 11 not 20.  Use power=1000 to land at 100 + 10 = 110, then
+        // bump the total to clear it.
+        //   power=1000 ⇒ cap = 1000 * 0.10 + 10 = 110.  Total = 50+80 = 130.
+        //   scale = 110/130 ≈ 0.8462.
+        let eff = mk_effects(&[("power", 50.0), ("morale", 80.0)]);
+        let s = compute_scale(1000, &eff, false);
+        let expected = 110.0 / 130.0;
+        assert!((s - expected).abs() < 1e-9, "expected scale {expected}, got {s}");
         // Verify: after applying the scale, total |Δ| = cap exactly.
-        let new_total: f64 = 50.0 * s + 30.0 * s;
-        assert!((new_total - 10.0).abs() < 1e-6, "post-scale total should equal cap, got {new_total}");
+        let new_total: f64 = 50.0 * s + 80.0 * s;
+        assert!((new_total - 110.0).abs() < 1e-6, "post-scale total should equal cap, got {new_total}");
     }
 
     #[test]
     fn normalization_negatives_count_as_positive() {
-        // power=100 ⇒ cap = 10.  Effects: -7 and -5 ⇒ total |Δ| = 12 > 10.
-        // scale = 10/12 ≈ 0.8333.
-        let eff = mk_effects(&[("power", -7.0), ("morale", -5.0)]);
+        // power=100 ⇒ cap = 10 + 10 = 20.  Effects: -15 and -10 ⇒ total |Δ| = 25 > 20.
+        // scale = 20/25 = 0.8.  (Same shape as the old test, but with
+        // the cap bumped by the +10 max-amount term.)
+        let eff = mk_effects(&[("power", -15.0), ("morale", -10.0)]);
         let s = compute_scale(100, &eff, false);
-        let expected = 10.0 / 12.0;
+        let expected = 20.0 / 25.0;
         assert!((s - expected).abs() < 1e-9, "expected scale {expected}, got {s}");
     }
 
     #[test]
     fn normalization_power_zero_uses_floor_ten() {
-        // power=0 ⇒ cap = 10% of 10 = 1 (floored at 1).
-        // Effects: 0.4 and 0.4 ⇒ total |Δ| = 0.8 < 1. No scale.
+        // power=0 ⇒ cap = max(1, 10% of 10 + 10) = max(1, 11) = 11.
+        // Effects: 0.4 and 0.4 ⇒ total |Δ| = 0.8 < 11. No scale.
         let eff = mk_effects(&[("power", 0.4), ("morale", 0.4)]);
         let s = compute_scale(0, &eff, false);
         assert!((s - 1.0).abs() < 1e-9, "expected no scale, got {s}");
     }
 
     #[test]
-    fn normalization_power_zero_over_cap_scales_to_one() {
-        // power=0 ⇒ cap = 1.  Effects: 3 and 5 ⇒ total |Δ| = 8.
-        // scale = 1/8 = 0.125. Post-scale total = 1.
-        let eff = mk_effects(&[("power", 3.0), ("morale", 5.0)]);
+    fn normalization_power_zero_over_cap_scales_to_eleven() {
+        // power=0 ⇒ cap = 11 (= 1 + 10 max-amount).  Effects: 7 and 6
+        // ⇒ total |Δ| = 13 > 11.  scale = 11/13 ≈ 0.8462.
+        let eff = mk_effects(&[("power", 7.0), ("morale", 6.0)]);
         let s = compute_scale(0, &eff, false);
-        assert!((s - 0.125).abs() < 1e-9, "expected scale 0.125, got {s}");
-        let new_total: f64 = 3.0 * s + 5.0 * s;
-        assert!((new_total - 1.0).abs() < 1e-6);
+        let expected = 11.0 / 13.0;
+        assert!((s - expected).abs() < 1e-9, "expected scale {expected}, got {s}");
+        let new_total: f64 = 7.0 * s + 6.0 * s;
+        assert!((new_total - 11.0).abs() < 1e-6, "post-scale total should equal cap, got {new_total}");
     }
 
     #[test]
     fn normalization_mixed_signs_treated_as_magnitudes() {
-        // power=200 ⇒ cap = 20.  Effects: +15 and -10 ⇒ total |Δ| = 25 > 20.
-        // scale = 20/25 = 0.8. Post-scale: +12 and -8 (total 20).
-        let eff = mk_effects(&[("power", 15.0), ("morale", -10.0)]);
+        // power=200 ⇒ cap = 20 + 10 = 30.  Effects: +20 and -15 ⇒ total |Δ| = 35 > 30.
+        // scale = 30/35 = 6/7 ≈ 0.8571.
+        let eff = mk_effects(&[("power", 20.0), ("morale", -15.0)]);
         let s = compute_scale(200, &eff, false);
-        assert!((s - 0.8).abs() < 1e-9, "expected scale 0.8, got {s}");
+        let expected = 30.0 / 35.0;
+        assert!((s - expected).abs() < 1e-9, "expected scale {expected}, got {s}");
+    }
+
+    #[test]
+    fn normalization_max_amount_term_gives_low_power_room() {
+        // Per Arcurus 2026-06-07 #openworld: the +10 max-amount term
+        // means even a power-0 entity has a per-turn cap of 11 (not
+        // 1.0), enough for a single full +10 effect.  This test
+        // specifically exercises the +10 term — a 10+1 effect
+        // (e.g. +7 and +4) should fit exactly in the cap, and an
+        // 11+1 effect (e.g. +8 and +4) should scale.
+        let eff = mk_effects(&[("morale", 7.0), ("power", 4.0)]);  // total = 11
+        let s = compute_scale(0, &eff, false);
+        // power=0 ⇒ cap = 11.  Total = 11.  No scale.
+        assert!((s - 1.0).abs() < 1e-9,
+            "11 should fit exactly in cap of 11, expected no scale, got {s}");
+        let eff2 = mk_effects(&[("morale", 8.0), ("power", 4.0)]);  // total = 12
+        let s2 = compute_scale(0, &eff2, false);
+        // power=0 ⇒ cap = 11.  Total = 12 > 11.  scale = 11/12.
+        let expected2 = 11.0 / 12.0;
+        assert!((s2 - expected2).abs() < 1e-9,
+            "expected scale {expected2}, got {s2}");
     }
 
     #[test]
@@ -6117,10 +6163,11 @@ mod effect_normalization_tests {
 
     #[test]
     fn normalization_constant_values_are_pickable() {
-        // Sanity: the cap formula and minimum cap both compile to
-        // the values we expect.  If these drift, the rest of the
+        // Sanity: the cap formula constants all compile to the
+        // values we expect.  If these drift, the rest of the
         // tests above are meaningless.
         assert!((EFFECT_NORMALIZATION_CAP_PCT - 0.10).abs() < 1e-9);
+        assert!((EFFECT_NORMALIZATION_MAX_AMOUNT - 10.0).abs() < 1e-9);
         assert!((EFFECT_NORMALIZATION_MIN_CAP - 1.0).abs() < 1e-9);
     }
 }
