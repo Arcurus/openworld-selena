@@ -1736,7 +1736,16 @@ async fn action_llm_handler(
     // for now DRY-RUNS the cross-entity writes (logs what would have
     // happened, applies only self-effects). The LLM is asked to
     // emit at least one effect per entity it impacts in the action.
-    let system_prompt = "You are the world narrator for the Open World simulation. Respond ONLY with valid JSON (no other text before or after). Format: {\"action\":\"brief action name\",\"outcome\":\"2-3 sentences\",\"effects\":{{\"entityname.property_name\":change_value}},\"narrative\":\"story description\"} — keys are either self.property_name (the actor) or other_entity_name.property_name (any entity the action impacts); emit at least one effect per impacted entity so each can track it";
+    //
+    // 2026-06-07 (#openworld, Arcurus): cross-entity writes now
+    // APPLY. The LLM can name any other entity in the world
+    // (case-sensitive exact name) and the effect will be applied
+    // to that entity, with the same per-target safety nets as
+    // self-effects (magnitude check, per-target normalization
+    // computed against the target's own power, type handling,
+    // system-entity guard). Effects targeting the World Clock or
+    // any 'meta'-tagged entity are rejected with a warning.
+    let system_prompt = "You are the world narrator for the Open World simulation. Respond ONLY with valid JSON (no other text before or after). Format: {\"action\":\"brief action name\",\"outcome\":\"2-3 sentences\",\"effects\":{{\"entityname.property_name\":change_value}},\"narrative\":\"story description\"} — keys are either self.property_name (the actor) or other_entity_name.property_name (any entity the action impacts); emit at least one effect per impacted entity so each can track it. Effects on other entities are applied live (not dry-run), with per-target magnitude + normalization guards. System entities (World Clock, anything tagged 'meta') cannot be written to.";
     let llm_request = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -2155,73 +2164,51 @@ async fn entity_action(
                         &entity_name,
                         &name_to_id,
                     );
-                    let mut dry_run_report = DryRunReport::default();
                     let mut unknown_warnings: Vec<String> = Vec::new();
-                    if let Some(entity) = world.entities.get_mut(&id) {
-                        let mut applied_effects = std::collections::HashMap::new();
-                        for parsed in &parsed_effects {
-                            // Dispatch on target. Other-entity
-                            // effects are dry-run (parsed + logged,
-                            // not applied) to match the
-                            // process_action_handler behavior.
-                            match &parsed.target {
-                                EffectTarget::Other { name, .. } => {
-                                    dry_run_report.add(name, &parsed.raw_key, &parsed.value);
-                                    continue;
-                                }
-                                EffectTarget::Actor => {}
-                            }
-                            let prop_key = &parsed.prop_name;
-                            let change = match parse_effect_value(&parsed.value) {
-                                Some(c) => c,
-                                None => continue,
-                            };
-                            if !entity.properties_int.contains_key(prop_key) {
-                                entity.properties_int.insert(prop_key.clone(), 0);
-                            }
-                            if let Some(value) = entity.properties_int.get_mut(prop_key) {
-                                let old_value = *value;
-                                *value = (*value as f64 + change) as i64;
-                                applied_effects.insert(prop_key.clone(), *value - old_value);
-                            }
-                        }
+                    // Auto-call path: same per-target helper as
+                    // process_action_handler, so both paths apply
+                    // cross-entity effects with the same safety
+                    // nets (magnitude check, per-target
+                    // normalization, type handling, system-entity
+                    // guard). Per Arcurus 2026-06-07 #openworld.
+                    let mut response_warnings: Vec<String> = Vec::new();
+                    let (mut applied_effects, _actor_nvs, cross_entity_applied) =
+                        apply_all_effects(&mut world, id, &parsed_effects, &mut response_warnings);
+                    // Auto-call response format uses NEW VALUES
+                    // (not deltas — the pre-refactor auto-call used
+                    // deltas but the cleaner form is the same as
+                    // the process path). The process path is the
+                    // source of truth for post-action state; this
+                    // is just a best-effort preview.
+                    applied_effects = applied_effects;
 
-                        // Aggregate the dry-run + unknown-name
-                        // warnings into the response so the
-                        // auto-call path is consistent with the
-                        // process path. Per Arcurus 2026-06-06
-                        // #openworld.
-                        let mut response_warnings: Vec<String> =
-                            repair_warning.into_iter().collect();
-                        if let Some(w) = dry_run_report.to_warning() {
-                            response_warnings.push(w);
+                    if !unknown_entity_names.is_empty() {
+                        let mut w = format!(
+                            "Unknown entity names in effects ({} name(s) skipped):",
+                            unknown_entity_names.len()
+                        );
+                        for name in &unknown_entity_names {
+                            w.push_str(&format!(
+                                "\n  - {:?} (no entity with that exact name; check spelling and case)",
+                                name
+                            ));
                         }
-                        if !unknown_entity_names.is_empty() {
-                            let mut w = format!(
-                                "Unknown entity names in effects ({} name(s) skipped):",
-                                unknown_entity_names.len()
-                            );
-                            for name in &unknown_entity_names {
-                                w.push_str(&format!(
-                                    "\n  - {:?} (no entity with that exact name; check spelling and case)",
-                                    name
-                                ));
-                            }
-                            unknown_warnings.push(w);
-                        }
-                        response_warnings.extend(unknown_warnings);
-
-                        success_json(serde_json::json!({
-                            "success": true,
-                            "action": action_data.action,
-                            "outcome": action_data.outcome,
-                            "effects_applied": applied_effects,
-                            "narrative": action_data.narrative,
-                            "warnings": response_warnings
-                        })).into_response()
-                    } else {
-                        error_json(StatusCode::NOT_FOUND, "Entity not found")
+                        unknown_warnings.push(w);
                     }
+                    response_warnings.extend(unknown_warnings);
+                    let mut all_warnings: Vec<String> =
+                        repair_warning.into_iter().collect();
+                    all_warnings.extend(response_warnings);
+
+                    success_json(serde_json::json!({
+                        "success": true,
+                        "action": action_data.action,
+                        "outcome": action_data.outcome,
+                        "effects_applied": applied_effects,
+                        "cross_entity_effects_applied": cross_entity_applied,
+                        "narrative": action_data.narrative,
+                        "warnings": all_warnings
+                    })).into_response()
                 }
                 Err(e) => {
                     success_json(serde_json::json!({
@@ -3089,54 +3076,6 @@ struct ParsedEffect {
     value: serde_json::Value,
 }
 
-/// Aggregate of the cross-entity (Other-target) effects in a single
-/// `process_action_handler` call, collected during the apply loop
-/// and emitted as a single aggregated warning. Per Arcurus
-/// 2026-06-06 #openworld: "make one warning message and include
-/// all stats and entities that are impacting other entities".
-#[derive(Debug, Default, Clone)]
-struct DryRunReport {
-    /// Per-entity tally: (entity_name, vec_of_(raw_key, value_str)).
-    by_entity: std::collections::BTreeMap<String, Vec<(String, String)>>,
-}
-
-impl DryRunReport {
-    fn add(&mut self, entity_name: &str, raw_key: &str, value: &serde_json::Value) {
-        self.by_entity
-            .entry(entity_name.to_string())
-            .or_default()
-            .push((raw_key.to_string(), value.to_string()));
-    }
-    fn is_empty(&self) -> bool { self.by_entity.is_empty() }
-    fn total_effects(&self) -> usize {
-        self.by_entity.values().map(|v| v.len()).sum()
-    }
-    fn total_entities(&self) -> usize { self.by_entity.len() }
-    /// Render as a single multi-line warning suitable for the
-    /// `warnings` vec. Returns None when the report is empty (so
-    /// the caller doesn't emit a no-op warning).
-    fn to_warning(&self) -> Option<String> {
-        if self.is_empty() { return None; }
-        let mut s = format!(
-            "Cross-entity dry-run: {} effect(s) targeting {} other entit{} (NOT applied):",
-            self.total_effects(),
-            self.total_entities(),
-            if self.total_entities() == 1 { "y" } else { "ies" },
-        );
-        for (entity_name, effects) in &self.by_entity {
-            s.push_str(&format!("\n  - {} ({} effect{}):",
-                entity_name, effects.len(),
-                if effects.len() == 1 { "" } else { "s" }));
-            for (raw_key, value_str) in effects {
-                s.push_str(&format!("\n      * {} = {}", raw_key, value_str));
-            }
-        }
-        s.push_str("\n  Cross-entity writes are dry-run for now (parsed and routed, not applied). \
-            Use self.X for actor effects and the entity's literal name (case-sensitive) for other entities.");
-        Some(s)
-    }
-}
-
 /// Build a case-sensitive name → id lookup table for the current
 /// world. The LLM emits literal names (e.g. "Mira the Merchant")
 /// as the prefix in dotted keys; we resolve to the entity id at
@@ -3304,10 +3243,363 @@ fn compute_actor_normalization_scale(
     (total, scale)
 }
 
+/// Apply a batch of effects (already parsed via `parse_effects` so
+/// the targets are resolved) to a single target entity. The helper
+/// handles:
+///   - system-entity protection (skip all effects with a warning;
+///     the LLM is told cross-entity writes can hit any entity, but
+///     system entities are an exception)
+///   - per-target normalization (each target gets its own cap from
+///     its own `power`; a high-power Ironforge can absorb more
+///     change than a low-power Mira the Scribe)
+///   - magnitude / oversize guards (rejects non-finite values, |Δ|>
+///     MAX_DELTA_ABS, integer overflow, and oversize results)
+///   - type-mismatch handling (int / float / string dispatch)
+///   - the per-effect normalization scale (numeric deltas are
+///     scaled; string effects are not)
+///
+/// Returns `(applied, new_values)` — both HashMaps from prop_name
+/// to the value written.  They are populated together and end up
+/// the same shape; the field is split in the response for
+/// readability.
+///
+/// Per Arcurus 2026-06-07 #openworld: extracted from the inline
+/// loop in `process_action_handler` so the actor path and the new
+/// cross-entity path share one implementation, and so future
+/// per-target safety guards (e.g. "effect on a faction must not
+/// increase the faction's own reputation above 1000") can be added
+/// in one place.
+fn apply_effects_to_target(
+    target: &mut WorldEntity,
+    effects: &[&ParsedEffect],
+    warnings: &mut Vec<String>,
+) -> (
+    std::collections::HashMap<String, serde_json::Value>,
+    std::collections::HashMap<String, serde_json::Value>,
+) {
+    let mut applied: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut new_values: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+
+    // System-entity protection: any effect targeting a system
+    // entity (world_clock, anything tagged 'meta') is rejected
+    // outright, regardless of which LLM call proposed it.
+    // Previously this protection was implicit (cross-entity
+    // writes were dry-run); now that cross-entity writes are
+    // live, we need the explicit check.
+    if target.is_system_entity() {
+        for e in effects {
+            warnings.push(format!(
+                "Skipped effect on system entity '{}': {}={:?} (system entities are protected)",
+                target.name, e.raw_key, e.value
+            ));
+        }
+        return (applied, new_values);
+    }
+
+    // Per-target normalization: each target's cap comes from its
+    // own power. Garbage values (failing magnitude_check) are
+    // excluded from the total so a single 1e18 sibling can't
+    // drag a small real effect down to ~0 (the same rule as
+    // compute_actor_normalization_scale).
+    let target_power = target.properties_int.get("power").copied().unwrap_or(0);
+    let mut total: f64 = 0.0;
+    for e in effects {
+        if magnitude_check(&e.value).is_some() { continue; }
+        if let Some(f) = parse_effect_value(&e.value) {
+            if f.is_finite() { total += f.abs(); }
+        }
+    }
+    let cap = compute_effect_normalization_cap(target_power);
+    let scale = if total > cap && total > 0.0 { cap / total } else { 1.0 };
+    if total > cap && total > 0.0 {
+        warnings.push(format!(
+            "Effects normalized on '{}': total |Δ|={:.3} exceeds cap {:.3} ({}% of max(10, power)={} + max-amount={}); scaled by {:.4}.",
+            target.name, total, cap,
+            (EFFECT_NORMALIZATION_CAP_PCT * 100.0) as i64,
+            std::cmp::max(10, target_power),
+            EFFECT_NORMALIZATION_MAX_AMOUNT as i64,
+            scale
+        ));
+    }
+
+    for e in effects {
+        let prop_key = &e.prop_name;
+        let raw_key = &e.raw_key;
+        let change_val = &e.value;
+
+        // Empty property name (e.g. "self." with nothing after the
+        // dot) — parsed as Actor with empty prop_name; the apply
+        // loop surfaces a warning and skips.
+        if prop_key.is_empty() {
+            warnings.push(format!("Empty property name in effect '{}'; skipped", raw_key));
+            continue;
+        }
+
+        // Magnitude guard (non-finite or |Δ| > MAX_DELTA_ABS).
+        if let Some(reason) = magnitude_check(change_val) {
+            warnings.push(format!(
+                "Skipped effect on '{}': {} (value={:?})",
+                raw_key, reason, change_val
+            ));
+            continue;
+        }
+
+        // Determine value type and convert appropriately. Same
+        // dispatch as the original process_action_handler path.
+        let (int_val, float_val, string_val) = match change_val {
+            serde_json::Value::Bool(b) => {
+                let v = if *b { 1 } else { 0 };
+                (Some(v as i64), None, None)
+            }
+            serde_json::Value::Number(n) => {
+                if n.is_i64() {
+                    (Some(n.as_i64().unwrap()), None, None)
+                } else {
+                    (None, n.as_f64(), None)
+                }
+            }
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                if let Ok(v) = trimmed.parse::<i64>() {
+                    (Some(v), None, None)
+                } else if let Ok(v) = trimmed.parse::<f64>() {
+                    if v.fract() == 0.0 && v.abs() < 1e15 && !trimmed.contains('.') {
+                        (Some(v as i64), None, None)
+                    } else {
+                        (None, Some(v), None)
+                    }
+                } else {
+                    (None, None, Some(trimmed.to_string()))
+                }
+            }
+            _ => {
+                warnings.push(format!(
+                    "Unsupported effect type for '{}': {:?}", raw_key, change_val
+                ));
+                continue;
+            }
+        };
+
+        // Apply the per-turn normalization scale to numeric
+        // deltas. String effects are not scaled.
+        let (int_val, float_val) = (
+            int_val.map(|v| ((v as f64) * scale).round() as i64),
+            float_val.map(|v| v * scale),
+        );
+
+        let is_in_int = target.properties_int.contains_key(prop_key);
+        let is_in_float = target.properties_float.contains_key(prop_key);
+        let is_in_string = target.properties_string.contains_key(prop_key);
+
+        if let Some(val) = int_val {
+            if is_in_float {
+                warnings.push(format!(
+                    "Type mismatch: '{}' is float, tried to set int ({}). Skipped.",
+                    prop_key, val
+                ));
+                continue;
+            }
+            if is_in_string {
+                warnings.push(format!(
+                    "Type mismatch: '{}' is string, tried to set int ({}). Skipped.",
+                    prop_key, val
+                ));
+                continue;
+            }
+            let old_val = *target.properties_int.get(prop_key).unwrap_or(&0);
+            let new_val = old_val.checked_add(val).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "Integer overflow on '{}' (old={}, delta={}); clamped to {}",
+                    prop_key, old_val, val, MAX_INT_ABS
+                ));
+                MAX_INT_ABS
+            });
+            if int_oversize(new_val) {
+                warnings.push(format!(
+                    "Skipped oversize int write on '{}': new_val={} (|val| > {})",
+                    prop_key, new_val, MAX_INT_ABS
+                ));
+                continue;
+            }
+            target.properties_int.insert(prop_key.clone(), new_val);
+            applied.insert(prop_key.clone(), serde_json::json!(new_val));
+            new_values.insert(prop_key.clone(), serde_json::json!(new_val));
+        } else if let Some(val) = float_val {
+            if is_in_int {
+                warnings.push(format!(
+                    "Type mismatch: '{}' is int, tried to set float ({}). Skipped.",
+                    prop_key, val
+                ));
+                continue;
+            }
+            if is_in_string {
+                warnings.push(format!(
+                    "Type mismatch: '{}' is string, tried to set float ({}). Skipped.",
+                    prop_key, val
+                ));
+                continue;
+            }
+            let old_val = *target.properties_float.get(prop_key).unwrap_or(&0.0);
+            let new_val = old_val + val;
+            if float_oversize(new_val) {
+                warnings.push(format!(
+                    "Skipped oversize float write on '{}': new_val={}",
+                    prop_key, new_val
+                ));
+                continue;
+            }
+            target.properties_float.insert(prop_key.clone(), new_val);
+            applied.insert(prop_key.clone(), serde_json::json!(new_val));
+            new_values.insert(prop_key.clone(), serde_json::json!(new_val));
+        } else if let Some(ref val) = string_val {
+            if is_in_int {
+                warnings.push(format!(
+                    "Type mismatch: '{}' is int, tried to set string value={:?}. Skipped.",
+                    prop_key, val
+                ));
+                continue;
+            }
+            if is_in_float {
+                warnings.push(format!(
+                    "Type mismatch: {} is float, tried to set string (val=\"{}\"). Skipped.",
+                    prop_key, val
+                ));
+                continue;
+            }
+            target.properties_string.insert(prop_key.clone(), val.clone());
+            applied.insert(prop_key.clone(), serde_json::json!(val));
+            new_values.insert(prop_key.clone(), serde_json::json!(val));
+        }
+    }
+
+    (applied, new_values)
+}
+
+/// Apply a fully-parsed effect list to a world, dispatching each
+/// effect to its target entity (Actor + N Other). Per-target
+/// safety (system-entity guard, magnitude check, per-target
+/// normalization, type handling) is handled inside
+/// `apply_effects_to_target`. Returns the actor's applied map +
+/// new_values map, plus a per-target-name map of cross-entity
+/// applied effects.
+///
+/// Extracted to a top-level helper so the caller (e.g.
+/// `process_action_handler`) can release any existing mutable
+/// borrow on the world before dispatching, avoiding the
+/// double-mutable-borrow that the Rust borrow checker otherwise
+/// rejects (we want to mutate the actor entity AND any other
+/// target entities in the same call).
+fn apply_all_effects(
+    world: &mut World,
+    actor_id: Uuid,
+    parsed_effects: &[ParsedEffect],
+    warnings: &mut Vec<String>,
+) -> (
+    std::collections::HashMap<String, serde_json::Value>,
+    std::collections::HashMap<String, serde_json::Value>,
+    std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, serde_json::Value>,
+    >,
+) {
+    // Group by target.
+    let mut by_target: std::collections::BTreeMap<Uuid, Vec<&ParsedEffect>> =
+        std::collections::BTreeMap::new();
+    for parsed in parsed_effects {
+        let tid = match &parsed.target {
+            EffectTarget::Actor => actor_id,
+            EffectTarget::Other { id: other_id, .. } => *other_id,
+        };
+        by_target.entry(tid).or_default().push(parsed);
+    }
+
+    // Pre-collect target names (immutable borrow; released
+    // before the apply loop).
+    let target_names: std::collections::HashMap<Uuid, String> = by_target
+        .keys()
+        .filter_map(|tid| world.entities.get(tid).map(|e| (*tid, e.name.clone())))
+        .collect();
+
+    let mut actor_applied: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut actor_new_values: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut cross_entity_applied: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, serde_json::Value>,
+    > = std::collections::BTreeMap::new();
+
+    for (tid, effects) in by_target {
+        if let Some(target) = world.entities.get_mut(&tid) {
+            let (applied, nvs) =
+                apply_effects_to_target(target, &effects, warnings);
+            if tid == actor_id {
+                actor_applied = applied;
+                actor_new_values = nvs;
+            } else {
+                // For non-actor targets, only include in the
+                // response if at least one effect actually wrote
+                // to the target.  An empty applied map means
+                // either the target is system-protected (LLM
+                // shouldn't have been writing to it) or all
+                // effects were rejected (magnitude, type, etc.
+                // — the LLM will see the warnings).  Either
+                // way, surfacing an empty {prop: ...} map
+                // would just add noise.
+                if !applied.is_empty() {
+                    let name = target_names
+                        .get(&tid)
+                        .cloned()
+                        .unwrap_or_else(|| format!("<id:{}>", tid));
+                    cross_entity_applied.insert(name, applied);
+                }
+            }
+        }
+    }
+
+    (actor_applied, actor_new_values, cross_entity_applied)
+}
+
+// ---------------------------------------------------------------------------
+// Effect-key parser (Arcurus 2026-06-06 #openworld)
 //
-// On success, returns the parsed `LlmActionResponse` together with
-// an optional repair warning. The warning is `Some(_)` when the
-// tolerant `fix_known_malformed_patterns` regex-fixup actually fired
+// LLM-emit effects use dot-keys to disambiguate the target entity:
+//   - "self.morale"                → apply to the actor
+//   - "Mira the Merchant.wealth"   → apply to Mira the Merchant
+//   - "morale"                     → apply to the actor (backward compat)
+//
+// The actor's own literal name (e.g. "Kira Dawnblade.morale" when
+// Kira is acting) is also accepted, case-sensitive, exact match.
+// The template and system prompt advertise only `self.X` to keep
+// the convention simple; the literal-name form is a forgiving
+// fallback for LLMs that forget the prefix. Per Arcurus 2026-06-06
+// #openworld: "yes alow self or own name but no need to mention
+// that it can use own name".
+//
+// As of 2026-06-07 (#openworld, Arcurus): cross-entity writes
+// APPLY, not dry-run. The LLM can name any other entity in the
+// world and the effect is written, with the same per-target
+// safety nets (magnitude check, per-target normalization,
+// type handling, system-entity guard) that actor effects have
+// always had.
+//   - "self.morale"                → apply to the actor
+//   - "Mira the Merchant.wealth"   → apply to Mira the Merchant
+//   - "morale"                     → apply to the actor (backward compat)
+//
+// The actor's own literal name (e.g. "Kira Dawnblade.morale" when
+// Kira is acting) is also accepted, case-sensitive, exact match.
+// The template and system prompt advertise only `self.X` to keep
+// the convention simple; the literal-name form is a forgiving
+// fallback for LLMs that forget the prefix. Per Arcurus 2026-06-06
+// #openworld: "yes alow self or own name but no need to mention
+// that it can use own name".
+//
+// Cross-entity writes are DRY-RUN for now (parsed, routed, logged
+// in an aggregated warning, NOT applied). This lets us verify the
+// routing and catch typos / stale entity memories before the writes
+// go live.
 // and rescued a strict-parse failure, and `None` when the strict
 // `serde_json` parse succeeded on the first try. Returning the
 // warning (rather than swallowing it) keeps the recovery observable:
@@ -3570,286 +3862,52 @@ async fn process_action_handler(
             // the target entity id. O(1) per lookup; rebuilt
             // once per process call.
             let name_to_id = build_name_index(&world);
-            if let Some(entity) = world.entities.get_mut(&entity_id) {
-                let mut applied_effects = std::collections::HashMap::new();
-                let mut new_values = std::collections::HashMap::new();
-                let mut warnings: Vec<String> = Vec::new();
 
-                // Surface the tolerant-repair warning (if any) first
-                // so it shows up at the top of the warnings vec in
-                // the response and the LLM-call log. This makes
-                // the regex-fixup recovery visible to operators
-                // (per Arcurus 2026-06-05 #openworld: the World
-                // Clock's empty-key bug is recurring, and we need
-                // to know when our repair actually fires).
-                if let Some(w) = repair_warning {
-                    warnings.push(w);
-                }
+            // --- Effect-parse + apply (outside the actor's
+            // mutable borrow) ---
+            //
+            // We need the actor's name for parse_effects but NOT
+            // a mutable borrow of the actor entity, so we can
+            // fetch the name via a shared borrow and release it
+            // before the apply pass. The apply itself runs on
+            // `&mut world` (via `apply_all_effects`), so the
+            // entity mutable borrow can only start AFTER the
+            // apply completes.  Per Arcurus 2026-06-07 #openworld:
+            // this restructure is the cost of letting
+            // cross-entity writes actually apply — we mutate
+            // multiple entities in a single call.
+            let actor_name = world
+                .entities
+                .get(&entity_id)
+                .map(|e| e.name.clone())
+                .unwrap_or_default();
+            let (parsed_effects, unknown_entity_names) = parse_effects(
+                &action_data.effects,
+                entity_id,
+                &actor_name,
+                &name_to_id,
+            );
 
-                // System entities (world_clock, meta-tagged) are protected
-                // from LLM-driven property writes to prevent integer/float
-                // corruption of world state. The action is still recorded
-                // in history and the durable JSONL log, but effects are
-                // rejected with a warning. See todo c7f3bc27.
-                let protected_entity = entity.is_system_entity();
-                if protected_entity {
-                    warnings.push(format!(
-                        "Entity is a system entity (type={}, tags={:?}); LLM effect writes blocked.",
-                        entity.entity_type, entity.tags
-                    ));
-                }
+            let mut warnings: Vec<String> = Vec::new();
+            // Surface the tolerant-repair warning (if any) first
+            // so it shows up at the top of the warnings vec in
+            // the response and the LLM-call log. This makes
+            // the regex-fixup recovery visible to operators
+            // (per Arcurus 2026-06-05 #openworld).
+            if let Some(w) = repair_warning {
+                warnings.push(w);
+            }
 
-                // Effect-normalization pre-pass (Arcurus 2026-06-06
-                // #openworld): compute the total absolute magnitude of
-                // all numeric effects that would actually be applied
-                // (skipping protected entities and magnitude-rejected
-                // deltas), then derive a single scale factor so the
-                // applied total never exceeds 10% of the entity's
-                // effective power (floored at 10, with a hard 1-unit
-                // minimum cap).  Negative deltas count as positive for
-                // the cap check (the magnitude is what matters).
-                // String effects are not scaled (categorical).
-                let raw_power = entity.properties_int.get("power").copied().unwrap_or(0);
-                // Parse the LLM-emit effects map ONCE into a typed
-                // list with explicit targets. The pre-pass and the
-                // application loop both iterate this list, so they
-                // can never disagree on what counts as an actor
-                // effect vs a cross-entity (dry-run) effect.
-                // Per Arcurus 2026-06-06 #openworld.
-                let (parsed_effects, unknown_entity_names) = parse_effects(
-                    &action_data.effects,
-                    entity_id,
-                    &entity.name,
-                    &name_to_id,
-                );
-                // Single source of truth for the normalization
-                // scale; computed on the parsed list, so only
-                // Actor-targeted effects count toward the actor's
-                // 10%-of-power cap. Garbage (1e18) is rejected
-                // FIRST via `magnitude_check` so a single bad
-                // sibling cannot drag a small real effect down to
-                // a near-zero scaled value. Per Arcurus 2026-06-06
-                // #openworld.
-                let (effect_total_magnitude, effect_scale) =
-                    compute_actor_normalization_scale(
-                        raw_power,
-                        &parsed_effects,
-                        protected_entity,
-                    );
-                let effect_cap = compute_effect_normalization_cap(raw_power);
-                if effect_total_magnitude > effect_cap && effect_total_magnitude > 0.0 {
-                    warnings.push(format!(
-                            "Effects normalized: total |Δ|={:.3} exceeds cap {:.3} ({}% of max(10, power)={} + max-amount={}); scaled by {:.4}.",
-                            effect_total_magnitude, effect_cap,
-                            (EFFECT_NORMALIZATION_CAP_PCT * 100.0) as i64,
-                            std::cmp::max(10, raw_power),
-                            EFFECT_NORMALIZATION_MAX_AMOUNT as i64,
-                            effect_scale
-                        ));
-                    }
-                // Aggregated dry-run report for cross-entity
-                // effects. One warning per call, with the full
-                // list of effects and their target entity names.
-                // Per Arcurus 2026-06-06 #openworld.
-                let mut dry_run_report = DryRunReport::default();
+            // Apply effects to actor + any cross-entity targets.
+            // Per-target safety: system-entity guard, magnitude
+            // check, per-target normalization (cap from the
+            // target's own `power`), type handling. Per Arcurus
+            // 2026-06-07 #openworld: this replaces the old
+            // dry-run for cross-entity effects.
+            let (applied_effects, new_values, cross_entity_applied) =
+                apply_all_effects(&mut world, entity_id, &parsed_effects, &mut warnings);
 
-                for parsed in &parsed_effects {
-                    let prop_key = &parsed.prop_name;
-                    let raw_key = &parsed.raw_key;
-                    let change_val = &parsed.value;
-
-                    // Dispatch on target first — cross-entity
-                    // (Other) effects are dry-run and never write.
-                    // Per Arcurus 2026-06-06 #openworld.
-
-                    // Dispatch on target first — cross-entity
-                    // (Other) effects are dry-run and never write.
-                    // Per Arcurus 2026-06-06 #openworld.
-                    match &parsed.target {
-                        EffectTarget::Other { name, .. } => {
-                            if protected_entity {
-                                // Skip; the system-entity warning
-                                // already covers the whole batch.
-                                continue;
-                            }
-                            // Aggregate into the dry-run report;
-                            // one warning per call (after the loop).
-                            dry_run_report.add(name, raw_key, change_val);
-                            continue;
-                        }
-                        EffectTarget::Actor => {
-                            // Fall through to the actor-effect
-                            // application below.
-                        }
-                    }
-
-                    if protected_entity {
-                        // Skip writing effects on system entities but keep
-                        // tracking the count for the response payload.
-                        warnings.push(format!(
-                            "Skipped effect on system entity: {}={:?}",
-                            raw_key, change_val
-                        ));
-                        continue;
-                    }
-
-                    // Magnitude guard: LLM occasionally emits huge garbage
-                    // values (e.g. 1e18 for "power") that get added to the
-                    // property and corrupt the entity forever. Cap the
-                    // absolute size of both the delta and the result so a
-                    // single bad response can't poison world state. See
-                    // todo 2df49bd8.
-                    if let Some(reason) = magnitude_check(change_val) {
-                        warnings.push(format!(
-                            "Skipped effect on '{}': {} (value={:?})",
-                            raw_key, reason, change_val
-                        ));
-                        continue;
-                    }
-
-                    // Determine value type and convert appropriately
-                    let (int_val, float_val, string_val) = match change_val {
-                        // Bool -> int (true=1, false=0)
-                        serde_json::Value::Bool(b) => {
-                            let v = if *b { 1 } else { 0 };
-                            (Some(v as i64), None, None)
-                        }
-                        // Number -> int or float. Anything with a decimal point is float.
-                        serde_json::Value::Number(n) => {
-                            if n.is_i64() {
-                                // Pure integer -> int property
-                                (Some(n.as_i64().unwrap()), None, None)
-                            } else {
-                                // Float (including 1.0, 0.5, etc.) -> float property
-                                (None, n.as_f64(), None)
-                            }
-                        }
-                        // String -> parse as number or string
-                        serde_json::Value::String(s) => {
-                            let trimmed = s.trim();
-                            // Try parsing as integer first
-                            if let Ok(v) = trimmed.parse::<i64>() {
-                                (Some(v), None, None)
-                            // Then as float (anything with a decimal point)
-                            } else if let Ok(v) = trimmed.parse::<f64>() {
-                                if v.fract() == 0.0 && v.abs() < 1e15 && !trimmed.contains('.') {
-                                    // Looks like int in string form (no decimal point)
-                                    (Some(v as i64), None, None)
-                                } else {
-                                    // Has decimal point or looks like a float -> float property
-                                    (None, Some(v), None)
-                                }
-                            } else {
-                                // Not a number -> string property
-                                (None, None, Some(trimmed.to_string()))
-                            }
-                        }
-                        // Null, Array, Object -> skip with warning
-                        _ => {
-                            warnings.push(format!("Unsupported effect type for '{}': {:?}", raw_key, change_val));
-                            continue;
-                        }
-                    };
-
-                    // Apply the per-turn effect-normalization scale to
-                    // numeric deltas.  String effects are not scaled
-                    // (they're categorical and there's no magnitude
-                    // to cap).  The scale was computed in the pre-pass
-                    // above; 1.0 means no normalization was needed.
-                    let (int_val, float_val) = (
-                        int_val.map(|v| ((v as f64) * effect_scale).round() as i64),
-                        float_val.map(|v| v * effect_scale),
-                    );
-
-                    // Check which property stores this key (int, float, or string)
-                    // — the BARE property name (no `self.` or
-                    // `EntityName.` prefix), so e.g. "self.morale"
-                    // and "Kira Dawnblade.morale" both write to
-                    // the actor's "morale" property.
-                    let is_in_int = entity.properties_int.contains_key(prop_key);
-                    let is_in_float = entity.properties_float.contains_key(prop_key);
-                    let is_in_string = entity.properties_string.contains_key(prop_key);
-
-                    // Apply to the existing property type, or create the right type
-                    if let Some(val) = int_val {
-                        if is_in_float {
-                            warnings.push(format!("Type mismatch: '{}' is float, tried to set int ({}). Skipped.", prop_key, val));
-                            continue;
-                        }
-                        if is_in_string {
-                            warnings.push(format!("Type mismatch: '{}' is string, tried to set int ({}). Skipped.", prop_key, val));
-                            continue;
-                        }
-
-                        // Get or create the int property
-                        let old_val = *entity.properties_int.get(prop_key).unwrap_or(&0);
-                        let new_val = old_val.checked_add(val).unwrap_or_else(|| {
-                            warnings.push(format!(
-                                "Integer overflow on '{}' (old={}, delta={}); clamped to {}",
-                                prop_key, old_val, val, MAX_INT_ABS
-                            ));
-                            MAX_INT_ABS
-                        });
-                        if int_oversize(new_val) {
-                            warnings.push(format!(
-                                "Skipped oversize int write on '{}': new_val={} (|val| > {})",
-                                prop_key, new_val, MAX_INT_ABS
-                            ));
-                            continue;
-                        }
-                        entity.properties_int.insert(prop_key.clone(), new_val);
-                        applied_effects.insert(prop_key.clone(), serde_json::json!(new_val));
-                        new_values.insert(prop_key.clone(), serde_json::json!(new_val));
-                    } else if let Some(val) = float_val {
-                        if is_in_int {
-                            warnings.push(format!("Type mismatch: '{}' is int, tried to set float ({}). Skipped.", prop_key, val));
-                            continue;
-                        }
-                        if is_in_string {
-                            warnings.push(format!("Type mismatch: '{}' is string, tried to set float ({}). Skipped.", prop_key, val));
-                            continue;
-                        }
-
-                        let old_val = *entity.properties_float.get(prop_key).unwrap_or(&0.0);
-                        let new_val = old_val + val;
-                        if float_oversize(new_val) {
-                            warnings.push(format!(
-                                "Skipped oversize float write on '{}': new_val={}",
-                                prop_key, new_val
-                            ));
-                            continue;
-                        }
-                        entity.properties_float.insert(prop_key.clone(), new_val);
-                        applied_effects.insert(prop_key.clone(), serde_json::json!(new_val));
-                        new_values.insert(prop_key.clone(), serde_json::json!(new_val));
-                    } else if let Some(ref val) = string_val {
-                        if is_in_int {
-                            warnings.push(format!("Type mismatch: '{}' is int, tried to set string value={:?}. Skipped.", prop_key, val));
-                            continue;
-                        }
-                        if is_in_float {
-                            warnings.push(format!("Type mismatch: {} is float, tried to set string (val=\"{}\"). Skipped.", prop_key, val));
-                            continue;
-                        }
-
-                        // String: set the value (not additive, just replace)
-                        entity.properties_string.insert(prop_key.clone(), val.clone());
-                        applied_effects.insert(prop_key.clone(), serde_json::json!(val));
-                        new_values.insert(prop_key.clone(), serde_json::json!(val));
-                    }
-                }
-
-                // Emit the aggregated dry-run warning (ONE per
-                // call, regardless of how many cross-entity
-                // effects there are). Per Arcurus 2026-06-06
-                // #openworld: "make one warning message and
-                // include all stats and entities that are
-                // impacting otherentities".
-                if let Some(w) = dry_run_report.to_warning() {
-                    warnings.push(w);
-                }
-
-                // Emit the aggregated unknown-entity warning.
+            // Emit the aggregated unknown-entity warning.
                 // One per call, listing the de-duped names that
                 // the LLM referenced but that don't exist in
                 // the world. (The corresponding effects are
@@ -3875,7 +3933,27 @@ async fn process_action_handler(
                     warnings.push(w);
                 }
 
-                // NOTE: log_llm() + history_entry build are deferred
+                if let Some(entity) = world.entities.get_mut(&entity_id) {
+                    // System entities (world_clock, meta-tagged)
+                    // are protected from LLM-driven property writes
+                    // to prevent integer/float corruption of world
+                    // state.  The action is still recorded in
+                    // history and the durable JSONL log, but effects
+                    // are rejected with a warning.  See todo
+                    // c7f3bc27.  (The actual effect guard is
+                    // inside `apply_effects_to_target` — we also
+                    // emit a single summary warning here so
+                    // operators see at a glance that the actor
+                    // is protected.)
+                    let protected_entity = entity.is_system_entity();
+                    if protected_entity {
+                        warnings.push(format!(
+                            "Entity is a system entity (type={}, tags={:?}); LLM effect writes blocked.",
+                            entity.entity_type, entity.tags
+                        ));
+                    }
+
+                    // NOTE: log_llm() + history_entry build are deferred
                 // to AFTER the history_summary handling below, so the
                 // `warnings` vec they capture includes "Both" / "Neither"
                 // / truncation warnings. Moved per Arcurus 2026-06-04
@@ -4103,6 +4181,7 @@ async fn process_action_handler(
                     "outcome": action_data.outcome,
                     "effects_applied": applied_effects,
                     "new_values": new_values,
+                    "cross_entity_effects_applied": cross_entity_applied,
                     "narrative": action_data.narrative,
                     "history_summary": applied_summary,
                     "warnings": warnings,
@@ -5963,35 +6042,6 @@ mod effect_normalization_tests {
             "actor scale should be 1.0 (5.0 < cap of 10), got {scale}");
     }
 
-    #[test]
-    fn dry_run_report_aggregates_by_entity() {
-        // The report is per-entity (BTreeMap) with the full
-        // list of effects for each. Per Arcurus 2026-06-06
-        // #openworld: "make one warning message and include
-        // all stats and entities that are impacting
-        // otherentities".
-        let mut r = DryRunReport::default();
-        r.add("Mira the Merchant", "Mira the Merchant.wealth", &serde_json::json!(-2.0));
-        r.add("Mira the Merchant", "Mira the Merchant.reputation", &serde_json::json!(1.0));
-        r.add("Whisperwood Forest", "Whisperwood Forest.knowledge", &serde_json::json!(3.0));
-        assert_eq!(r.total_effects(), 3);
-        assert_eq!(r.total_entities(), 2);
-        let w = r.to_warning().unwrap();
-        assert!(w.contains("3 effect(s)"), "stats in warning: {w}");
-        assert!(w.contains("2 other entities"), "stats in warning: {w}");
-        assert!(w.contains("Mira the Merchant"), "target name in warning: {w}");
-        assert!(w.contains("Whisperwood Forest"), "target name in warning: {w}");
-        assert!(w.contains("Mira the Merchant.wealth"), "raw key in warning: {w}");
-    }
-
-    #[test]
-    fn dry_run_report_empty_returns_none() {
-        // No dry-run effects → no warning, to keep the response
-        // clean.
-        let r = DryRunReport::default();
-        assert!(r.to_warning().is_none());
-    }
-
     /// The same algorithm the pre-pass uses, lifted out for testing.
     /// Returns the scale factor (1.0 if no normalization is needed).
     fn compute_scale(
@@ -6169,6 +6219,230 @@ mod effect_normalization_tests {
         assert!((EFFECT_NORMALIZATION_CAP_PCT - 0.10).abs() < 1e-9);
         assert!((EFFECT_NORMALIZATION_MAX_AMOUNT - 10.0).abs() < 1e-9);
         assert!((EFFECT_NORMALIZATION_MIN_CAP - 1.0).abs() < 1e-9);
+    }
+
+    // ---- Cross-entity apply tests (Arcurus 2026-06-07 #openworld) ----
+    //
+    // The previous dry-run tests (which are now removed) tested
+    // the `DryRunReport` struct. The new tests below cover the
+    // replacement behavior: cross-entity effects actually apply,
+    // with per-target safety (system-entity guard, per-target
+    // normalization, type handling).
+
+    /// Minimal world with one actor (Kira) and one other (Mira).
+    fn make_two_entity_world() -> (World, Uuid, Uuid) {
+        let mut world = World::new("test");
+        let mut actor = WorldEntity::new("hero", "Kira Dawnblade", 0.0, 0.0);
+        actor.properties_int.insert("power".to_string(), 100);
+        actor.properties_int.insert("morale".to_string(), 50);
+        let mut other = WorldEntity::new("merchant", "Mira the Merchant", 100.0, 0.0);
+        other.properties_int.insert("power".to_string(), 50);
+        other.properties_int.insert("wealth".to_string(), 100);
+        let actor_id = actor.id;
+        let other_id = other.id;
+        world.entities.insert(actor.id, actor);
+        world.entities.insert(other.id, other);
+        (world, actor_id, other_id)
+    }
+
+    #[test]
+    fn cross_entity_effect_applies_to_named_target() {
+        // Per Arcurus 2026-06-07 #openworld: cross-entity writes
+        // are no longer dry-run. The LLM proposes an effect on
+        // "Mira the Merchant.wealth" and Mira's wealth actually
+        // changes.
+        let (mut world, actor_id, other_id) = make_two_entity_world();
+        // Integer value (-5) so the int property doesn't trigger
+        // the type-mismatch path. The LLM emits integer values
+        // in practice; float values for int properties are
+        // rejected as type-mismatches (intentional).
+        let parsed = vec![ParsedEffect {
+            target: EffectTarget::Other {
+                name: "Mira the Merchant".to_string(),
+                id: other_id,
+            },
+            prop_name: "wealth".to_string(),
+            raw_key: "Mira the Merchant.wealth".to_string(),
+            value: serde_json::json!(-5),
+        }];
+        let mut warnings = Vec::new();
+        let (actor_applied, _actor_nvs, cross) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+        // Actor has no effects, so its map is empty.
+        assert!(actor_applied.is_empty(), "actor should have no applied effects");
+        // Mira's wealth went from 100 to 95.
+        let mira = world.entities.get(&other_id).unwrap();
+        assert_eq!(mira.properties_int.get("wealth"), Some(&95));
+        // The cross-entity map should have Mira's wealth update.
+        assert!(cross.contains_key("Mira the Merchant"),
+            "cross-entity map should be keyed by entity name: {cross:?}");
+        assert_eq!(cross["Mira the Merchant"]["wealth"], serde_json::json!(95));
+        // No warnings expected for a clean small effect.
+        assert!(warnings.is_empty(), "no warnings expected, got: {warnings:?}");
+    }
+
+    #[test]
+    fn actor_and_cross_entity_effects_both_apply() {
+        // A single LLM call with both self.X and Other.Y keys
+        // should apply BOTH. The actor's morale changes and
+        // Mira's wealth changes.
+        let (mut world, actor_id, other_id) = make_two_entity_world();
+        let parsed = vec![
+            ParsedEffect {
+                target: EffectTarget::Actor,
+                prop_name: "morale".to_string(),
+                raw_key: "self.morale".to_string(),
+                value: serde_json::json!(5),
+            },
+            ParsedEffect {
+                target: EffectTarget::Other {
+                    name: "Mira the Merchant".to_string(),
+                    id: other_id,
+                },
+                prop_name: "wealth".to_string(),
+                raw_key: "Mira the Merchant.wealth".to_string(),
+                value: serde_json::json!(10),
+            },
+        ];
+        let mut warnings = Vec::new();
+        let (actor_applied, _actor_nvs, cross) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+        // Kira's morale: 50 + 5 = 55.
+        let kira = world.entities.get(&actor_id).unwrap();
+        assert_eq!(kira.properties_int.get("morale"), Some(&55));
+        assert_eq!(actor_applied["morale"], serde_json::json!(55));
+        // Mira's wealth: 100 + 10 = 110.
+        let mira = world.entities.get(&other_id).unwrap();
+        assert_eq!(mira.properties_int.get("wealth"), Some(&110));
+        assert_eq!(cross["Mira the Merchant"]["wealth"], serde_json::json!(110));
+    }
+
+    #[test]
+    fn cross_entity_target_system_entity_is_rejected() {
+        // Per Arcurus 2026-06-07 #openworld: the previous dry-run
+        // implicitly protected system entities. Now that
+        // cross-entity writes apply, the protection is explicit
+        // in `apply_effects_to_target`. An LLM that names the
+        // World Clock in an effect must be warned, not silently
+        // overwrite the system entity.
+        let mut world = World::new("test");
+        let mut actor = WorldEntity::new("hero", "Kira Dawnblade", 0.0, 0.0);
+        actor.properties_int.insert("power".to_string(), 100);
+        let actor_id = actor.id;
+        world.entities.insert(actor.id, actor);
+        // Build the world clock (auto-created by World::new).
+        let clock_id = world.entities.values()
+            .find(|e| e.is_system_entity())
+            .unwrap().id;
+        let clock_name = world.entities.get(&clock_id).unwrap().name.clone();
+        // Snapshot clock.history_entries before the effect.
+        let clock_before = world.entities.get(&clock_id).unwrap()
+            .properties_int.get("history_entries").copied().unwrap_or(0);
+        let parsed = vec![ParsedEffect {
+            target: EffectTarget::Other {
+                name: clock_name.clone(),
+                id: clock_id,
+            },
+            prop_name: "history_entries".to_string(),
+            raw_key: format!("{clock_name}.history_entries"),
+            value: serde_json::json!(1.0),
+        }];
+        let mut warnings = Vec::new();
+        let (actor_applied, _actor_nvs, cross) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+        // Actor has nothing applied.
+        assert!(actor_applied.is_empty());
+        // Cross-entity map should NOT contain the clock.
+        assert!(!cross.contains_key(&clock_name),
+            "system-entity effect must not appear in cross-entity applied: {cross:?}");
+        // Clock's history_entries unchanged.
+        let clock_after = world.entities.get(&clock_id).unwrap()
+            .properties_int.get("history_entries").copied().unwrap_or(0);
+        assert_eq!(clock_before, clock_after,
+            "system-entity write must be rejected (no change to clock)");
+        // Warning emitted.
+        assert!(warnings.iter().any(|w| w.contains("Skipped effect on system entity")),
+            "expected a 'Skipped effect on system entity' warning, got: {warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains(&clock_name)),
+            "warning should name the system entity: {warnings:?}");
+    }
+
+    #[test]
+    fn cross_entity_per_target_normalization_uses_target_power() {
+        // Per Arcurus 2026-06-07 #openworld: each target gets
+        // its own cap, computed from its own `power`. A
+        // low-power target has a tighter cap. The actor's cap
+        // doesn't protect a low-power target.
+        let (mut world, actor_id, other_id) = make_two_entity_world();
+        // Mira has power=50, cap = 50*0.10 + 10 = 15.
+        // A total |Δ| of 20 on Mira's wealth should scale to 15.
+        // The actor (power=100, cap=20) is unaffected because
+        // the actor has no effects in this test.
+        let parsed = vec![ParsedEffect {
+            target: EffectTarget::Other {
+                name: "Mira the Merchant".to_string(),
+                id: other_id,
+            },
+            prop_name: "wealth".to_string(),
+            raw_key: "Mira the Merchant.wealth".to_string(),
+            value: serde_json::json!(20),
+        }];
+        let mut warnings = Vec::new();
+        let (_actor_applied, _actor_nvs, cross) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+        // Mira's wealth: 100 + 20 (scaled to 15) = 115.
+        let mira = world.entities.get(&other_id).unwrap();
+        assert_eq!(mira.properties_int.get("wealth"), Some(&115),
+            "cross-entity effect should scale to target's cap of 15 (not actor's cap of 20)");
+        // Per-target normalization warning emitted (target name in warning).
+        assert!(warnings.iter().any(|w| w.contains("Effects normalized on 'Mira the Merchant'")),
+            "expected per-target 'Effects normalized' warning, got: {warnings:?}");
+    }
+
+    #[test]
+    fn cross_entity_garbage_value_does_not_drag_sibling_to_zero() {
+        // The same regression the actor-side test covers, but
+        // for cross-entity targets. A 1e18 sibling on Mira must
+        // be excluded from Mira's total, so Mira's small real
+        // effect is applied at its literal value.
+        let (mut world, actor_id, other_id) = make_two_entity_world();
+        // The LLM emits a small +5 on wealth AND a 1e18 garbage
+        // value. The 1e18 must be rejected BEFORE the scale is
+        // computed.
+        let parsed = vec![
+            ParsedEffect {
+                target: EffectTarget::Other {
+                    name: "Mira the Merchant".to_string(),
+                    id: other_id,
+                },
+                prop_name: "wealth".to_string(),
+                raw_key: "Mira the Merchant.wealth".to_string(),
+                value: serde_json::json!(5),
+            },
+            ParsedEffect {
+                target: EffectTarget::Other {
+                    name: "Mira the Merchant".to_string(),
+                    id: other_id,
+                },
+                prop_name: "evil_garbage".to_string(),
+                raw_key: "Mira the Merchant.evil_garbage".to_string(),
+                value: serde_json::json!(1e18),
+            },
+        ];
+        let mut warnings = Vec::new();
+        let (_actor_applied, _actor_nvs, cross) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings);
+        // Mira's wealth: 100 + 5 = 105. The 1e18 was rejected,
+        // so the scale is 1.0 and the small effect is applied
+        // at its literal value.
+        let mira = world.entities.get(&other_id).unwrap();
+        assert_eq!(mira.properties_int.get("wealth"), Some(&105),
+            "garbage sibling must not drag cross-entity small effect to ~0");
+        // The garbage write is also rejected, with a warning.
+        assert!(!mira.properties_int.contains_key("evil_garbage"),
+            "garbage property must not be written");
+        assert!(warnings.iter().any(|w| w.contains("evil_garbage") || w.contains("MAX_DELTA_ABS")),
+            "expected a magnitude-rejection warning for the garbage value: {warnings:?}");
     }
 }
 

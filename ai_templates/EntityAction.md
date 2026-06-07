@@ -41,7 +41,7 @@ If the entity already has a property (e.g. `wealth`, `power`, `morale`), use tha
 **Multi-entity effects (key format `entityname.property_name`):**
 - For effects on the **actor** (yourself), prefix with `self.`: e.g. `self.morale: +5`, `self.power: -2`.
 - For effects on **other entities** the action impacts, use their exact name (as it appears in the world) followed by `.property_name`: e.g. `Mira the Merchant.wealth: -3`, `The Sunken Temple.magical_activity: +2`.
-- The server resolves the name to the entity, and for now **DRY-RUNS the cross-entity writes** — it parses them, logs what would have happened, and applies only your self-effects. You'll see the dry-run result in the warnings so you can verify the routing next turn.
+- The server resolves the name to the entity and **applies the effect to that entity** (it is no longer dry-run). Per-target safety nets are in place: magnitude cap (no single delta > 1e6), per-target normalization (each target's cap is computed from its own `power`, with a +10 max-amount baseline), and the system-entity guard (the World Clock and anything tagged `meta` cannot be written to). You'll see a per-target `Effects normalized on '<name>':` warning if a target's cap is hit, or `Skipped effect on system entity ...` for system-entity targets.
 - **Emit at least one effect per entity you impact in the action** (including yourself), so each entity's history can track the ripple. If your `narrative` mentions a specific entity being affected, that entity should appear in your `effects`.
 - Property names on the right-hand side of the dot still follow the "use existing property names" rule above.
 
