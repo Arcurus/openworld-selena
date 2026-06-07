@@ -135,6 +135,79 @@ pub fn load_for_entity_at(
     matching
 }
 
+/// Load the most recent N world actions across ALL entities,
+/// optionally filtering to entries strictly after `after_ts`.
+///
+/// This is the cross-entity feed used by the LLM action prompt so
+/// the actor can see what else has been happening in the world.
+/// Per Arcurus 2026-06-07 (#openworld): "add to the world action
+/// llm call an insertion of not yet processed world actions".
+///
+/// "Not yet processed" is modelled as: every entry in the
+/// `action_history.jsonl` log with `timestamp > actor.last_action_at`
+/// (or, if the actor has never acted, every entry). The caller is
+/// expected to do any final filtering (e.g. drop the actor's own
+/// most recent action that triggered the current LLM call, drop
+/// system-entity actions) before rendering the prompt block — this
+/// function is deliberately raw.
+///
+/// Returns the entries in most-recent-first order, capped at `limit`.
+pub fn load_recent_world_actions(limit: usize, after_ts: Option<DateTime<Utc>>) -> Vec<ActionHistoryEntry> {
+    load_recent_world_actions_at(limit, after_ts, &history_path())
+}
+
+/// Path-parameterized variant of [`load_recent_world_actions`].
+/// Public so tests and any future non-default storage can target a
+/// different file.
+pub fn load_recent_world_actions_at(
+    limit: usize,
+    after_ts: Option<DateTime<Utc>>,
+    path: &Path,
+) -> Vec<ActionHistoryEntry> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    // The file is chronological (oldest first). We collect all
+    // matching entries that satisfy the after_ts filter, then
+    // truncate to the most recent `limit` from the tail (cheaper
+    // than sorting the whole thing if the log is large).
+    let mut matching: Vec<ActionHistoryEntry> = Vec::new();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: ActionHistoryEntry = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if let Some(cutoff) = after_ts {
+            if entry.timestamp <= cutoff {
+                continue;
+            }
+        }
+        matching.push(entry);
+    }
+    // Truncate from the head to keep only the most recent `limit`
+    // (the tail of `matching` is the newest because the log is
+    // chronological).
+    if matching.len() > limit {
+        let drop_n = matching.len() - limit;
+        matching.drain(0..drop_n);
+    }
+    // Reverse to most-recent-first.
+    matching.reverse();
+    matching
+}
+
 /// Total entries for a given entity (cheap, for stats / debug).
 pub fn count_for_entity(entity_id: &str) -> usize {
     count_for_entity_at(entity_id, &history_path())
@@ -271,6 +344,109 @@ mod tests {
         // No append — file does not exist yet
         assert!(load_for_entity_at("e1", 10, &path).is_empty());
         assert_eq!(count_for_entity_at("e1", &path), 0);
+    }
+
+    // -- load_recent_world_actions tests ------------------------------
+    // Per Arcurus 2026-06-07 (#openworld): cross-entity feed used to
+    // surface "not yet processed" world actions to the LLM prompt.
+    // Helper makes one entry per call so test bodies stay readable.
+    fn make_entry_full(
+        entity_id: &str,
+        entity_name: &str,
+        action: &str,
+        ts_secs: i64,
+    ) -> ActionHistoryEntry {
+        ActionHistoryEntry {
+            entity_id: entity_id.to_string(),
+            entity_name: entity_name.to_string(),
+            timestamp: DateTime::<Utc>::from_timestamp(ts_secs, 0).unwrap(),
+            action: action.to_string(),
+            outcome: format!("outcome for {}", action),
+            details: String::new(),
+            effects: serde_json::Map::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn load_recent_returns_all_when_no_after_ts() {
+        let path = fresh_log_path();
+        // 3 entries across 2 entities, oldest -> newest.
+        append_entry_at(&make_entry_full("e1", "A", "a1", 1000), &path).unwrap();
+        append_entry_at(&make_entry_full("e2", "B", "b1", 2000), &path).unwrap();
+        append_entry_at(&make_entry_full("e1", "A", "a2", 3000), &path).unwrap();
+        let v = load_recent_world_actions_at(10, None, &path);
+        assert_eq!(v.len(), 3);
+        // Most-recent-first order
+        assert_eq!(v[0].action, "a2");
+        assert_eq!(v[1].action, "b1");
+        assert_eq!(v[2].action, "a1");
+    }
+
+    #[test]
+    fn load_recent_respects_limit() {
+        let path = fresh_log_path();
+        for i in 0..5 {
+            append_entry_at(
+                &make_entry_full("e1", "A", &format!("a{}", i), 1000 + i),
+                &path,
+            )
+            .unwrap();
+        }
+        let v = load_recent_world_actions_at(3, None, &path);
+        assert_eq!(v.len(), 3);
+        // The last 3 written are a2, a3, a4 (most-recent-first)
+        assert_eq!(v[0].action, "a4");
+        assert_eq!(v[1].action, "a3");
+        assert_eq!(v[2].action, "a2");
+    }
+
+    #[test]
+    fn load_recent_filters_by_after_ts() {
+        let path = fresh_log_path();
+        append_entry_at(&make_entry_full("e1", "A", "old_a", 1000), &path).unwrap();
+        append_entry_at(&make_entry_full("e2", "B", "old_b", 1500), &path).unwrap();
+        append_entry_at(&make_entry_full("e1", "A", "new_a", 2000), &path).unwrap();
+        append_entry_at(&make_entry_full("e2", "B", "new_b", 2500), &path).unwrap();
+        // after_ts = 1500 strictly: drops entries at t=1000 and t=1500,
+        // keeps t=2000 and t=2500.
+        let cutoff = DateTime::<Utc>::from_timestamp(1500, 0).unwrap();
+        let v = load_recent_world_actions_at(10, Some(cutoff), &path);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].action, "new_b");
+        assert_eq!(v[1].action, "new_a");
+    }
+
+    #[test]
+    fn load_recent_empty_when_file_missing() {
+        let mut dir = env::temp_dir();
+        dir.push(format!("ow-missing-recent-{}", Uuid::new_v4()));
+        let path = history_path_at(&dir);
+        assert!(load_recent_world_actions_at(10, None, &path).is_empty());
+        // Even with a cutoff
+        let cutoff = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        assert!(load_recent_world_actions_at(10, Some(cutoff), &path).is_empty());
+    }
+
+    #[test]
+    fn load_recent_skips_garbled_lines() {
+        // Mix a malformed line in with good entries; the loader must
+        // skip it without panicking.
+        let path = fresh_log_path();
+        append_entry_at(&make_entry_full("e1", "A", "good_a", 1000), &path).unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "{{ this is not valid json").unwrap();
+        }
+        append_entry_at(&make_entry_full("e2", "B", "good_b", 2000), &path).unwrap();
+        let v = load_recent_world_actions_at(10, None, &path);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].action, "good_b");
+        assert_eq!(v[1].action, "good_a");
     }
 
     // Bring Uuid into scope for the test helpers above

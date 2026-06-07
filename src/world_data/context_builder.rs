@@ -1281,20 +1281,28 @@ mod tests {
         world.entities.insert(me_id, me.clone());
         world.entities.insert(other_id, other.clone());
 
-        // Feed: 1 most-recent by Other, then 1 by Me (older).
+        // Feed (most-recent first):
+        //   [0] Other do_x at 3000   (newest, surfaces)
+        //   [1] Me    do_y at 2000   (newest Me — gets dropped as
+        //                            "the action the LLM is generating")
+        //   [2] Me    do_z at 1000   (older Me — MUST still surface)
         let raw = vec![
             entry_at(&other_id.to_string(), "Other", "do_x", "x outcome", 3000),
             entry_at(&me_id.to_string(), "Me", "do_y", "y outcome", 2000),
+            entry_at(&me_id.to_string(), "Me", "do_z", "z outcome", 1000),
         ];
         let result = build_recent_world_actions_str(&world, &me, &raw);
         assert!(result.starts_with("## Recent World Actions"));
         // Other's action is rendered
         assert!(result.contains("**Other**"), "got: {}", result);
         assert!(result.contains("`do_x`"), "got: {}", result);
-        // Me's OLDER action also surfaces (we only drop the most-recent
-        // Me entry, not all of them)
+        // The newest Me entry (do_y) is the one being generated, so
+        // it must NOT appear.
+        assert!(!result.contains("`do_y`"), "newest Me entry leaked: {}", result);
+        // The older Me entry (do_z) MUST still surface — we only
+        // drop the most-recent Me entry, not all of them.
         assert!(result.contains("**Me**"), "got: {}", result);
-        assert!(result.contains("`do_y`"), "got: {}", result);
+        assert!(result.contains("`do_z`"), "older Me entry missing: {}", result);
     }
 
     #[test]
