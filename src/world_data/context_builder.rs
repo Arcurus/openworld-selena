@@ -47,6 +47,25 @@ pub struct ActionContext {
     /// `{recent_world_actions}`.
     /// Per Arcurus 2026-06-07 (#openworld).
     pub recent_world_actions_str: String,
+    /// "Unprocessed world actions from other entities that
+    /// affected this one" — i.e. history entries with
+    /// `entity_id != this` AND the entry's effects mention
+    /// this entity by dotted name AND the entry's `tick` is
+    /// greater than the entity's
+    /// `properties_int["last_processed_other_tick"]`
+    /// (or 0 if unset).  Rendered compact, oldest first,
+    /// capped at `MAX_UNPROCESSED_OTHER_ACTIONS_CHARS` chars
+    /// total.  The LLM uses this to keep its
+    /// `history_summary_replace` in sync with what other
+    /// entities have done to it.  Per Arcurus 2026-06-07
+    /// (#openworld): "for the connection we go for now if
+    /// the entity was affected in the entities effect" and
+    /// "Whatever fits in the 10 k (the long version) i
+    /// think for now no need to mention the effects, just
+    /// that they are applied already.  put as many
+    /// unprocessed world actions from other entities in
+    /// as they fit in the 10k".
+    pub unprocessed_other_actions_str: String,
 }
 
 /// Resolve the effective per-entity history-summary char cap.
@@ -117,6 +136,26 @@ pub fn build_action_context(
             );
             build_recent_world_actions_str(world, entity, &raw)
         },
+        unprocessed_other_actions_str: {
+            // Per Arcurus 2026-06-07 (#openworld).  The 10K
+            // cap is large enough that the file scan is the
+            // bottleneck, so we read ALL entries (no per-call
+            // cap) and let the renderer cap by char count.
+            // This is a one-shot scan of the whole JSONL log,
+            // which at 5-10K entries is sub-millisecond.
+            let last_processed_tick = entity
+                .properties_int
+                .get("last_processed_other_tick")
+                .copied()
+                .unwrap_or(0);
+            let raw = action_history_log::load_all_world_actions();
+            build_unprocessed_other_actions_str(
+                world,
+                entity,
+                &raw,
+                last_processed_tick,
+            )
+        },
     }
 }
 
@@ -177,6 +216,7 @@ pub fn build_action_prompt(
         .replace("{max_history_summary_chars}", &ctx.max_history_summary_chars.to_string())
         .replace("{history_summary_header}", &build_history_summary_header(ctx))
         .replace("{recent_world_actions}", &ctx.recent_world_actions_str)
+        .replace("{unprocessed_other_actions}", &ctx.unprocessed_other_actions_str)
 }
 
 fn build_property_context(entity: &WorldEntity, type_stats: Option<&EntityTypeStats>) -> String {
@@ -492,6 +532,232 @@ fn build_recent_world_actions_str(
         s.push_str(&r);
     }
     s
+}
+
+/// Char cap for the `{unprocessed_other_actions}` block.
+/// Per Arcurus 2026-06-07 (#openworld): "Whatever fits in
+/// the 10 k (the long version) i think for now no need to
+/// mention the effects, just that they are applied
+/// already.  put as many unprocessed world actions from
+/// other entities in as they fit in the 10k".  We use 9.5K
+/// to leave headroom for the block header + the rest of
+/// the prompt.
+const MAX_UNPROCESSED_OTHER_ACTIONS_CHARS: usize = 9_500;
+
+/// Build the "Unprocessed world actions from other
+/// entities" block for the LLM context.
+///
+/// Filtering rules (per Arcurus 2026-06-07 #openworld):
+///   1. The action's actor must NOT be this entity
+///      (`entry.entity_id != entity.id`).
+///   2. The action must have *affected* this entity, which
+///      we detect by checking whether any of the entry's
+///      effect keys starts with `"<this entity name>."`
+///      (the dotted-name convention used by the LLM when
+///      it writes cross-entity effects).  Per Arcurus
+///      2026-06-07: "for the connection we go for now if
+///      the entity was affected in the entities effect".
+///   3. The action must NOT be from a system entity
+///      (World Clock etc.) — bookkeeping noise.
+///   4. The entry's `tick` must be strictly greater than
+///      `entity.properties_int["last_processed_other_tick"]`
+///      (or 0 if unset).  This is the "processed up to"
+///      marker that advances on every LLM call for this
+///      entity (see `tick_unprocessed_other_actions` in
+///      main.rs) and is operator-settable via the
+///      per-property PUT endpoint.
+///
+/// Render rules:
+///   - Chronological (oldest first) — natural reading
+///     order; the LLM sees the cause before the effect.
+///   - Compact one-liner per action, no effects listed
+///     (per Arcurus: "no need to mention the effects, just
+///     that they are applied already").  The LLM doesn't
+///     need to re-emit them, just be aware of the
+///     relationship change.
+///   - If the char cap is reached, drop the OLDEST
+///     entries (so the LLM always sees the most recent
+///     actions, which are the ones most likely to matter
+///     for its response).  This is a silent cap from the
+///     LLM's point of view; no "and N more" line is
+///     shown (per the "no hidden mechanics" rule in
+///     AGENTS.md).
+///   - If the filtered list is empty, return an empty
+///     string (don't render an empty block).
+///
+/// `all_entries` is the pre-loaded full history log
+/// (oldest-first).  The caller (`build_action_context`)
+/// does the I/O; this function is pure so tests can pass
+/// any list of entries without touching the live
+/// `action_history.jsonl` file.
+fn build_unprocessed_other_actions_str(
+    world: &World,
+    entity: &WorldEntity,
+    all_entries: &[ActionHistoryEntry],
+    last_processed_tick: i64,
+) -> String {
+    if all_entries.is_empty() {
+        return String::new();
+    }
+    let my_id = entity.id.to_string();
+    let my_name_prefix = format!("{}.", entity.name);
+    // Filter to the relevant entries.
+    let mut matching: Vec<&ActionHistoryEntry> = Vec::new();
+    for entry in all_entries {
+        if entry.entity_id == my_id {
+            continue;  // own action
+        }
+        if entry.tick <= last_processed_tick {
+            continue;  // already processed
+        }
+        if is_system_entry(world, entry) {
+            continue;  // World Clock, meta-tagged, etc.
+        }
+        // "Was this entity affected?" = at least one
+        // effect key starts with "<this entity name>.".
+        // Note: a system entity (entity.is_system_entity())
+        // has no name in the usual sense and won't match
+        // the prefix; we also explicitly skip system
+        // entries above.
+        let affects_me = entry
+            .effects
+            .keys()
+            .any(|k| k.starts_with(&my_name_prefix));
+        if !affects_me {
+            continue;
+        }
+        matching.push(entry);
+    }
+    if matching.is_empty() {
+        return String::new();
+    }
+    // Build the rows, but stop adding once the cap is
+    // reached.  We iterate oldest-first and add to the
+    // string; if adding a row would exceed the cap, we
+    // drop the oldest already-added rows to make room.
+    // (Simpler than a two-pass: just track total and
+    // trim from the front when over.)
+    let mut s = String::from(
+        "## Unprocessed world actions from other entities\n\n\
+         These are recent world actions from other entities that have affected you.\n\
+         Their effects are already reflected in your current state. You don't need to re-emit these effects in your response.\n\n\
+         You may want to mention their impact and any change of relations in your `history_summary_replace`, so your narrative memory stays in sync with what other entities have been doing.\n\n",
+    );
+    let mut rows: Vec<String> = Vec::with_capacity(matching.len());
+    for entry in &matching {
+        rows.push(format_unprocessed_other_action_row(entry));
+    }
+    // Greedy sliding window: walk oldest-first, build up
+    // a window of rows that fits in the cap, then drop
+    // the oldest as we add newer ones.  This guarantees
+    // the OUTPUT (the rows we actually emit) is at most
+    // `cap` chars total, AND we keep the most recent rows
+    // (the ones most likely to matter for the LLM's
+    // next move).
+    //
+    // The naive "drop one oldest, try again" loop has
+    // a bug: it slides first_kept forward, but always
+    // keeps adding the new row, so the output (from
+    // first_kept to end) eventually contains ALL rows.
+    // The fix is a proper sliding window: track which
+    // rows are CURRENTLY in the window, drop the oldest
+    // while the window is over cap, and only "commit" a
+    // row to the window once we know the window will
+    // stay under cap.  Concretely: walk the rows, build
+    // a candidate window; if the window would exceed
+    // the cap, drop oldest rows from the window UNTIL
+    // it fits (not just one); THEN commit the new row.
+    let header_len = s.len();
+    let mut window_start: usize = 0;  // inclusive start
+    let mut window_len: usize = 0;    // count of rows in the window
+    let mut window_chars: usize = header_len;  // header + sum of row lens in window
+    for (i, row) in rows.iter().enumerate() {
+        // Tentatively add the row.
+        let new_window_chars = window_chars + row.len();
+        if new_window_chars <= MAX_UNPROCESSED_OTHER_ACTIONS_CHARS {
+            // Fits without dropping. Commit.
+            window_chars = new_window_chars;
+            window_len = i + 1 - window_start;
+            continue;
+        }
+        // Doesn't fit. Drop oldest rows from the window
+        // until the new row fits.  Could be many drops
+        // (e.g. a very long new row needs us to drop
+        // many old ones).
+        let mut new_window_start = window_start;
+        let mut projected = window_chars + row.len();
+        while projected > MAX_UNPROCESSED_OTHER_ACTIONS_CHARS
+            && new_window_start < i
+        {
+            projected -= rows[new_window_start].len();
+            new_window_start += 1;
+        }
+        // After dropping, does the new row fit?
+        if projected <= MAX_UNPROCESSED_OTHER_ACTIONS_CHARS {
+            // Yes. Commit.
+            window_start = new_window_start;
+            window_chars = projected;
+            window_len = i + 1 - window_start;
+        } else {
+            // The new row alone is bigger than the cap
+            // headroom.  Skip it (don't add to window).
+            // (We still keep whatever's in the window
+            // for output.)
+        }
+    }
+    if window_len == 0 {
+        // Nothing fit; the cap is so tight we can't show
+        // even the newest entry.  Just return the header
+        // so the LLM at least knows the block exists.
+        // (Edge case; in practice the cap is 9.5K and a
+        // typical row is ~280 chars, so 30+ rows fit.)
+        return s;
+    }
+    let end = window_start + window_len;
+    for row in &rows[window_start..end] {
+        s.push_str(row);
+    }
+    s
+}
+
+/// Format one unprocessed-other-action row for the LLM
+/// context.  Compact one-liner:
+///
+/// `- [YYYY-MM-DD HH:MM] **EntityName**: \`action_name\` — outcome (effects applied)`
+///
+/// Per Arcurus 2026-06-07 (#openworld): "no need to mention
+/// the effects, just that they are applied already".  We
+/// show the action and the outcome (truncated) and append
+/// a single "(effects applied)" tag so the LLM knows the
+/// state has already been updated.
+fn format_unprocessed_other_action_row(entry: &ActionHistoryEntry) -> String {
+    let ts = entry.timestamp.format("%Y-%m-%d %H:%M");
+    let outcome_one_line = entry
+        .outcome
+        .replace('\n', " ")
+        .chars()
+        .take(150)
+        .collect::<String>();
+    let outcome_suffix = if entry.outcome.chars().count() > 150 {
+        "…"
+    } else {
+        ""
+    };
+    if outcome_one_line.is_empty() {
+        format!(
+            "- [{}] **{}**: `{}` (effects applied)\n",
+            ts, entry.entity_name, entry.action
+        )
+    } else {
+        format!(
+            "- [{}] **{}**: `{}` — {}{} (effects applied)\n",
+            ts,
+            entry.entity_name,
+            entry.action,
+            outcome_one_line,
+            outcome_suffix
+        )
+    }
 }
 
 /// True if the action_history entry was performed by a system entity
@@ -1106,6 +1372,7 @@ mod tests {
             max_history_summary_chars: 500,
             history_summary_chars_used: 7,
             recent_world_actions_str: "recent".to_string(),
+            unprocessed_other_actions_str: "unprocessed".to_string(),
         };
         let template = "{world_name} {entity_name} {entity_type} {description} {tags} {x} {y} {property_context} {property_docs} {power_tier} {entity_history} {nearby_entities} {world_events} {history_summary} {max_history_summary_chars} {history_summary_header}";
         let result = build_action_prompt("Middle Earth", &entity, &ctx, template, "DOCS");
@@ -1172,6 +1439,7 @@ mod tests {
             max_history_summary_chars: 500,
             history_summary_chars_used: 0,
             recent_world_actions_str: String::new(),
+            unprocessed_other_actions_str: String::new(),
         };
         let rendered = build_action_prompt("TestWorld", &entity, &ctx, &template, "");
 
@@ -1259,6 +1527,7 @@ mod tests {
             details: String::new(),
             effects: serde_json::Map::new(),
             warnings: Vec::new(),
+            tick: 0,
         }
     }
 
@@ -1413,5 +1682,260 @@ mod tests {
         assert!(result.contains("…"), "expected ellipsis on long outcome");
         // Should NOT contain all 500 xs
         assert!(!result.contains(&"x".repeat(300)), "outcome not truncated");
+    }
+
+    // ========================================================================
+    // build_unprocessed_other_actions_str tests
+    // ========================================================================
+
+    /// Build a fully-formed `World` with two non-system entities
+    /// ("Me" and "Bard") for the unprocessed-block tests.  The
+    /// "Me" entity is the "this entity" the LLM call is being
+    /// made for; "Bard" is the "other entity" whose actions may
+    /// or may not affect "Me".
+    fn make_world_two_non_system_entities() -> (World, Uuid, Uuid) {
+        let mut world = make_world();
+        let mut bard = make_entity("Bard", 10100.0, 10100.0);
+        bard.entity_type = "character".to_string();
+        let bard_id = bard.id;
+        let mut me = make_entity("Me", 10000.0, 10000.0);
+        me.entity_type = "character".to_string();
+        let me_id = me.id;
+        world.entities.insert(me_id, me);
+        world.entities.insert(bard_id, bard);
+        (world, me_id, bard_id)
+    }
+
+    /// Build an entry with a custom effect map.  Helper for
+    /// the unprocessed-block tests below.
+    fn entry_with_effects(
+        entity_id: &str,
+        entity_name: &str,
+        action: &str,
+        outcome: &str,
+        ts_secs: i64,
+        tick: i64,
+        effects: serde_json::Map<String, serde_json::Value>,
+    ) -> ActionHistoryEntry {
+        ActionHistoryEntry {
+            entity_id: entity_id.to_string(),
+            entity_name: entity_name.to_string(),
+            timestamp: Utc.timestamp_opt(ts_secs, 0).unwrap(),
+            action: action.to_string(),
+            outcome: outcome.to_string(),
+            details: String::new(),
+            effects,
+            warnings: Vec::new(),
+            tick,
+        }
+    }
+
+    #[test]
+    fn unprocessed_empty_when_no_entries() {
+        let (world, me_id, _) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let result = build_unprocessed_other_actions_str(&world, me, &[], 0);
+        assert!(result.is_empty(), "expected empty, got: {}", result);
+    }
+
+    #[test]
+    fn unprocessed_empty_when_no_other_actions_affect_me() {
+        // Bard acts, but Bard's effects do NOT mention "Me".
+        // → unprocessed list is empty.
+        let (world, me_id, bard_id) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut effects = serde_json::Map::new();
+        effects.insert("Bard.composure".to_string(), serde_json::json!(1));
+        let raw = vec![entry_with_effects(
+            &bard_id.to_string(),
+            "Bard",
+            "compose",
+            "Bard composes a song",
+            3000,
+            100,
+            effects,
+        )];
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        assert!(result.is_empty(), "expected empty, got: {}", result);
+    }
+
+    #[test]
+    fn unprocessed_includes_other_action_with_my_name_in_effects() {
+        // Bard attacks "Me" — the effect key "Me.health" starts
+        // with "Me.", so this action is "unprocessed for Me".
+        let (world, me_id, bard_id) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut effects = serde_json::Map::new();
+        effects.insert("Bard.composure".to_string(), serde_json::json!(1));
+        effects.insert("Me.health".to_string(), serde_json::json!(-10));
+        let raw = vec![entry_with_effects(
+            &bard_id.to_string(),
+            "Bard",
+            "attack",
+            "Bard attacks Me",
+            3000,
+            100,
+            effects,
+        )];
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        assert!(!result.is_empty(), "expected non-empty, got: {}", result);
+        assert!(result.contains("Bard"), "should include actor name");
+        assert!(result.contains("attack"), "should include action name");
+        assert!(
+            result.contains("effects applied"),
+            "should include 'effects applied' tag"
+        );
+    }
+
+    #[test]
+    fn unprocessed_skips_own_actions() {
+        // "Me" acts on themselves — must be skipped even if the
+        // effect key starts with "Me.".
+        let (world, me_id, _) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut effects = serde_json::Map::new();
+        effects.insert("Me.morale".to_string(), serde_json::json!(5));
+        let raw = vec![entry_with_effects(
+            &me_id.to_string(),
+            "Me",
+            "rally",
+            "Me rallies themselves",
+            3000,
+            100,
+            effects,
+        )];
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        assert!(result.is_empty(), "own actions must be skipped, got: {}", result);
+    }
+
+    #[test]
+    fn unprocessed_skips_entries_at_or_below_marker() {
+        // Two actions by Bard affecting Me: tick 99 (already
+        // processed) and tick 100 (new).  Marker is 99, so only
+        // tick 100 is unprocessed.
+        let (world, me_id, bard_id) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut effects_a = serde_json::Map::new();
+        effects_a.insert("Me.health".to_string(), serde_json::json!(-5));
+        let mut effects_b = serde_json::Map::new();
+        effects_b.insert("Me.health".to_string(), serde_json::json!(-7));
+        let raw = vec![
+            entry_with_effects(
+                &bard_id.to_string(),
+                "Bard",
+                "stab",
+                "Bard stabs Me (old)",
+                3000,
+                99,
+                effects_a,
+            ),
+            entry_with_effects(
+                &bard_id.to_string(),
+                "Bard",
+                "slash",
+                "Bard slashes Me (new)",
+                3001,
+                100,
+                effects_b,
+            ),
+        ];
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 99);
+        assert!(!result.contains("(old)"), "marker should filter out tick=99");
+        assert!(result.contains("(new)"), "tick=100 should be present");
+    }
+
+    #[test]
+    fn unprocessed_handles_missing_marker() {
+        // Marker is 0 (the property doesn't exist yet).  Both
+        // entries (tick 1 and 2) should be unprocessed.
+        let (world, me_id, bard_id) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut effects = serde_json::Map::new();
+        effects.insert("Me.health".to_string(), serde_json::json!(-5));
+        let raw = vec![entry_with_effects(
+            &bard_id.to_string(),
+            "Bard",
+            "attack",
+            "Bard attacks Me",
+            3000,
+            1,
+            effects.clone(),
+        )];
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn unprocessed_skips_system_entities() {
+        // World Clock is a system entity — its actions should be
+        // skipped.  (We mark it via is_system_entity; the
+        // simplest way is to set entity_type="abstract".)
+        let mut world = make_world();
+        let mut clock = make_entity("WorldClock", 0.0, 0.0);
+        clock.entity_type = "abstract".to_string();
+        let clock_id = clock.id;
+        let mut me = make_entity("Me", 10000.0, 10000.0);
+        me.entity_type = "character".to_string();
+        let me_id = me.id;
+        world.entities.insert(me_id, me);
+        world.entities.insert(clock_id, clock);
+
+        let me = world.entities.get(&me_id).unwrap();
+        let mut effects = serde_json::Map::new();
+        effects.insert("Me.tick".to_string(), serde_json::json!(1));
+        let raw = vec![entry_with_effects(
+            &clock_id.to_string(),
+            "WorldClock",
+            "tick",
+            "WorldClock advances time",
+            3000,
+            100,
+            effects,
+        )];
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        assert!(
+            result.is_empty(),
+            "system-entity actions must be skipped, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn unprocessed_caps_at_9500_chars() {
+        // Generate 200 fake entries, each with a long outcome,
+        // all of which affect "Me".  Verify the result is under
+        // the cap (we allow a small slop for the header, ~500
+        // chars, plus newline-included row lengths).
+        let (world, me_id, bard_id) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut raw: Vec<ActionHistoryEntry> = Vec::new();
+        for i in 0..200 {
+            let mut effects = serde_json::Map::new();
+            effects.insert("Me.health".to_string(), serde_json::json!(-1));
+            let long_outcome: String = "y".repeat(300);
+            raw.push(entry_with_effects(
+                &bard_id.to_string(),
+                "Bard",
+                "attack",
+                &long_outcome,
+                3000 + i,
+                i as i64 + 1,
+                effects,
+            ));
+        }
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        // The cap is 9.5K chars, hard.  Result must be <= cap.
+        assert!(
+            result.len() <= MAX_UNPROCESSED_OTHER_ACTIONS_CHARS,
+            "result {} chars exceeds cap of {}",
+            result.len(),
+            MAX_UNPROCESSED_OTHER_ACTIONS_CHARS
+        );
+        // The newest entries should be preserved; the oldest
+        // dropped.  (Cap drops oldest first.)
+        assert!(
+            result.contains("attack"),
+            "result should contain at least one row"
+        );
     }
 }

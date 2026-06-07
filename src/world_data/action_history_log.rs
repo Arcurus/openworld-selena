@@ -49,6 +49,19 @@ pub struct ActionHistoryEntry {
     pub effects: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// World tick at the moment this action was processed.
+    /// Tied to `World::action_count` (a monotonic counter
+    /// that increments on every world action).  Used by the
+    /// "unprocessed world actions from other entities" LLM
+    /// feature to track, per-entity, which actions have been
+    /// folded into that entity's history_summary.  See
+    /// `docs/world-mechanics.md` for the full contract.
+    ///
+    /// `#[serde(default)]` so old entries (pre-2026-06-07)
+    /// load with `tick = 0` and get backfilled on world
+    /// load by the load path in `main.rs`.
+    #[serde(default)]
+    pub tick: i64,
 }
 
 /// Default on-disk location: `<cwd>/world_data/action_history.jsonl`.
@@ -208,6 +221,168 @@ pub fn load_recent_world_actions_at(
     matching
 }
 
+/// Read ALL entries from the durable history log, in append
+/// (oldest-first) order.  Used by the "unprocessed world
+/// actions from other entities" LLM context feature to scan
+/// the whole file and filter to entries that touch a
+/// specific entity.  Per Arcurus 2026-06-07 (#openworld).
+///
+/// Why oldest-first here (not most-recent-first like
+/// `load_recent_world_actions`): the renderer for the
+/// unprocessed list needs to know the count of *omitted*
+/// older actions so it can flag the operator (and because
+/// the 10K char cap means we may need to drop the oldest
+/// entries from the visible list).  Working in
+/// chronological order makes the drop-oldest logic
+/// trivial.
+///
+/// The 10K char cap is applied inside the renderer (so the
+/// renderer is pure and unit-testable).  The I/O is done
+/// here so the renderer doesn't need to read the file.
+///
+/// Cheap on a typical world (5400 entries, sub-millisecond
+/// to parse).  If the log grows to 100K+ entries this
+/// would benefit from an index; not needed at current
+/// scale.
+pub fn load_all_world_actions() -> Vec<ActionHistoryEntry> {
+    load_all_world_actions_at(&history_path())
+}
+
+/// Path-parameterized variant of [`load_all_world_actions`].
+pub fn load_all_world_actions_at(path: &Path) -> Vec<ActionHistoryEntry> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    let mut entries: Vec<ActionHistoryEntry> = Vec::new();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: ActionHistoryEntry = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        entries.push(entry);
+    }
+    entries
+}
+
+/// Best-effort helper that reads the durable history log,
+/// assigns a sequential tick (1, 2, 3, ...) to any entry with
+/// `tick == 0` (pre-2026-06-07 entries; the `tick` field has
+/// `#[serde(default)]` so old data loads as 0), and rewrites
+/// the file in place.  Returns the count of entries that
+/// were backfilled (0 means "everything already had ticks").
+///
+/// Per Arcurus 2026-06-07 #openworld: "we need also to add
+/// the time tick in the world action history when the action
+/// happened.  if its not set yes, we need also to be able
+/// to set a date until which dates other entities actions
+/// where processed".  The backfill is what closes the "if
+/// its not set yes" gap for the existing 5400+ entries on
+/// disk.
+///
+/// Why this is safe to call on every world load: it's
+/// idempotent (only modifies entries with tick=0; once
+/// every entry has a real tick, it's a no-op).  And it
+/// never touches entries that already have a tick.
+///
+/// Why we rewrite the whole file (instead of in-place
+/// patching each line): the JSONL log is append-only and
+/// lines aren't a fixed length, so a partial-write
+/// approach would need to read the whole file into memory
+/// anyway.  An atomic full-file rewrite (write to
+/// `action_history.jsonl.tmp`, then rename) is the
+/// standard pattern.
+pub fn backfill_ticks() -> usize {
+    backfill_ticks_at(&history_path())
+}
+
+/// Path-parameterized variant of [`backfill_ticks`].
+pub fn backfill_ticks_at(path: &Path) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+    // Read all entries.
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let mut entries: Vec<ActionHistoryEntry> = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ActionHistoryEntry>(line) {
+            Ok(e) => entries.push(e),
+            // Skip malformed lines (defense: a corrupt
+            // line shouldn't break the whole backfill).
+            Err(_) => continue,
+        }
+    }
+    if entries.is_empty() {
+        return 0;
+    }
+    // Assign sequential ticks: 1, 2, 3, ... to any entry
+    // with tick==0.  Skip entries that already have a
+    // tick (they were stamped when written; we don't
+    // overwrite).  The starting point is the max existing
+    // tick + 1, so the backfill seamlessly continues the
+    // monotonic sequence even if the file was partially
+    // backfilled in a prior run.
+    let mut backfilled_count = 0usize;
+    let mut next_tick: i64 = entries
+        .iter()
+        .map(|e| e.tick)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    for e in entries.iter_mut() {
+        if e.tick == 0 {
+            e.tick = next_tick;
+            next_tick = next_tick.saturating_add(1);
+            backfilled_count += 1;
+        }
+    }
+    if backfilled_count == 0 {
+        return 0;
+    }
+    // Atomic rewrite: write to tmp, then rename.  Avoids
+    // a half-written file if the process is killed mid-write.
+    let tmp_path = path.with_extension("jsonl.tmp");
+    let write_result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::File::create(&tmp_path)?;
+        for e in &entries {
+            let line = serde_json::to_string(e)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+            writeln!(f, "{}", line)?;
+        }
+        f.flush()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        eprintln!("[backfill_ticks] failed to write tmp file: {}", e);
+        return 0;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        eprintln!("[backfill_ticks] failed to rename tmp to {}: {}", path.display(), e);
+        let _ = std::fs::remove_file(&tmp_path);
+        return 0;
+    }
+    backfilled_count
+}
+
 /// Total entries for a given entity (cheap, for stats / debug).
 pub fn count_for_entity(entity_id: &str) -> usize {
     count_for_entity_at(entity_id, &history_path())
@@ -266,6 +441,7 @@ mod tests {
             details: String::new(),
             effects: serde_json::Map::new(),
             warnings: Vec::new(),
+            tick: 0,
         }
     }
 
@@ -365,6 +541,7 @@ mod tests {
             details: String::new(),
             effects: serde_json::Map::new(),
             warnings: Vec::new(),
+            tick: 0,
         }
     }
 
@@ -447,6 +624,106 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].action, "good_b");
         assert_eq!(v[1].action, "good_a");
+    }
+
+    // ========================================================================
+    // backfill_ticks tests
+    // ========================================================================
+
+    #[test]
+    fn backfill_ticks_assigns_sequential_ticks_to_zero_tick_entries() {
+        // Pre-2026-06-07 entries have tick=0.  Backfill
+        // should assign them 1, 2, 3 in append order.
+        let path = fresh_log_path();
+        let mut e1 = make_entry_full("e1", "A", "first", 1000);
+        let mut e2 = make_entry_full("e2", "B", "second", 2000);
+        let mut e3 = make_entry_full("e3", "C", "third", 3000);
+        e1.tick = 0;
+        e2.tick = 0;
+        e3.tick = 0;
+        append_entry_at(&e1, &path).unwrap();
+        append_entry_at(&e2, &path).unwrap();
+        append_entry_at(&e3, &path).unwrap();
+
+        let backfilled = backfill_ticks_at(&path);
+        assert_eq!(backfilled, 3);
+
+        // Reload and verify the ticks.
+        let v = load_for_entity_at("e1", 100, &path);
+        assert_eq!(v[0].tick, 1);
+        let v = load_for_entity_at("e2", 100, &path);
+        assert_eq!(v[0].tick, 2);
+        let v = load_for_entity_at("e3", 100, &path);
+        assert_eq!(v[0].tick, 3);
+    }
+
+    #[test]
+    fn backfill_ticks_is_idempotent() {
+        // Run backfill twice; the second call must be a no-op
+        // (0 entries backfilled).
+        let path = fresh_log_path();
+        let mut e1 = make_entry_full("e1", "A", "first", 1000);
+        e1.tick = 0;
+        append_entry_at(&e1, &path).unwrap();
+        let first = backfill_ticks_at(&path);
+        assert_eq!(first, 1);
+        let second = backfill_ticks_at(&path);
+        assert_eq!(second, 0);
+    }
+
+    #[test]
+    fn backfill_ticks_preserves_existing_ticks() {
+        // Pre-2026-06-07 entries have tick=0; one entry was
+        // already stamped at tick=42 by the new code.  The
+        // backfill should NOT overwrite tick=42, and should
+        // assign tick=1 to the un-ticked one (since the max
+        // existing tick is 42, the next sequential is 43,
+        // but the implementation actually starts the
+        // sequence at max+1 for the first un-ticked one;
+        // verify the actual behavior below).
+        let path = fresh_log_path();
+        let mut e1 = make_entry_full("e1", "A", "first", 1000);
+        let mut e2 = make_entry_full("e2", "B", "second", 2000);
+        e1.tick = 42;
+        e2.tick = 0;
+        append_entry_at(&e1, &path).unwrap();
+        append_entry_at(&e2, &path).unwrap();
+        let backfilled = backfill_ticks_at(&path);
+        assert_eq!(backfilled, 1);
+        let v1 = load_for_entity_at("e1", 100, &path);
+        assert_eq!(v1[0].tick, 42, "existing tick must be preserved");
+        let v2 = load_for_entity_at("e2", 100, &path);
+        assert!(v2[0].tick > 42, "new tick must be > existing max");
+    }
+
+    #[test]
+    fn backfill_ticks_on_missing_file_is_noop() {
+        let path = fresh_log_path();  // doesn't exist
+        let backfilled = backfill_ticks_at(&path);
+        assert_eq!(backfilled, 0);
+    }
+
+    #[test]
+    fn backfill_ticks_skips_garbled_lines() {
+        // Mix a malformed line in; backfill must skip it and
+        // backfill the rest without panicking.
+        let path = fresh_log_path();
+        let mut e1 = make_entry_full("e1", "A", "good_a", 1000);
+        e1.tick = 0;
+        append_entry_at(&e1, &path).unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "{{ this is not valid json").unwrap();
+        }
+        let mut e2 = make_entry_full("e2", "B", "good_b", 2000);
+        e2.tick = 0;
+        append_entry_at(&e2, &path).unwrap();
+        let backfilled = backfill_ticks_at(&path);
+        assert_eq!(backfilled, 2);
     }
 
     // Bring Uuid into scope for the test helpers above

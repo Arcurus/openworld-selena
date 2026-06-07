@@ -4519,6 +4519,14 @@ async fn process_action_handler(
                     warnings.push(w);
                 }
 
+                // Capture world.action_count BEFORE the
+                // mutable borrow of world.entities below —
+                // we need it both for the tick stamp on the
+                // history entry and for the
+                // last_processed_other_tick marker.  Per
+                // Arcurus 2026-06-07 (#openworld).
+                let stamp_tick = world.action_count as i64;
+
                 if let Some(entity) = world.entities.get_mut(&entity_id) {
                     // System entities (world_clock, meta-tagged)
                     // are protected from LLM-driven property writes
@@ -4556,11 +4564,17 @@ async fn process_action_handler(
                 //       of save.owbl, survives save corruption).
                 use world_data::entity_history::add_to_history;
                 let history_timestamp = chrono::Utc::now();
+                // Pass `stamp_tick` (captured before the
+                // mutable borrow above) so the
+                // `last_processed_other_tick` marker is
+                // advanced to the same tick as the history
+                // entry below.
                 add_to_history(
                     entity,
                     &action_data.action,
                     &action_data.narrative,
                     &action_data.outcome,
+                    stamp_tick,
                 );
 
                 // Build the durable JSONL entry. Deferred to AFTER
@@ -4736,6 +4750,17 @@ async fn process_action_handler(
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                     warnings: warnings.clone(),
+                    // Per Arcurus 2026-06-07 #openworld: stamp
+                    // the world tick (== world.action_count at
+                    // the moment of this action).  Pre-2026-06-07
+                    // entries have tick=0; they get backfilled
+                    // on world load (see load_world backfill
+                    // block in main.rs).  Use the
+                    // already-captured `stamp_tick` to avoid
+                    // borrowing `world` here (the mutable
+                    // borrow of `entity` is still live in
+                    // this `if let` block).
+                    tick: stamp_tick,
                 };
                 let parsing_outcome = format!(
                     "Applied {} effects. Warnings: {:?}",
@@ -6194,6 +6219,26 @@ async fn main() {
                 // migrated).  See World::migrate_entity_types
                 // for the full rule.
                 w.migrate_entity_types();
+                // Backfill the durable action_history.jsonl:
+                // assign a sequential tick (1, 2, 3, ...) to any
+                // entry that has tick=0 (pre-2026-06-07
+                // entries; the new `tick` field on
+                // ActionHistoryEntry is `#[serde(default)]` so
+                // they load as 0).  Per Arcurus 2026-06-07
+                // #openworld: "we need also to add the time
+                // tick in the world action history when the
+                // action happened.  if its not set yes, we
+                // need also to be able to set a date until
+                // which dates other entities actions where
+                // processed".  The backfill is what closes the
+                // "if its not set yes" gap for the existing
+                // 5400+ entries on disk.  No-op once the file
+                // is fully backfilled (every entry already has
+                // tick > 0).  See action_history_log::backfill_ticks.
+                let backfilled = action_history_log::backfill_ticks();
+                if backfilled > 0 {
+                    println!("🔁 Backfilled ticks on {} history entries (pre-2026-06-07 data)", backfilled);
+                }
                 // Re-seed the canonical lore events on load. The binary
                 // save format intentionally does NOT serialize
                 // active_events (see BinaryPersistence doc comment at

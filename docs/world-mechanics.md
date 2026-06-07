@@ -411,6 +411,132 @@ stays within the cap, and the LLM is told (via the prompt header
 next time) that it should trim further using
 `history_summary_replace`.
 
+## 5b. Unprocessed World Actions from Other Entities (LLM context)
+
+When the LLM is called for an entity, it gets a block listing
+**world actions from other entities that affected this entity but
+haven't yet been folded into its `history_summary`**. The LLM
+uses this to keep its narrative memory in sync with what other
+entities have done to it (and, in the `history_summary_replace`
+edit, it can mention the relationship change).
+
+Per Arcurus 2026-06-07 (#openworld):
+- "for the connection we go for now if the entity was affected
+  in the entities effect"
+- "we can reconstruct which world actions are not yet
+  processed for a given entity right?"
+- "Whatever fits in the 10 k (the long version) i think for
+  now no need to mention the effects, just that they are
+  applied already.  put as many unprocessed world actions from
+  other entities in as they fit in the 10k"
+
+### Mechanics (operator-facing, not LLM-facing)
+
+1. **Tick stamping.** Every entry in the durable
+   `action_history.jsonl` gets a `tick: i64` field, stamped
+   from `World::action_count` (a monotonic u64 that
+   increments on every world action).  Pre-2026-06-07
+   entries (which lack the field) are backfilled on world
+   load by `action_history_log::backfill_ticks` (assigns
+   sequential ticks 1, 2, 3, ... in append order;
+   idempotent).  This closes the "if its not set yes, we
+   need also to be able to set a date until which dates
+   other entities actions where processed" gap for the
+   existing 5400+ entries on disk.
+
+2. **Per-entity "processed up to" marker.** Each entity has
+   a `properties_int["last_processed_other_tick"]: i64`
+   that records the highest tick this entity has been
+   shown in its unprocessed-other-actions block.  On every
+   `action/llm` (or `action/process`) call for the
+   entity, `entity_history::add_to_history` advances the
+   marker to `world.action_count` (pre-increment; the
+   just-recorded action gets the same tick).  This means
+   old actions naturally fall out of the 10K-char window
+   even if the LLM didn't write a `history_summary_replace`.
+
+3. **Manual override.** An operator can set the marker
+   manually to skip the backfill or to force reprocessing:
+   `PUT /api/entities/:id/properties/int/last_processed_other_tick`
+   with body `{"value": 5000}`.  This is the same
+   per-property PUT endpoint used for every other int
+   property; the LLM never sees this knob.
+
+4. **Filtering rules** (`build_unprocessed_other_actions_str`
+   in `context_builder.rs`):
+   - Drop the actor's own actions
+     (`entry.entity_id != entity.id`).
+   - Drop system entities
+     (`is_system_entry(world, entry)` — World Clock,
+     anything tagged `meta`).
+   - Drop entries with
+     `entry.tick <= entity.properties_int["last_processed_other_tick"]`.
+   - Drop entries where no effect key starts with
+     `"<this entity name>."` (the dotted-name
+     convention used by LLM-emit cross-entity effects).
+   - Result: the LLM only sees actions by other
+     entities that touched it, that the LLM hasn't
+     seen yet.
+
+5. **Char cap.** The block is capped at
+   `MAX_UNPROCESSED_OTHER_ACTIONS_CHARS = 9_500` chars
+   (close to the 10K Arcurus mentioned, with headroom
+   for the header + rest of the prompt).  If the
+   filtered list exceeds the cap, the **oldest** rows
+   are dropped first (so the LLM always sees the most
+   recent actions, which are the ones most likely to
+   matter for its next move).  The cap is silent from
+   the LLM's point of view: no "and N more" line, no
+   "oldest first" hint, no mention of the marker. The
+   "no hidden mechanics" rule (see AGENTS.md) wins
+   over the operator's debugging convenience.
+
+6. **Prompt position.** Right after `{entity_history}`,
+   before `{history_summary_header}` / `{history_summary}`.
+   Order in `EntityAction.md` (2026-06-07): history →
+   unprocessed-other-actions → history summary →
+   nearby entities → world events → recent world actions.
+
+### Why relations are in the history summary (for now)
+
+The LLM is told "**Mention the impact and any change of
+relations in your `history_summary_replace`**" in the new
+block. Per Arcurus 2026-06-07: "for now all relations are
+in the history summary. we see later if we put them in
+querriable properties". So:
+
+- The unprocessed-other-actions block is a **reminder**
+  ("this happened, you should mention it in your
+  summary"), not a structured relation store.
+- Relations remain an LLM-written prose section inside
+  the per-entity `history_summary`, formatted as
+  `→ <other entity name>: <2-4 dense sentences>` per
+  relation.
+- If a future iteration makes relations queryable as
+  first-class properties (e.g. per-target
+  `relations: {entity_id: relation_label}`), the
+  unprocessed-other-actions block would still exist
+  (to keep the LLM's narrative memory in sync), but the
+  LLM would be told to write the structured property
+  too.
+
+### Why no "effects" in the prompt row
+
+Per Arcurus 2026-06-07: "no need to mention the effects,
+just that they are applied already". The LLM doesn't
+need to re-emit them (the world's state already
+reflects them — that's the whole point of the
+"processed" mark).  The row format is:
+
+```
+- [YYYY-MM-DD HH:MM] **EntityName**: `action_name` — outcome (effects applied)
+```
+
+with the outcome truncated to 150 chars + `…` (vs.
+200 chars in the older "recent world actions" block
+— shorter because this block is denser and the LLM
+already has the surrounding context).
+
 ---
 
 ## 6. Effect Normalization

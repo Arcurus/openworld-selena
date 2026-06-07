@@ -122,14 +122,47 @@ pub fn format_histories_for_entities(
     output
 }
 
-/// Add an action result to an entity's history
+/// Add an action result to an entity's history.
+///
+/// Also advances the entity's
+/// `properties_int["last_processed_other_tick"]` to the
+/// current world tick — because by the time this function
+/// runs, the LLM has been shown the "unprocessed world
+/// actions from other entities" list, so those actions are
+/// now considered processed for this entity's history
+/// summary purposes.  Per Arcurus 2026-06-07 (#openworld):
+/// "we can reconstruct which world actions are not yet
+/// processed for a given entity".
+///
+/// NOTE: the tick value passed in is the world tick at the
+/// moment the LLM call completes (== the world
+/// `action_count` after the action was committed).  We
+/// don't read it from the world here because the caller
+/// already has it in scope; threading it through keeps
+/// this function pure (no World borrow needed).
 pub fn add_to_history(
     entity: &mut WorldEntity,
     action: &str,
     details: &str,
     outcome: &str,
+    world_tick: i64,
 ) {
     entity.add_history(action, details, outcome);
+    // Advance the marker.  If the property doesn't exist
+    // yet, this inserts it.  We use `max(..., world_tick)`
+    // so the marker never goes backwards (defensive — in
+    // practice world_tick is monotonic so this is a
+    // no-op, but the guard is cheap).
+    let current = entity
+        .properties_int
+        .get("last_processed_other_tick")
+        .copied()
+        .unwrap_or(0);
+    if world_tick > current {
+        entity
+            .properties_int
+            .insert("last_processed_other_tick".to_string(), world_tick);
+    }
 }
 
 /// Get recent history entries (most recent first)
@@ -348,7 +381,7 @@ mod tests {
     fn test_add_to_history_appends_entry() {
         let mut entity = WorldEntity::new("character", "Hero", 0.0, 0.0);
         assert_eq!(entity.history.len(), 0);
-        add_to_history(&mut entity, "fight", "slays dragon", "wins");
+        add_to_history(&mut entity, "fight", "slays dragon", "wins", 0);
         assert_eq!(entity.history.len(), 1);
         let h = &entity.history[0];
         assert_eq!(h.action, "fight");

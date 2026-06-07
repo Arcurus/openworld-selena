@@ -14,6 +14,8 @@ Properties (relative to other {entity_type} entities in the world):
 
 {entity_history}
 
+{unprocessed_other_actions}
+
 {history_summary_header}
 {history_summary}
 
