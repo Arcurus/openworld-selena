@@ -2255,7 +2255,21 @@
                     }
                     html += `<div style="color: #5a7a9a; font-size: 10px; margin-top: 4px;">effects: ${escapeHtml(effStr)}</div>`;
                     if (e.warnings && e.warnings.length > 0) {
-                        html += `<div style="color: #fbbf24; font-size: 10px; margin-top: 2px;">⚠️ ${e.warnings.length} warning(s)</div>`;
+                        // Per Arcurus 2026-06-08 (#openworld):
+                        // "in the Action History it says warnings,
+                        // but it does not display the warnings
+                        // text, can you display it".  Render the
+                        // FULL warning text (not just the count)
+                        // using the same .action-warning class
+                        // the action-result modal uses, so the
+                        // operator can see what actually
+                        // happened (e.g. "Skipped effect on
+                        // internal/operator-only property ...").
+                        html += '<div class="action-warning-list" style="margin-top: 6px;">';
+                        e.warnings.forEach(w => {
+                            html += '<div class="action-warning" style="padding: 6px 8px; font-size: 11px; margin-bottom: 4px;">⚠️ ' + escapeHtml(w) + '</div>';
+                        });
+                        html += '</div>';
                     }
                     html += '</div>';
                 });
