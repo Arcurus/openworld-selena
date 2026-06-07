@@ -16,7 +16,7 @@
 **Live counts** (from `GET /api/entities`, 2026-06-04):
 - Total: 18 entities
 - Legendary tier: 3 (Vaelthrix, Velora, World Clock)
-- Type breakdown: 7 locations, 5 characters, 2 factions, 2 heroes, 1 dragon, 1 artifact, 1 oracle, 1 abstract (world clock), 1 location (Scribe is character; miscounted here, see roster below for ground truth)
+- Type breakdown: 26 locations, 14 factions, 7 characters (including 2 former heroes and 1 former oracle; all are now `entity_type=character` with role tags `hero` / `oracle`), 1 dragon, 1 artifact, 1 abstract (world clock). (Older versions of this doc used to show `hero` and `oracle` as separate `entity_type` values; per Arcurus 2026-06-07 #openworld those were folded into the `character` umbrella — see `World::migrate_entity_types`.)
 
 ---
 
@@ -26,11 +26,11 @@
 |---|------|------|-------|----------|-------------|
 | ★ 1 | **Vaelthrix the Endless** | `dragon` | 2000 (Legendary) | (500, 100) | Ancient dragon stirring in northern mountains |
 | ★ 2 | **World Clock** | `abstract` | 1500 (Legendary) | (0, 0) | Meta-entity that tracks world time |
-| ★ 3 | **Velora the Undying** | `hero` | 1500 (Legendary) | (250, 400) | Cursed knight who refused death itself |
+| ★ 3 | **Velora the Undying** | `character` (tag: hero) | 1500 (Legendary) | (250, 400) | Cursed knight who refused death itself |
 | 4 | **The Shadow Crown** | `artifact` | 300 (Rare) | (500, 250) | Blackened silver circlet that creates new Shadows |
-| 5 | **Kira Dawnblade** | `hero` | 180 (Uncommon) | (340, 220) | Young knight marked by the prophecy |
+| 5 | **Kira Dawnblade** | `character` (tag: hero) | 180 (Uncommon) | (340, 220) | Young knight marked by the prophecy |
 | 6 | **Keepers of the Eternal Flame** | `faction` | 140 (Uncommon) | (400, 250) | Ancient order preserving the balance |
-| 7 | **Zephyrus the Oracle** | `oracle` | 120 (Uncommon) | (250, 130) | Blind oracle who speaks in riddles |
+| 7 | **Zephyrus the Oracle** | `character` (tag: oracle) | 120 (Uncommon) | (250, 130) | Blind oracle who speaks in riddles |
 | 8 | **The Sunken Temple** | `location` | 80 (Uncommon) | (180, 450) | Half-submerged ruins where bells still ring |
 | 9 | **Silverstream Keep** | `location` | 75 (Uncommon) | (320, 180) | Fortified castle overlooking the river |
 | 10 | **Shadow Ridge Camp** | `location` | 52 (Uncommon) | (280, 320) | Hidden bandit encampment |

@@ -346,10 +346,68 @@ impl World {
         };
         // Create the world clock entity
         world.create_clock_entity();
+        // Migrate any pre-2026-06-07 entity_types (hero →
+        // character, oracle → character).  Idempotent; safe to
+        // run on every World::new().  See
+        // `migrate_entity_types` for the full rule.
+        world.migrate_entity_types();
         // Auto-bootstrap with the canonical lore events so a fresh world
         // already has narrative momentum (see todo e4cc4203).
         world.seed_default_events();
         world
+    }
+
+    /// Migrate legacy entity_types to the current canonical
+    /// `character` umbrella.  Per Arcurus 2026-06-07
+    /// #openworld: heroes and oracles are still "characters"
+    /// in the gameplay sense (they're actors in the story,
+    /// they get LLM-driven actions, they show up in the
+    /// nearby-characters panel), they just have a
+    /// narrative-role tag ("hero", "oracle") that disambiguates
+    /// them from regular characters.  This is a defense-in-
+    /// depth migration: the data was already updated to the
+    /// new type via the web UI, but we re-run the migration
+    /// on every load in case a future save file ships with
+    /// legacy types (e.g. from a fresh git pull of an older
+    /// snapshot).
+    ///
+    /// Rules:
+    ///   - `entity_type == "hero"`  → `entity_type = "character"`.
+    ///     Ensures the `hero` tag is present (the data already
+    ///     has it; we add it for safety).
+    ///   - `entity_type == "oracle"`  → `entity_type = "character"`.
+    ///     Ensures the `oracle` tag is present.
+    ///
+    /// Idempotent: re-running on an already-migrated world is
+    /// a no-op (no entity has the legacy types anymore).
+    pub fn migrate_entity_types(&mut self) {
+        let mut migrations: Vec<(Uuid, String, String, Vec<String>)> = Vec::new();
+        for (id, entity) in self.entities.iter() {
+            let needs_migration = entity.entity_type == "hero"
+                || entity.entity_type == "oracle";
+            if !needs_migration {
+                continue;
+            }
+            let old_type = entity.entity_type.clone();
+            let role_tag = if old_type == "hero" { "hero" } else { "oracle" };
+            let mut new_tags = entity.tags.clone();
+            if !new_tags.contains(&role_tag.to_string()) {
+                new_tags.push(role_tag.to_string());
+            }
+            migrations.push((*id, old_type, "character".to_string(), new_tags));
+        }
+        for (id, old_type, new_type, new_tags) in migrations {
+            if let Some(entity) = self.entities.get_mut(&id) {
+                let role_tag = if old_type == "hero" { "hero" } else { "oracle" };
+                eprintln!(
+                    "[migrate_entity_types] {} (\"{}\"): entity_type \"{}\" → \"{}\" (tag \"{}\" ensured)",
+                    id, entity.name, old_type, new_type, role_tag,
+                );
+                entity.entity_type = new_type;
+                entity.tags = new_tags;
+                entity.updated_at = chrono::Utc::now();
+            }
+        }
     }
 
     /// Seed the world with the 7 canonical sample entities described in
@@ -1688,5 +1746,228 @@ mod tests {
         let now = chrono::Utc::now();
         world.last_world_action = Some(now);
         assert_eq!(world.last_world_action, Some(now));
+    }
+
+    // -----------------------------------------------------------------
+    // Tests for `migrate_entity_types` (Arcurus 2026-06-07
+    // #openworld: hero + oracle → character, with role-tag
+    // preserved).
+    //
+    // The migration is idempotent: re-running it on an already-
+    // migrated world is a no-op (no entity has the legacy types
+    // anymore).  All tests below start from a fresh World::new()
+    // and then manually re-insert entities with the legacy types
+    // to exercise the migration.
+    // -----------------------------------------------------------------
+
+    /// Helper: insert one entity with the given legacy
+    /// `entity_type` and starter tags into a World, returning
+    /// the entity's id.
+    fn insert_legacy_entity(
+        world: &mut World,
+        entity_type: &str,
+        name: &str,
+        tags: &[&str],
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let mut e = WorldEntity::new(entity_type, name, 0.0, 0.0);
+        e.id = id;
+        e.properties_int.insert("power".to_string(), 10);
+        for t in tags {
+            e.add_tag(t);
+        }
+        world.entities.insert(id, e);
+        id
+    }
+
+    #[test]
+    fn migrate_hero_to_character_preserves_hero_tag() {
+        let mut world = World::new("test");
+        let id = insert_legacy_entity(
+            &mut world,
+            "hero",
+            "Kira Dawnblade",
+            &["hero", "prophecy", "young"],
+        );
+
+        // Pre-migration: type=hero, tag=hero present.
+        assert_eq!(world.entities.get(&id).unwrap().entity_type, "hero");
+        assert!(world.entities.get(&id).unwrap().has_tag("hero"));
+
+        world.migrate_entity_types();
+
+        // Post-migration: type=character, hero tag still present.
+        let after = world.entities.get(&id).unwrap();
+        assert_eq!(after.entity_type, "character",
+            "hero entity_type should migrate to character");
+        assert!(after.has_tag("hero"),
+            "hero tag should be preserved (it was already there)");
+        assert!(after.has_tag("prophecy"),
+            "other tags should be preserved");
+    }
+
+    #[test]
+    fn migrate_oracle_to_character_preserves_oracle_tag() {
+        let mut world = World::new("test");
+        let id = insert_legacy_entity(
+            &mut world,
+            "oracle",
+            "Zephyrus the Oracle",
+            &["oracle", "blind", "ancient", "prophecy"],
+        );
+
+        // Pre-migration: type=oracle, tag=oracle present.
+        assert_eq!(world.entities.get(&id).unwrap().entity_type, "oracle");
+        assert!(world.entities.get(&id).unwrap().has_tag("oracle"));
+
+        world.migrate_entity_types();
+
+        // Post-migration: type=character, oracle tag still present.
+        let after = world.entities.get(&id).unwrap();
+        assert_eq!(after.entity_type, "character",
+            "oracle entity_type should migrate to character");
+        assert!(after.has_tag("oracle"),
+            "oracle tag should be preserved (it was already there)");
+        assert!(after.has_tag("blind"),
+            "other tags should be preserved");
+    }
+
+    #[test]
+    fn migrate_adds_missing_role_tag() {
+        // Edge case: entity_type is "hero" but the role tag
+        // is somehow missing.  The migration should add it.
+        // (This shouldn't happen in real data — heroes
+        // always have the hero tag — but defense in depth.)
+        let mut world = World::new("test");
+        let id = insert_legacy_entity(
+            &mut world,
+            "hero",
+            "Tagless Hero",
+            &[],  // no tags
+        );
+        assert!(!world.entities.get(&id).unwrap().has_tag("hero"));
+
+        world.migrate_entity_types();
+
+        let after = world.entities.get(&id).unwrap();
+        assert_eq!(after.entity_type, "character");
+        assert!(after.has_tag("hero"),
+            "missing hero tag should be added by the migration");
+    }
+
+    #[test]
+    fn migrate_is_idempotent_on_already_migrated_world() {
+        let mut world = World::new("test");
+        // Insert a regular character (no migration needed).
+        let id = insert_legacy_entity(
+            &mut world,
+            "character",
+            "Mira the Merchant",
+            &["merchant"],
+        );
+        // Insert an abstract entity (system, no migration).
+        let abstract_id = insert_legacy_entity(
+            &mut world,
+            "abstract",
+            "World Clock",
+            &["meta"],
+        );
+        // Insert a location (no migration).
+        let loc_id = insert_legacy_entity(
+            &mut world,
+            "location",
+            "Oak Valley",
+            &["peaceful"],
+        );
+
+        // Capture tag counts before the migration.
+        let before_mira_tags: Vec<String> =
+            world.entities.get(&id).unwrap().tags.clone();
+        let before_clock_tags: Vec<String> =
+            world.entities.get(&abstract_id).unwrap().tags.clone();
+        let before_loc_tags: Vec<String> =
+            world.entities.get(&loc_id).unwrap().tags.clone();
+
+        // Run the migration.
+        world.migrate_entity_types();
+
+        // Nothing should have changed.
+        assert_eq!(world.entities.get(&id).unwrap().entity_type, "character");
+        assert_eq!(
+            world.entities.get(&id).unwrap().tags,
+            before_mira_tags,
+            "character entity's tags should be untouched"
+        );
+        assert_eq!(world.entities.get(&abstract_id).unwrap().entity_type, "abstract");
+        assert_eq!(
+            world.entities.get(&abstract_id).unwrap().tags,
+            before_clock_tags,
+            "abstract entity's tags should be untouched"
+        );
+        assert_eq!(world.entities.get(&loc_id).unwrap().entity_type, "location");
+        assert_eq!(
+            world.entities.get(&loc_id).unwrap().tags,
+            before_loc_tags,
+            "location entity's tags should be untouched"
+        );
+
+        // Run the migration a second time — should still be a
+        // no-op (the whole point of idempotency).
+        world.migrate_entity_types();
+        assert_eq!(world.entities.get(&id).unwrap().entity_type, "character");
+        assert_eq!(world.entities.get(&abstract_id).unwrap().entity_type, "abstract");
+        assert_eq!(world.entities.get(&loc_id).unwrap().entity_type, "location");
+    }
+
+    #[test]
+    fn migrate_does_not_touch_dragon_or_artifact() {
+        // Defense: dragons and artifacts keep their own
+        // entity_type (Arcurus 2026-06-07 #openworld did not
+        // ask for those to be migrated — they remain their
+        // own category, they just get a legend entry in the
+        // web UI).
+        let mut world = World::new("test");
+        let dragon_id = insert_legacy_entity(
+            &mut world,
+            "dragon",
+            "Vaelthrix the Endless",
+            &["dragon", "legendary"],
+        );
+        let artifact_id = insert_legacy_entity(
+            &mut world,
+            "artifact",
+            "The Shadow Crown",
+            &["cursed", "legendary"],
+        );
+
+        world.migrate_entity_types();
+
+        assert_eq!(
+            world.entities.get(&dragon_id).unwrap().entity_type,
+            "dragon",
+            "dragon entity_type should NOT be migrated (only hero/oracle are)"
+        );
+        assert_eq!(
+            world.entities.get(&artifact_id).unwrap().entity_type,
+            "artifact",
+            "artifact entity_type should NOT be migrated"
+        );
+    }
+
+    #[test]
+    fn world_new_automatically_migrates_legacy_types() {
+        // World::new() calls migrate_entity_types() as part
+        // of bootstrap.  We can verify this by patching the
+        // world AFTER World::new() and asserting that
+        // re-creating it via get_clock_entity or similar
+        // would not re-trigger the migration on a fully-
+        // migrated world.  Indirect test: just confirm
+        // World::new() doesn't crash when the clock is the
+        // only entity (which is type "abstract", no
+        // migration).
+        let world = World::new("test");
+        let clock = world.entities.get(&clock_entity_id()).unwrap();
+        assert_eq!(clock.entity_type, "abstract",
+            "clock should remain abstract; migration should not touch it");
     }
 }

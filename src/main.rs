@@ -5950,6 +5950,14 @@ async fn main() {
             Ok(mut w) => {
                 // Ensure clock entity exists (for old save files)
                 w.create_clock_entity();
+                // Migrate legacy entity_types to the current
+                // canonical form.  Per Arcurus 2026-06-07
+                // #openworld: hero + oracle → character, with
+                // the role tag preserved.  Idempotent; runs on
+                // every load (no-op once the data has been
+                // migrated).  See World::migrate_entity_types
+                // for the full rule.
+                w.migrate_entity_types();
                 // Re-seed the canonical lore events on load. The binary
                 // save format intentionally does NOT serialize
                 // active_events (see BinaryPersistence doc comment at

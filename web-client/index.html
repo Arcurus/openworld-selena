@@ -284,6 +284,9 @@
         .legend-dot.location { background: #4ade80; color: #4ade80; }
         .legend-dot.character { background: #c084fc; color: #c084fc; }
         .legend-dot.faction { background: #f87171; color: #f87171; }
+        .legend-dot.artifact { background: #fbbf24; color: #fbbf24; }
+        .legend-dot.abstract { background: #94a3b8; color: #94a3b8; }
+        .legend-dot.dragon { background: #fb923c; color: #fb923c; }
         .legend-dot.default { background: #60a5fa; color: #60a5fa; }
         
         /* Docs Modal */
@@ -750,6 +753,9 @@
                             <option value="location">Locations</option>
                             <option value="character">Characters</option>
                             <option value="faction">Factions</option>
+                            <option value="artifact">Artifacts</option>
+                            <option value="dragon">Dragons</option>
+                            <option value="abstract">Abstract</option>
                         </select>
                         <button class="btn" onclick="refreshEntities()">🔄</button>
                     </div>
@@ -760,7 +766,9 @@
                         <div class="legend-item"><div class="legend-dot location"></div> Location</div>
                         <div class="legend-item"><div class="legend-dot character"></div> Character</div>
                         <div class="legend-item"><div class="legend-dot faction"></div> Faction</div>
-                        <div class="legend-item"><div class="legend-dot default"></div> Other</div>
+                        <div class="legend-item"><div class="legend-dot artifact"></div> Artifact</div>
+                        <div class="legend-item"><div class="legend-dot dragon"></div> Dragon</div>
+                        <div class="legend-item"><div class="legend-dot abstract"></div> Abstract</div>
                     </div>
                 </div>
             </div>
@@ -786,6 +794,22 @@
                         <div class="stat">
                             <div class="stat-value" id="totalCharacters">0</div>
                             <div class="stat-label">Chars</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="totalFactions">0</div>
+                            <div class="stat-label">Factions</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="totalArtifacts">0</div>
+                            <div class="stat-label">Artifacts</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="totalDragons">0</div>
+                            <div class="stat-label">Dragons</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="totalAbstract">0</div>
+                            <div class="stat-label">Abstract</div>
                         </div>
                     </div>
                 </div>
@@ -1184,6 +1208,10 @@
             document.getElementById('totalEntities').textContent = entities.length;
             document.getElementById('totalLocations').textContent = entities.filter(e => e.entity_type === 'location').length;
             document.getElementById('totalCharacters').textContent = entities.filter(e => e.entity_type === 'character').length;
+            document.getElementById('totalFactions').textContent = entities.filter(e => e.entity_type === 'faction').length;
+            document.getElementById('totalArtifacts').textContent = entities.filter(e => e.entity_type === 'artifact').length;
+            document.getElementById('totalDragons').textContent = entities.filter(e => e.entity_type === 'dragon').length;
+            document.getElementById('totalAbstract').textContent = entities.filter(e => e.entity_type === 'abstract').length;
             document.getElementById('listCount').textContent = entities.length;
             document.getElementById('worldEntities').textContent = entities.length;
         }
@@ -1303,6 +1331,9 @@
                 if (entity.entity_type === 'location') color = '#4ade80';
                 else if (entity.entity_type === 'character') color = '#c084fc';
                 else if (entity.entity_type === 'faction') color = '#f87171';
+                else if (entity.entity_type === 'artifact') color = '#fbbf24';
+                else if (entity.entity_type === 'abstract') color = '#94a3b8';
+                else if (entity.entity_type === 'dragon') color = '#fb923c';
                 
                 // Glow for selected
                 if (isSelected) {

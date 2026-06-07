@@ -168,12 +168,13 @@ where it's meaningful.  Arcurus 2026-06-07 #openworld.
   the subject can visit.  Top `MAX_NEARBY_LOCATIONS` (5) by
   influence score.
 - **Characters** — everything else except `location`, `faction`,
-  and system entities (`abstract` — the new canonical umbrella
-  per Arcurus 2026-06-07 #openworld — or anything tagged
-  `meta`.  The legacy string `world_clock` is still
-  recognised for backward compat with pre-migration save
-  files):
-  `character`, `hero`, `oracle`, `dragon`, `artifact`, etc.  All
+  `dragon`, and system entities (`abstract` — the new
+  canonical umbrella per Arcurus 2026-06-07 #openworld — or
+  anything tagged `meta`.  The legacy string `world_clock` is
+  still recognised for backward compat with pre-migration save
+  files): `character` (now includes former `hero` and
+  `oracle` types — they're `character` with a role tag, per
+  Arcurus 2026-06-07 #openworld), `artifact`.  All
   agent-like / interactive individuals and items grouped
   together.  Top `MAX_NEARBY_CHARACTERS` (5) by influence score.
 - **Factions** — `entity_type == "faction"`.  Organised groups
@@ -680,8 +681,82 @@ without putting a real auth layer in front. Currently bound to
 | `max_history_summary_chars` (per-world) | `WorldSettings.max_history_summary_chars` | `0` (use global) | Per-entity override of the cap. |
 | `EFFECT_NORMALIZATION_CAP_PCT` | `main.rs` | `0.10` | Per-turn cap on total `|Δ|` of effects, as a fraction of `power`. Lower → tighter LLM constraints; higher → more room for big swings per turn. |
 | `EFFECT_NORMALIZATION_MIN_CAP` | `main.rs` | `1.0` | Hard floor on the per-turn effect cap (so power-0 entities still have a tiny budget). |
+| `STATS_CAP_POWER_MULTIPLIER` | `main.rs` | `5` | Per-entity stats-cap budget scales with this × power. |
+| `STATS_CAP_BASE` | `main.rs` | `100` | Per-entity stats-cap budget gets this baseline on top of the power-scaled part. |
+| `STATS_CAP_POWER_FLOOR` | `main.rs` | `1` | Floor on the power-multiplier (so power-0 entities still get a small budget). |
+| Hidden-tag threshold | `main.rs → update_hidden_tag` | `max(10, power)/10 + visibility` | Deep hider (threshold < 0) gets the `hidden` tag; ≥ 1 removes it. |
+| Corrupted-tag threshold | `main.rs → update_corrupted_tag` | `max(1, power) - corruption` | Threshold < 0 adds `corrupted`; ≥ 1 removes it. |
+| Hidden/corrupted dead zone | `main.rs → update_hidden_tag`, `update_corrupted_tag` | `[0, 1)` | Tag state doesn't change in this band, so the tag doesn't flicker at the boundary. |
 
 `ow_scheduler_config.json` is read **live** every cycle, so changes
 take effect on the next cycle (no service restart needed).
 `scheduled_actions.py` and Rust files (`entity_history.rs`,
 `main.rs`, `context_builder.rs`) require a service restart.
+
+---
+
+## 12. Auto-Tag Rules (Hidden from the LLM)
+
+These rules run inside `apply_all_effects` after every effect
+write. They are intentionally **not** exposed to the LLM in the
+prompt — the LLM shouldn't be reasoning about the formula, just
+narrating. The operator (and anyone reading this doc) sees the
+mechanics; the LLM sees only the post-write state and the
+`{property_context}` block.
+
+### Hidden-tag rule (`update_hidden_tag`)
+
+For every entity affected by an action (actor + cross-entity
+targets), recompute:
+
+  threshold = `max(10, power) / 10 + visibility`
+  threshold <  0  → add the `hidden` tag
+  threshold >= 1  → remove the `hidden` tag
+  0 ≤ threshold < 1  → no change (small dead zone, prevents
+                          flicker at the boundary)
+
+Returns `(added, removed, threshold)` and emits a warning per
+toggle so operators can see what changed. The threshold and the
+"max(10, power)" floor are tuned so power-0 entities still get a
+small baseline; a power-1 entity has a budget of 2; a power-10
+entity has 11; a power-100 entity has 60. The +1 cap on the
+multiplier (instead of a `+10` floor) keeps brand-new entities
+from flickering on/off the tag due to noisy ±1 visibility
+writes.
+
+### Corrupted-tag rule (`update_corrupted_tag`)
+
+Mirror of the hidden-tag rule, but for the `corruption` property:
+
+  threshold = `max(1, power) - corruption`
+  threshold <  0  → add the `corrupted` tag
+  threshold >= 1  → remove the `corrupted` tag
+  0 ≤ threshold < 1  → no change (dead zone)
+
+Both rules share the same `affected_ids` set inside
+`apply_all_effects`, so they run on the same set of entities in
+the same call. They use independent formulas and are independent
+in practice (a single action can toggle both tags on the same
+entity, e.g. an entity that goes into hiding AND gets corrupted
+at the same time).
+
+### Stats-cap rule (`check_stats_cap_warn`)
+
+For every entity affected by an action, recompute:
+
+  cap = `max(STATS_CAP_POWER_FLOOR, power * STATS_CAP_POWER_MULTIPLIER) + STATS_CAP_BASE`
+  sum = signed sum of all `properties_int` values
+  sum > cap  → emit a warning, do NOT normalize
+
+The runtime path only **warns** (it does not normalize), so a
+single big effect doesn't silently shrink an entity mid-action.
+The standalone `selena-project/code/normalize_stats.py` script
+does the actual proportional scaling when the operator wants to
+fix the over-cap entities (run `preview` first to see the planned
+deltas, then `normalize --yes` to apply).
+
+The cap is keyed on the **original** (pre-normalize) power of
+the entity, and `normalize_entity_stats` scales `power` along
+with every other value (because `power` counts in the sum). The
+post-scaling sum exactly matches the old cap, so no death
+spiral.
