@@ -19,6 +19,7 @@
 | Entity info | `{entity_name}`, `{entity_type}`, `{description}`, `{tags}`, `{x}`, `{y}` | ✅ Implemented | Basic entity identification and location |
 | Power tier | `{power_tier}` | ✅ Implemented | Power classification (e.g., "Low", "Medium", "High", "Legendary") |
 | Property context | `{property_context}` | ✅ Implemented | Entity properties relative to other entities of same type |
+| Property docs | `{property_docs}` | ✅ Implemented | LLM-facing reference for named properties (`visibility`, `corruption`, common props, writing-effects cheat sheet). Loaded from `ai_templates/property_docs.md` at runtime. See [property_docs.md](../ai_templates/property_docs.md). |
 | Entity history | `{entity_history}` | ✅ Implemented | Past actions and events for this entity |
 | Nearby entities | `{nearby_entities}` | ✅ Implemented | Other entities within proximity (150 units), split into three groups: Locations (entity_type=location), Characters (everything else), and Factions (entity_type=faction, top 5 nearest, distance-asc). See [world-mechanics.md §3](./world-mechanics.md#3-nearby-entities-llm-context) for the full formula. |
 | World events | `{world_events}` | ✅ Implemented | Active world events affecting the simulation |

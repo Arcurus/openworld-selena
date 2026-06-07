@@ -10,6 +10,8 @@ Power Tier: {power_tier}
 Properties (relative to other {entity_type} entities in the world):
 {property_context}
 
+{property_docs}
+
 {entity_history}
 
 {history_summary_header}
@@ -19,6 +21,8 @@ Nearby Entities:
 {nearby_entities}
 
 {world_events}
+
+{recent_world_actions}
 
 ---
 
@@ -44,11 +48,6 @@ If the entity already has a property (e.g. `wealth`, `power`, `morale`), use tha
 - The server resolves the name to the entity and **applies the effect to that entity** (it is no longer dry-run). Per-target safety nets are in place: magnitude cap (no single delta > 1e6), per-target normalization (each target's cap is computed from its own `power`, with a +10 max-amount baseline), and the system-entity guard (the World Clock and anything tagged `meta` cannot be written to). You'll see a per-target `Effects normalized on '<name>':` warning if a target's cap is hit, or `Skipped effect on system entity ...` for system-entity targets.
 - **Emit at least one effect per entity you impact in the action** (including yourself), so each entity's history can track the ripple. If your `narrative` mentions a specific entity being affected, that entity should appear in your `effects`.
 - Property names on the right-hand side of the dot still follow the "use existing property names" rule above.
-
-**`visibility` (story signal only):**
-- A high `visibility` means this entity is *exposed* — it stands out, its presence is felt, and other entities will be very aware of it.
-- A negative `visibility` means the entity is *hiding* — withdrawn, concealed, easy to overlook. Other entities will be less aware of it.
-- Use it as a narrative cue: how present or absent does this entity feel in the world right now?
 
 Respond ONLY with valid JSON (no other text before or after). **Always include a `history_summary_replace` field — it is the ONLY way to update the entity's rolling history summary.** See the rules section below for how to use it.
 

@@ -11,6 +11,7 @@
 use crate::world_data::entity_history::format_history_for_llm;
 use crate::world_data::world::{EntityTypeStats, World};
 use crate::world_data::world_entity::WorldEntity;
+use crate::world_data::action_history_log::{self, ActionHistoryEntry};
 
 /// All the context strings an LLM action prompt needs. Built once per
 /// request by `build_action_context`, then handed to `build_action_prompt`.
@@ -37,6 +38,15 @@ pub struct ActionContext {
     /// has left for the next `history_summary_replace` edit. 0 if no
     /// summary has ever been written for this entity.
     pub history_summary_chars_used: u64,
+    /// Recent world actions from the cross-entity action_history.jsonl
+    /// log that the LLM has not yet seen — i.e. entries with
+    /// `timestamp > actor.last_action_at` (or all recent entries if
+    /// the actor has never acted), filtered to drop the actor's own
+    /// most recent action (so the LLM doesn't see "what it's about
+    /// to do") and system-entity actions. Goes into
+    /// `{recent_world_actions}`.
+    /// Per Arcurus 2026-06-07 (#openworld).
+    pub recent_world_actions_str: String,
 }
 
 /// Resolve the effective per-entity history-summary char cap.
@@ -94,6 +104,19 @@ pub fn build_action_context(
             .as_ref()
             .map(|s| s.chars().count() as u64)
             .unwrap_or(0),
+        recent_world_actions_str: {
+            // Load the cross-entity feed (capped) once, then hand
+            // the entries to the pure renderer. Doing the I/O here
+            // (not inside build_recent_world_actions_str) keeps the
+            // renderer unit-testable without touching the live log
+            // file.
+            let cutoff = entity.last_action_at;
+            let raw = action_history_log::load_recent_world_actions(
+                MAX_RECENT_WORLD_ACTIONS,
+                cutoff,
+            );
+            build_recent_world_actions_str(world, entity, &raw)
+        },
     }
 }
 
@@ -122,11 +145,19 @@ fn build_history_summary_header(ctx: &ActionContext) -> String {
 }
 
 /// Render the EntityAction.md template with all placeholders filled.
+///
+/// `property_docs` is the rendered text of
+/// `ai_templates/property_docs.md` — the LLM-facing reference for
+/// named properties (visibility, corruption, etc.).  It is loaded
+/// separately by the caller so the template can stay focused on
+/// the prompt structure and the docs can be edited without
+/// touching the template.
 pub fn build_action_prompt(
     world_name: &str,
     entity: &WorldEntity,
     ctx: &ActionContext,
     template: &str,
+    property_docs: &str,
 ) -> String {
     template
         .replace("{world_name}", world_name)
@@ -137,6 +168,7 @@ pub fn build_action_prompt(
         .replace("{x}", &format!("{:.1}", entity.x))
         .replace("{y}", &format!("{:.1}", entity.y))
         .replace("{property_context}", &ctx.prop_context)
+        .replace("{property_docs}", property_docs)
         .replace("{power_tier}", &ctx.power_tier_str)
         .replace("{entity_history}", &ctx.entity_history_str)
         .replace("{nearby_entities}", &ctx.nearby_entities_str)
@@ -144,6 +176,7 @@ pub fn build_action_prompt(
         .replace("{history_summary}", &ctx.history_summary_str)
         .replace("{max_history_summary_chars}", &ctx.max_history_summary_chars.to_string())
         .replace("{history_summary_header}", &build_history_summary_header(ctx))
+        .replace("{recent_world_actions}", &ctx.recent_world_actions_str)
 }
 
 fn build_property_context(entity: &WorldEntity, type_stats: Option<&EntityTypeStats>) -> String {
@@ -396,6 +429,117 @@ fn build_world_events_str(world: &World) -> String {
         }
     }
     s
+}
+
+/// Maximum number of recent world actions to surface in the
+/// `{recent_world_actions}` block. Tunable. 10 is a sweet spot:
+/// enough to give the LLM a clear "what just happened elsewhere"
+/// picture (typical turn sees 1-3 actions by other entities), not
+/// so many that the prompt bloats.
+const MAX_RECENT_WORLD_ACTIONS: usize = 10;
+
+/// Build the "Recent World Actions" block for the LLM context.
+///
+/// `recent_entries` is the pre-loaded cross-entity feed (most-recent
+/// first), already capped at `MAX_RECENT_WORLD_ACTIONS`. The caller
+/// (`build_action_context`) does the I/O; this function is pure so
+/// tests can pass any list of entries without touching the live
+/// `action_history.jsonl` file.
+///
+/// Filtering rules:
+///   1. Drop the actor's own MOST RECENT action (the one that
+///      triggered this LLM call — the LLM is *generating* that
+///      action, not reacting to it). Other entries by the same
+///      actor (e.g. an earlier action in the same turn) ARE
+///      surfaced, because the LLM benefits from seeing its own
+///      history in the global feed too.
+///   2. Drop system-entity actions (World Clock, anything tagged
+///      'meta' — bookkeeping noise the LLM doesn't need).
+///
+/// Per Arcurus 2026-06-07 (#openworld): "add to the world action
+/// llm call an insertion of not yet processed world actions".
+fn build_recent_world_actions_str(
+    world: &World,
+    entity: &WorldEntity,
+    recent_entries: &[ActionHistoryEntry],
+) -> String {
+    if recent_entries.is_empty() {
+        // No unprocessed actions — most common case (the actor is
+        // acting for the first time, or no other entity has acted
+        // since its last action). Don't render an empty section.
+        return String::new();
+    }
+
+    let mut rows: Vec<String> = Vec::with_capacity(recent_entries.len());
+    let mut dropped_own_most_recent = false;
+    for entry in recent_entries {
+        if !dropped_own_most_recent
+            && entry.entity_id == entity.id.to_string()
+        {
+            dropped_own_most_recent = true;
+            continue;
+        }
+        if is_system_entry(world, entry) {
+            continue;
+        }
+        rows.push(format_recent_action_row(entry));
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("## Recent World Actions (since your last action)\n\n");
+    for r in rows {
+        s.push_str(&r);
+    }
+    s
+}
+
+/// True if the action_history entry was performed by a system entity
+/// (World Clock or anything tagged 'meta'). These are bookkeeping
+/// actions, not narrative events the LLM needs in the recent-feed
+/// block.  Resolved by matching the entry's entity_id against the
+/// world's live entity list, falling back to the entity_name when
+/// the id is missing (shouldn't happen, but be defensive).
+fn is_system_entry(world: &World, entry: &ActionHistoryEntry) -> bool {
+    // Fast path: match by id.
+    if let Some(e) = world.entities.values().find(|e| e.id.to_string() == entry.entity_id) {
+        return e.is_system_entity();
+    }
+    // Fallback: match by exact name (case-sensitive).
+    if let Some(e) = world.entities.values().find(|e| e.name == entry.entity_name) {
+        return e.is_system_entity();
+    }
+    // Unknown entity — assume non-system so we don't silently drop
+    // legitimate narrative actions just because the world forgot
+    // the actor (e.g. after a load + entity prune).
+    false
+}
+
+/// Format one recent-action row for the LLM context. Compact
+/// one-liner: `- [HH:MM] EntityName: action_name — outcome`
+///
+/// We truncate the outcome to ~200 chars to keep the section
+/// bounded; the full narrative is in the entity's own history
+/// block (the actor's history is included in `{entity_history}`
+/// anyway, and a peek into other entities' most recent outcomes
+/// is what we want here, not their full narrative).
+fn format_recent_action_row(entry: &ActionHistoryEntry) -> String {
+    let ts = entry.timestamp.format("%Y-%m-%d %H:%M");
+    let outcome_one_line = entry
+        .outcome
+        .replace('\n', " ")
+        .chars()
+        .take(200)
+        .collect::<String>();
+    let outcome_suffix = if entry.outcome.chars().count() > 200 {
+        "…"
+    } else {
+        ""
+    };
+    format!(
+        "- [{}] **{}**: `{}` — {}{}\n",
+        ts, entry.entity_name, entry.action, outcome_one_line, outcome_suffix
+    )
 }
 
 #[cfg(test)]
@@ -961,14 +1105,15 @@ mod tests {
             history_summary_str: "summary".to_string(),
             max_history_summary_chars: 500,
             history_summary_chars_used: 7,
+            recent_world_actions_str: "recent".to_string(),
         };
-        let template = "{world_name} {entity_name} {entity_type} {description} {tags} {x} {y} {property_context} {power_tier} {entity_history} {nearby_entities} {world_events} {history_summary} {max_history_summary_chars} {history_summary_header}";
-        let result = build_action_prompt("Middle Earth", &entity, &ctx, template);
+        let template = "{world_name} {entity_name} {entity_type} {description} {tags} {x} {y} {property_context} {property_docs} {power_tier} {entity_history} {nearby_entities} {world_events} {history_summary} {max_history_summary_chars} {history_summary_header}";
+        let result = build_action_prompt("Middle Earth", &entity, &ctx, template, "DOCS");
         // 7 chars of summary already used; cap 500 ⇒ 493 free.
         // The header now includes that breakdown.
         assert_eq!(
             result,
-            "Middle Earth Aragorn hero A test entity test 10.0 20.0 props tier hist near events summary 500 Current History Summary (cap 500 chars, used 7, 493 free):"
+            "Middle Earth Aragorn hero A test entity test 10.0 20.0 props DOCS tier hist near events summary 500 Current History Summary (cap 500 chars, used 7, 493 free):"
         );
     }
 
@@ -977,7 +1122,7 @@ mod tests {
         let entity = make_entity("X", 1.0, 2.0);
         let ctx = ActionContext::default();
         let template = "static text with no placeholders";
-        let result = build_action_prompt("W", &entity, &ctx, template);
+        let result = build_action_prompt("W", &entity, &ctx, template, "");
         assert_eq!(result, "static text with no placeholders");
     }
 
@@ -1026,8 +1171,9 @@ mod tests {
             history_summary_str: String::new(),
             max_history_summary_chars: 500,
             history_summary_chars_used: 0,
+            recent_world_actions_str: String::new(),
         };
-        let rendered = build_action_prompt("TestWorld", &entity, &ctx, &template);
+        let rendered = build_action_prompt("TestWorld", &entity, &ctx, &template, "");
 
         // The example block is the first top-level `{{ ... }}` in the
         // rendered template (line `{{` ... line `}}`). The rendered
@@ -1087,5 +1233,177 @@ mod tests {
                 e, example_unescaped, example_raw
             )
         });
+    }
+
+    // -- build_recent_world_actions_str tests ------------------------
+    // Per Arcurus 2026-06-07 (#openworld): the world-action LLM
+    // prompt must include a feed of recent cross-entity actions
+    // that the actor has not yet seen.  This is the pure renderer
+    // (it takes pre-loaded entries, so tests don't touch the live
+    // `action_history.jsonl` log).
+    use chrono::{TimeZone, Utc};
+
+    fn entry_at(
+        entity_id: &str,
+        entity_name: &str,
+        action: &str,
+        outcome: &str,
+        ts_secs: i64,
+    ) -> ActionHistoryEntry {
+        ActionHistoryEntry {
+            entity_id: entity_id.to_string(),
+            entity_name: entity_name.to_string(),
+            timestamp: Utc.timestamp_opt(ts_secs, 0).unwrap(),
+            action: action.to_string(),
+            outcome: outcome.to_string(),
+            details: String::new(),
+            effects: serde_json::Map::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recent_world_actions_empty_when_no_entries() {
+        let world = make_world();
+        let entity = make_entity("Lone", 50000.0, 50000.0);
+        let result = build_recent_world_actions_str(&world, &entity, &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn recent_world_actions_renders_recent_entries() {
+        let mut world = make_world();
+        let mut me = make_entity("Me", 10000.0, 10000.0);
+        let me_id = me.id;
+        let mut other = make_entity("Other", 10100.0, 10100.0);
+        other.entity_type = "character".to_string();
+        let other_id = other.id;
+        world.entities.insert(me_id, me.clone());
+        world.entities.insert(other_id, other.clone());
+
+        // Feed: 1 most-recent by Other, then 1 by Me (older).
+        let raw = vec![
+            entry_at(&other_id.to_string(), "Other", "do_x", "x outcome", 3000),
+            entry_at(&me_id.to_string(), "Me", "do_y", "y outcome", 2000),
+        ];
+        let result = build_recent_world_actions_str(&world, &me, &raw);
+        assert!(result.starts_with("## Recent World Actions"));
+        // Other's action is rendered
+        assert!(result.contains("**Other**"), "got: {}", result);
+        assert!(result.contains("`do_x`"), "got: {}", result);
+        // Me's OLDER action also surfaces (we only drop the most-recent
+        // Me entry, not all of them)
+        assert!(result.contains("**Me**"), "got: {}", result);
+        assert!(result.contains("`do_y`"), "got: {}", result);
+    }
+
+    #[test]
+    fn recent_world_actions_drops_actors_own_most_recent() {
+        // If the most-recent entry in the feed is the actor's own
+        // action, it must be filtered out (so the LLM doesn't see
+        // "what it's about to do" — it IS generating that action).
+        let mut world = make_world();
+        let me = make_entity("Me", 10000.0, 10000.0);
+        let me_id = me.id;
+        world.entities.insert(me_id, me.clone());
+
+        let raw = vec![
+            entry_at(&me_id.to_string(), "Me", "self_act", "self outcome", 5000),
+            entry_at(&me_id.to_string(), "Me", "old_self_act", "old outcome", 2000),
+        ];
+        let result = build_recent_world_actions_str(&world, &me, &raw);
+        // The most-recent (self_act) is dropped
+        assert!(!result.contains("`self_act`"), "got: {}", result);
+        // The older one stays
+        assert!(result.contains("`old_self_act`"), "got: {}", result);
+    }
+
+    #[test]
+    fn recent_world_actions_drops_system_entities() {
+        // Build a world with the World Clock (system entity) and a
+        // normal actor.  The clock's actions must be filtered out.
+        let mut world = make_world();
+        // Use a non-actor entity as the clock target.
+        let clock_id = uuid::Uuid::nil();
+        let me = make_entity("Me", 10000.0, 10000.0);
+        let me_id = me.id;
+        world.entities.insert(me_id, me.clone());
+
+        let raw = vec![
+            // Most-recent: clock action (system) — should be dropped
+            entry_at(
+                "00000000-0000-0000-0000-000000000001",
+                "World Clock",
+                "tick",
+                "time passes",
+                9000,
+            ),
+            // Next: Me's own most-recent — should also be dropped
+            entry_at(&me_id.to_string(), "Me", "self_act", "self outcome", 8000),
+            // Older: a normal character's action — should surface
+            entry_at(
+                "11111111-1111-1111-1111-111111111111",
+                "Normal NPC",
+                "patrol",
+                "walked the walls",
+                7000,
+            ),
+        ];
+        let result = build_recent_world_actions_str(&world, &me, &raw);
+        // The clock's tick is dropped
+        assert!(!result.contains("World Clock"), "got: {}", result);
+        assert!(!result.contains("`tick`"), "got: {}", result);
+        // The Me self action is dropped
+        assert!(!result.contains("`self_act`"), "got: {}", result);
+        // The normal NPC's action surfaces
+        assert!(result.contains("**Normal NPC**"), "got: {}", result);
+        assert!(result.contains("`patrol`"), "got: {}", result);
+    }
+
+    #[test]
+    fn recent_world_actions_returns_empty_if_all_filtered() {
+        // If every entry is the actor's most-recent (i.e. one entry
+        // by the actor, nothing else) the section must be omitted
+        // entirely (no header alone).
+        let mut world = make_world();
+        let me = make_entity("Me", 10000.0, 10000.0);
+        let me_id = me.id;
+        world.entities.insert(me_id, me.clone());
+
+        let raw = vec![entry_at(
+            &me_id.to_string(),
+            "Me",
+            "only_act",
+            "only outcome",
+            5000,
+        )];
+        let result = build_recent_world_actions_str(&world, &me, &raw);
+        assert!(result.is_empty(), "expected empty, got: {}", result);
+    }
+
+    #[test]
+    fn recent_world_actions_truncates_long_outcomes() {
+        let mut world = make_world();
+        let mut other = make_entity("Bard", 10100.0, 10100.0);
+        other.entity_type = "character".to_string();
+        let other_id = other.id;
+        let me = make_entity("Me", 10000.0, 10000.0);
+        let me_id = me.id;
+        world.entities.insert(me_id, me.clone());
+        world.entities.insert(other_id, other.clone());
+
+        // 500-char outcome — must be truncated to ~200 + ellipsis.
+        let long_outcome: String = "x".repeat(500);
+        let raw = vec![entry_at(
+            &other_id.to_string(),
+            "Bard",
+            "compose",
+            &long_outcome,
+            3000,
+        )];
+        let result = build_recent_world_actions_str(&world, &me, &raw);
+        assert!(result.contains("…"), "expected ellipsis on long outcome");
+        // Should NOT contain all 500 xs
+        assert!(!result.contains(&"x".repeat(300)), "outcome not truncated");
     }
 }
