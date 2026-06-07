@@ -162,11 +162,17 @@ impl WorldEntity {
     }
 
     /// True if this is a system (non-LLM-driven) entity. Identified by
-    /// `entity_type == "world_clock"` or any tag of `"meta"`. Property
-    /// writes to such entities are blocked at the LLM-effect layer to
-    /// prevent garbage from corrupting world state (see todo c7f3bc27).
+    /// `entity_type == "abstract"` (the new umbrella category per
+    /// Arcurus 2026-06-07 #openworld, which replaced the narrower
+    /// `"world_clock"` name), or `entity_type == "world_clock"`
+    /// (kept for backward compat with pre-migration save files), or
+    /// any tag of `"meta"`. Property writes to such entities are
+    /// blocked at the LLM-effect layer to prevent garbage from
+    /// corrupting world state (see todo c7f3bc27).
     pub fn is_system_entity(&self) -> bool {
-        self.entity_type == "world_clock" || self.has_tag("meta")
+        self.entity_type == "abstract"
+            || self.entity_type == "world_clock"
+            || self.has_tag("meta")
     }
 
     /// Add a tag
@@ -337,11 +343,24 @@ mod tests {
 
     #[test]
     fn test_is_system_entity() {
-        // world_clock type -> system
+        // world_clock type -> system (legacy, kept for
+        // backward compat with pre-2026-06-07 save files)
         let mut clock = WorldEntity::new("world_clock", "World Clock", 0.0, 0.0);
         assert!(clock.is_system_entity());
 
-        // meta tag -> system
+        // abstract type -> system (new canonical type for
+        // the clock + future non-narrative bookkeeping
+        // entities; per Arcurus 2026-06-07 #openworld)
+        let mut abstract_entity = WorldEntity::new("abstract", "World Clock", 0.0, 0.0);
+        assert!(abstract_entity.is_system_entity());
+
+        // Any other "abstract" entity (e.g. a hypothetical
+        // "Lore Anchor" or "Time Marker") also counts.
+        let mut marker = WorldEntity::new("abstract", "Spring Equinox Marker", 0.0, 0.0);
+        assert!(marker.is_system_entity());
+
+        // meta tag -> system (tag-based recognition still
+        // works for any entity_type)
         let mut meta = WorldEntity::new("config", "Meta Config", 0.0, 0.0);
         meta.add_tag("meta");
         assert!(meta.is_system_entity());
@@ -354,5 +373,10 @@ mod tests {
         let mut loc = WorldEntity::new("location", "Oak Valley", 0.0, 0.0);
         loc.add_tag("peaceful");
         assert!(!loc.is_system_entity());
+
+        // abstract entity without meta tag is still system
+        // (recognition is on entity_type, not on tag)
+        let bare = WorldEntity::new("abstract", "Bare Marker", 0.0, 0.0);
+        assert!(bare.is_system_entity());
     }
 }

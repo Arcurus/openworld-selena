@@ -7,6 +7,27 @@ use uuid::Uuid;
 use crate::world_data::time_system::WorldTime;
 
 /// Special entity type for world clock
+/// Canonical entity_type for non-physical, non-narrative
+/// system entities. Per Arcurus 2026-06-07 #openworld:
+/// "abstract" replaced the narrower "world_clock" name (which
+/// could only ever describe one specific entity, the clock).
+/// "abstract" is the umbrella for time trackers, world-state
+/// markers, lore-event anchors, and any other bookkeeping
+/// entity that exists to support the simulation without being
+/// a real actor in the narrative.
+///
+/// For backward compatibility with pre-2026-06-07 save files
+/// that still have `entity_type == "world_clock"`, the
+/// system-entity guard (`is_system_entity` in
+/// `WorldEntity.rs`) recognises BOTH strings, and the clock
+/// bootstrap path (`create_clock_entity`) migrates the live
+/// world clock from "world_clock" to "abstract" on first
+/// load after this commit.
+pub(crate) const ABSTRACT_ENTITY_TYPE: &str = "abstract";
+
+/// Legacy alias kept for any code path that still references
+/// the old clock-specific name.  New code should use
+/// `ABSTRACT_ENTITY_TYPE`.
 const CLOCK_ENTITY_TYPE: &str = "world_clock";
 
 /// Represents an active world event that influences entity actions
@@ -463,7 +484,14 @@ impl World {
     /// Create the world clock entity if it doesn't exist
     pub fn create_clock_entity(&mut self) {
         if !self.entities.contains_key(&clock_entity_id()) {
-            let mut clock = WorldEntity::new(CLOCK_ENTITY_TYPE, "World Clock", 0.0, 0.0);
+            // Use the new "abstract" entity_type for fresh
+            // boots.  The clock is one of several possible
+            // abstract entities (time trackers, world-state
+            // markers, lore-event anchors); the broader
+            // category name fits better than a clock-specific
+            // string.  See ABSTRACT_ENTITY_TYPE for the full
+            // rationale.
+            let mut clock = WorldEntity::new(ABSTRACT_ENTITY_TYPE, "World Clock", 0.0, 0.0);
             clock.id = clock_entity_id();
             clock.description = "The world clock entity that tracks time in ticks".to_string();
             clock.tags.push("meta".to_string());
@@ -476,6 +504,23 @@ impl World {
             clock.properties_string.insert("last_real_time".to_string(), Utc::now().to_rfc3339());
             
             self.entities.insert(clock_entity_id(), clock);
+        } else {
+            // Migration path for pre-2026-06-07 save files
+            // (Per Arcurus 2026-06-07 #openworld: rename
+            // `entity_type` from the clock-specific
+            // "world_clock" to the broader "abstract"
+            // category).  We migrate in place — the entity
+            // already exists, so we just update its type.  The
+            // meta tag and the clock_entity_id() key are
+            // unchanged, so the system-entity guard continues
+            // to work via either string (the guard recognises
+            // both for safety).
+            if let Some(existing) = self.entities.get_mut(&clock_entity_id()) {
+                if existing.entity_type == CLOCK_ENTITY_TYPE {
+                    existing.entity_type = ABSTRACT_ENTITY_TYPE.to_string();
+                    existing.updated_at = chrono::Utc::now();
+                }
+            }
         }
     }
     

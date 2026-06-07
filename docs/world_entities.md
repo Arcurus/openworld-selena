@@ -16,7 +16,7 @@
 **Live counts** (from `GET /api/entities`, 2026-06-04):
 - Total: 18 entities
 - Legendary tier: 3 (Vaelthrix, Velora, World Clock)
-- Type breakdown: 7 locations, 5 characters, 2 factions, 2 heroes, 1 dragon, 1 artifact, 1 oracle, 1 world_clock, 1 location (Scribe is character; miscounted here, see roster below for ground truth)
+- Type breakdown: 7 locations, 5 characters, 2 factions, 2 heroes, 1 dragon, 1 artifact, 1 oracle, 1 abstract (world clock), 1 location (Scribe is character; miscounted here, see roster below for ground truth)
 
 ---
 
@@ -25,7 +25,7 @@
 | # | Name | Type | Power | Position | Description |
 |---|------|------|-------|----------|-------------|
 | ★ 1 | **Vaelthrix the Endless** | `dragon` | 2000 (Legendary) | (500, 100) | Ancient dragon stirring in northern mountains |
-| ★ 2 | **World Clock** | `world_clock` | 1500 (Legendary) | (0, 0) | Meta-entity that tracks world time |
+| ★ 2 | **World Clock** | `abstract` | 1500 (Legendary) | (0, 0) | Meta-entity that tracks world time |
 | ★ 3 | **Velora the Undying** | `hero` | 1500 (Legendary) | (250, 400) | Cursed knight who refused death itself |
 | 4 | **The Shadow Crown** | `artifact` | 300 (Rare) | (500, 250) | Blackened silver circlet that creates new Shadows |
 | 5 | **Kira Dawnblade** | `hero` | 180 (Uncommon) | (340, 220) | Young knight marked by the prophecy |
@@ -89,7 +89,7 @@ Restored 2026-06-03 20:30 in commit `a5cb4c8`.
 
 ### Group C — Auto-created
 
-- **World Clock** — `world_clock` (auto-created on first server load, power=1500)
+- **World Clock** — `abstract` (auto-created on first server load, power=1500)
 
 ### Notable entities from lore NOT YET in the world (future adds)
 

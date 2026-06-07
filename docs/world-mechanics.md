@@ -168,7 +168,11 @@ where it's meaningful.  Arcurus 2026-06-07 #openworld.
   the subject can visit.  Top `MAX_NEARBY_LOCATIONS` (5) by
   influence score.
 - **Characters** — everything else except `location`, `faction`,
-  and system entities (`world_clock`, anything tagged `meta`):
+  and system entities (`abstract` — the new canonical umbrella
+  per Arcurus 2026-06-07 #openworld — or anything tagged
+  `meta`.  The legacy string `world_clock` is still
+  recognised for backward compat with pre-migration save
+  files):
   `character`, `hero`, `oracle`, `dragon`, `artifact`, etc.  All
   agent-like / interactive individuals and items grouped
   together.  Top `MAX_NEARBY_CHARACTERS` (5) by influence score.
@@ -452,9 +456,12 @@ no magnitude to cap.
 
 ### What's NOT included in the total
 
-- **Protected entities** (system entities with `world_clock` or
-  `meta` tags): all effects are blocked entirely before this
-  pre-pass. The scale is 1.0 for them.
+- **Protected entities** (system entities with `abstract`
+  entity_type — the new umbrella for non-narrative bookkeeping
+  entities per Arcurus 2026-06-07 #openworld — or `meta`
+  tags): all effects are blocked entirely before this pre-pass.
+  The scale is 1.0 for them.  The legacy string
+  `world_clock` is still recognised for backward compat.
 - **Magnitude-rejected deltas** (e.g. `1e18` floats, NaN, Inf):
   skipped by the existing `magnitude_check` step, so they don't
   count toward the total. The "garbage in" guard runs first;
