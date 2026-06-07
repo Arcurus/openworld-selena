@@ -576,8 +576,21 @@ reflects them — that's the whole point of the
 - [YYYY-MM-DD HH:MM] **EntityName**: `action_name` — outcome (effects applied)
 ```
 
-with the outcome truncated to 200 chars + `…` (same
-length as the older `recent_world_actions_str` block).
+with the outcome in full (up to 1000 chars).  Per
+Arcurus 2026-06-07 (#openworld): "please dont cut it,
+or cut it very high at 1000 chars or so and log a
+warning if you do!"  The unprocessed block carries the
+full description of the other entities' events that
+the LLM needs to process, so the outcome is not
+truncated for space-saving.  Only as a safety net for
+unusually long outcomes (> 1000 chars) do we truncate
+to 1000 + `…`, and we log a warning when we do
+(server-side, NOT to the LLM).  Note: the entity's
+OWN history block (`{entity_history}`) always shows
+the FULL outcome (no truncation) — only the "short"
+mode there drops the `details` field, not the
+outcome.  The 1000-char safety net here is a per-row
+cap on the OTHER entities' events block only.
 
 ---
 

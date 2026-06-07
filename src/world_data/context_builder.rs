@@ -599,8 +599,18 @@ const MAX_UNPROCESSED_OTHER_ACTIONS_CHARS: usize = 9_500;
 ///     that they are applied already").  The LLM doesn't
 ///     need to re-emit them, just be aware of the
 ///     relationship change.
-///   - Outcome truncated to 200 chars + ellipsis (matches
-///     the `recent_world_actions_str` block length).
+///   - Outcome: full text (up to 1000 chars) is shown in
+///     each row.  Per Arcurus 2026-06-07 (#openworld):
+///     "please dont cut it, or cut it very high at 1000
+///     chars or so and log a warning if you do!"  The
+///     unprocessed block carries the FULL description of
+///     the other entities' events that the LLM needs to
+///     process, so the outcome is not truncated for
+///     space-saving purposes.  Only as a safety net for
+///     unusually long outcomes (> 1000 chars) do we
+///     truncate to 1000 + `…`, and we log a warning when
+///     we do (server-side, NOT to the LLM).  See
+///     `format_unprocessed_other_action_row`.
 ///   - If the char cap is reached, the OLDEST entries are
 ///     KEPT and the NEWEST ones are dropped.  Per Arcurus
 ///     2026-06-07: "we first fill the 10k with the oldest
@@ -849,32 +859,65 @@ pub fn compute_max_unprocessed_tick(
     max_tick
 }
 
+/// Outcome truncation cap for the unprocessed-other-actions
+/// block.  Per Arcurus 2026-06-07 (#openworld): "please dont
+/// cut it, or cut it very high at 1000 chars or so and log a
+/// warning if you do!" — the unprocessed block carries the
+/// full description of the other entities' events that the
+/// LLM needs to process, so it should NOT truncate just to
+/// save space.  We cut only as a safety net for unusually
+/// long outcomes (> 1000 chars), and we log a warning when
+/// we do.
+///
+/// Note: the entity's OWN history block
+/// (`{entity_history}`, rendered by `format_history_for_llm`)
+/// always shows the FULL outcome (no truncation) — only the
+/// "short" mode there drops the `details` field, not the
+/// outcome.  The truncation here is a per-row safety net for
+/// the unprocessed block.
+const UNPROCESSED_OUTCOME_MAX_CHARS: usize = 1_000;
+
 /// Format one unprocessed-other-action row for the LLM
-/// context.  Compact one-liner:
+/// context.  One row per action:
 ///
-/// `- [YYYY-MM-DD HH:MM] **EntityName**: \`action_name\` — outcome (effects applied)`
+/// `- [YYYY-MM-DD HH:MM] **EntityName**: \`action_name\` — <full outcome> (effects applied)`
 ///
-/// Per Arcurus 2026-06-07 (#openworld): "no need to mention
-/// the effects, just that they are applied already".  We
-/// show the action and the outcome (truncated) and append
-/// a single "(effects applied)" tag so the LLM knows the
-/// state has already been updated.
+/// Per Arcurus 2026-06-07 (#openworld): "we added the full
+/// description of the other event" — so we keep the FULL
+/// outcome (no truncation) for outcomes up to
+/// `UNPROCESSED_OUTCOME_MAX_CHARS = 1000` chars.  Above
+/// that we truncate to 1000 + `…` and log a warning.
+///
+/// Also per Arcurus 2026-06-07: "no need to mention the
+/// effects, just that they are applied already" — we
+/// append a single "(effects applied)" tag so the LLM knows
+/// the state has already been updated.
 fn format_unprocessed_other_action_row(entry: &ActionHistoryEntry) -> String {
     let ts = entry.timestamp.format("%Y-%m-%d %H:%M");
-    // Truncate the LLM's free-text outcome to 200 chars +
-    // ellipsis so each row is a one-liner.  Matches the
-    // truncation length used by the older
-    // `recent_world_actions_str` block — keeps the
-    // per-row length consistent across the prompt.
-    // The full outcome text lives in action_history.jsonl
-    // if the LLM ever needs it.
-    let outcome_one_line = entry
-        .outcome
-        .replace('\n', " ")
+    let outcome_full = entry.outcome.replace('\n', " ");
+    let outcome_chars = outcome_full.chars().count();
+    if outcome_chars > UNPROCESSED_OUTCOME_MAX_CHARS {
+        // Safety-net truncation: outcome is unusually
+        // long.  Per Arcurus 2026-06-07, log a warning
+        // so the operator knows which entry was cut.
+        // This is rare in practice (only 1 of 4000+
+        // entries on the live world has outcome > 1000
+        // chars; the typical LLM-emit outcome is 200-
+        // 500 chars).
+        eprintln!(
+            "[unprocessed-other-actions] truncated outcome for {} `{}` (tick {}): original {} chars, cut to {}",
+            entry.entity_name,
+            entry.action,
+            entry.tick,
+            outcome_chars,
+            UNPROCESSED_OUTCOME_MAX_CHARS
+        );
+    }
+    let outcome_one_line: String = outcome_full
         .chars()
-        .take(200)
-        .collect::<String>();
-    let outcome_suffix = if entry.outcome.chars().count() > 200 {
+        .take(UNPROCESSED_OUTCOME_MAX_CHARS)
+        .collect();
+    let outcome_suffix = if outcome_chars > UNPROCESSED_OUTCOME_MAX_CHARS {
         "…"
     } else {
         ""
@@ -2204,5 +2247,67 @@ mod tests {
         // is the filter), max tick = 0 (default).
         let max = compute_max_unprocessed_tick(&world, me, &raw, 10);
         assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn unprocessed_outcome_full_when_under_1000_chars() {
+        // Per Arcurus 2026-06-07 (#openworld): "please
+        // dont cut it, or cut it very high at 1000 chars
+        // or so".  An outcome of 800 chars should appear
+        // in full in the row (no truncation).
+        let (world, me_id, bard_id) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut effects = serde_json::Map::new();
+        effects.insert("Me.health".to_string(), serde_json::json!(-1));
+        let long_outcome = "a".repeat(800);
+        let raw = vec![entry_with_effects(
+            &bard_id.to_string(),
+            "Bard",
+            "attack",
+            &long_outcome,
+            3000,
+            1,
+            effects,
+        )];
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        // The full 800 'a' chars should be present (no
+        // truncation under 1000).
+        assert!(result.contains(&"a".repeat(800)));
+        // And the row should NOT end with ellipsis
+        // (only added when truncated).
+        let row = result.lines().find(|l| l.contains("Bard")).unwrap();
+        assert!(!row.contains("…"), "row should not be truncated (got: {})", row);
+    }
+
+    #[test]
+    fn unprocessed_outcome_safety_net_truncates_above_1000_chars() {
+        // Per Arcurus 2026-06-07: "cut it very high at
+        // 1000 chars or so and log a warning if you
+        // do!".  An outcome > 1000 chars is truncated to
+        // 1000 + ellipsis, and the function would log a
+        // warning (we just check the row content here,
+        // not the eprintln output).
+        let (world, me_id, bard_id) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut effects = serde_json::Map::new();
+        effects.insert("Me.health".to_string(), serde_json::json!(-1));
+        let too_long_outcome = "b".repeat(1500);
+        let raw = vec![entry_with_effects(
+            &bard_id.to_string(),
+            "Bard",
+            "attack",
+            &too_long_outcome,
+            3000,
+            1,
+            effects,
+        )];
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        // The row should end with ellipsis (truncated).
+        let row = result.lines().find(|l| l.contains("Bard")).unwrap();
+        assert!(row.contains("…"), "row should be truncated (got: {}...)", &row[..row.len().min(200)]);
+        // The 1500 b's should NOT all be present (truncated).
+        assert!(!result.contains(&"b".repeat(1500)));
+        // But 1000 b's SHOULD be present (cut to 1000).
+        assert!(result.contains(&"b".repeat(1000)));
     }
 }
