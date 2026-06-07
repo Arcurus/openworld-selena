@@ -418,7 +418,8 @@ When the LLM is called for an entity, it gets a block listing
 haven't yet been folded into its `history_summary`**. The LLM
 uses this to keep its narrative memory in sync with what other
 entities have done to it (and, in the `history_summary_replace`
-edit, it can mention the relationship change).
+edit, it can mention the relationship change + the action it
+just emitted itself).
 
 Per Arcurus 2026-06-07 (#openworld):
 - "for the connection we go for now if the entity was affected
@@ -429,6 +430,8 @@ Per Arcurus 2026-06-07 (#openworld):
   now no need to mention the effects, just that they are
   applied already.  put as many unprocessed world actions from
   other entities in as they fit in the 10k"
+- "the llm call dont need to know about the marker.  i guess
+  that is meant for our design (and doku) right?"
 
 ### Mechanics (operator-facing, not LLM-facing)
 
@@ -448,12 +451,21 @@ Per Arcurus 2026-06-07 (#openworld):
    a `properties_int["last_processed_other_tick"]: i64`
    that records the highest tick this entity has been
    shown in its unprocessed-other-actions block.  On every
-   `action/llm` (or `action/process`) call for the
-   entity, `entity_history::add_to_history` advances the
-   marker to `world.action_count` (pre-increment; the
-   just-recorded action gets the same tick).  This means
-   old actions naturally fall out of the 10K-char window
-   even if the LLM didn't write a `history_summary_replace`.
+   `action/process` call for the entity,
+   `entity_history::add_to_history` advances the marker
+   to **the max tick of the entries that were rendered in
+   the unprocessed block during this call** (per Arcurus
+   2026-06-07: "it needs to be set to the creating tick
+   time of the other history message last included in the
+   llm to process").  If no entries were shown (filter
+   empty OR cap too tight), the marker does NOT advance.
+
+   The marker property is operator-only — it lives in
+   `properties_int` but is listed in
+   `world_data::internal_properties::LLM_INTERNAL_INT_PROPERTIES`,
+   so it's filtered out of every LLM-facing context block
+   and is reject-from-LLM-emit-effect protected (see § 5c
+   below).
 
 3. **Manual override.** An operator can set the marker
    manually to skip the backfill or to force reprocessing:
@@ -478,36 +490,68 @@ Per Arcurus 2026-06-07 (#openworld):
      entities that touched it, that the LLM hasn't
      seen yet.
 
-5. **Char cap.** The block is capped at
-   `MAX_UNPROCESSED_OTHER_ACTIONS_CHARS = 9_500` chars
+5. **Char cap = 9 500, oldest-first.** The block is capped
+   at `MAX_UNPROCESSED_OTHER_ACTIONS_CHARS = 9_500` chars
    (close to the 10K Arcurus mentioned, with headroom
-   for the header + rest of the prompt).  If the
-   filtered list exceeds the cap, the **oldest** rows
-   are dropped first (so the LLM always sees the most
-   recent actions, which are the ones most likely to
-   matter for its next move).  The cap is silent from
-   the LLM's point of view: no "and N more" line, no
-   "oldest first" hint, no mention of the marker. The
-   "no hidden mechanics" rule (see AGENTS.md) wins
-   over the operator's debugging convenience.
+   for the header + rest of the prompt).  Per Arcurus
+   2026-06-07: "we first fill the 10k with the oldest
+   not processed messages, and log a warning if not all
+   fittet in.  if the next does fit in, simply dont put
+   it in, done.  next time it will continue with it."
+
+   The renderer sorts the matching entries by
+   WALL-CLOCK TIMESTAMP ASC (oldest in time first) — the
+   LLM reads the rows in chronological order.  The
+   marker, on the other hand, is a tick-based filter
+   (because the tick is the durable monotonic counter
+   and the backfilled values aren't strictly
+   wall-clock-monotonic).
+
+   If the cap is hit, the OLDEST rows are kept and the
+   NEWEST ones are dropped.  The dropped rows stay
+   above the marker, so the next LLM call re-sees them
+   — the LLM works through the backlog chronologically.
+   One warning is logged per call (server-side, NOT to
+   the LLM).
+
+   If the cap is so tight that even one row doesn't
+   fit (degenerate case; the cap is 9.5K chars and a
+   typical row is ~280 chars, so 30+ rows fit), the
+   block is omitted from the prompt, an ERROR is logged
+   to the server log, and the per-entity marker does
+   NOT advance (so the operator can investigate
+   without the data slipping past).
 
 6. **Prompt position.** Right after `{entity_history}`,
    before `{history_summary_header}` / `{history_summary}`.
    Order in `EntityAction.md` (2026-06-07): history →
    unprocessed-other-actions → history summary →
    nearby entities → world events → recent world actions.
+   The block is rendered ONLY if there are entries to
+   show (per Arcurus: "the hole new paragraph needs only
+   to be included if there was still a not yet included /
+   processed impact from another entities action"); when
+   empty, the placeholder renders to `''` and no
+   header / "no actions" line appears in the prompt.
 
 ### Why relations are in the history summary (for now)
 
-The LLM is told "**Mention the impact and any change of
-relations in your `history_summary_replace`**" in the new
-block. Per Arcurus 2026-06-07: "for now all relations are
-in the history summary. we see later if we put them in
-querriable properties". So:
+The LLM is told "**You should mention their impact and
+any change of relations in your `history_summary_replace`,
+AND you should also include the action you just emitted
+itself, so your narrative memory stays in sync with what
+other entities have been doing and with what you just
+did**" in the new block.  Per Arcurus 2026-06-07: "for
+now all relations are in the history summary.  we see
+later if we put them in querriable properties".  So:
 
 - The unprocessed-other-actions block is a **reminder**
   ("this happened, you should mention it in your
   summary"), not a structured relation store.
+- The LLM's own just-emitted action also needs to be
+  folded into the same `history_summary_replace`
+  (per Arcurus: "mention that also the action done
+  itself needs to be included").
 - Relations remain an LLM-written prose section inside
   the per-entity `history_summary`, formatted as
   `→ <other entity name>: <2-4 dense sentences>` per
@@ -523,7 +567,7 @@ querriable properties". So:
 ### Why no "effects" in the prompt row
 
 Per Arcurus 2026-06-07: "no need to mention the effects,
-just that they are applied already". The LLM doesn't
+just that they are applied already".  The LLM doesn't
 need to re-emit them (the world's state already
 reflects them — that's the whole point of the
 "processed" mark).  The row format is:
@@ -532,10 +576,8 @@ reflects them — that's the whole point of the
 - [YYYY-MM-DD HH:MM] **EntityName**: `action_name` — outcome (effects applied)
 ```
 
-with the outcome truncated to 150 chars + `…` (vs.
-200 chars in the older "recent world actions" block
-— shorter because this block is denser and the LLM
-already has the surrounding context).
+with the outcome truncated to 200 chars + `…` (same
+length as the older `recent_world_actions_str` block).
 
 ---
 
@@ -820,6 +862,74 @@ take effect on the next cycle (no service restart needed).
 `main.rs`, `context_builder.rs`) require a service restart.
 
 ---
+
+## 5c. Internal / Operator-Only Properties (Hidden from the LLM)
+
+Per Arcurus 2026-06-07 (#openworld): "best make a list
+that we can then update if we add new, so all the code
+that touches properties knows to ignore them.  ...
+also protect it from being updated by effects.  if we
+add more we just need it ad to the list and not change
+code again.  dokument it."
+
+The list lives in
+`src/world_data/internal_properties.rs` as three const
+slices (one per property type — int / float / string).
+Currently:
+
+| Property | Type | Purpose | Written by |
+|---|---|---|---|
+| `last_processed_other_tick` | int | The "processed up to" marker for the unprocessed-world-actions LLM block (§ 5b).  The LLM never sees this name; the orchestrator advances it via `entity_history::add_to_history`; the operator can override it via the per-property PUT. | `entity_history::add_to_history` + operator |
+
+All code that touches entity properties consults these
+lists:
+
+- **LLM-facing property context builder**
+  (`context_builder::build_property_context`): filters
+  out any property whose name is in the relevant
+  per-type slice.  The LLM's `{property_context}` block
+  never includes the marker.
+- **LLM-facing nearby-entity renderer**
+  (`context_builder::build_nearby_entities_str`):
+  filters out internal properties of OTHER entities too
+  (so the marker doesn't leak via "Nearby Entities
+  Properties: ..." lines).
+- **`apply_effects_to_target`** in main.rs: REJECTS any
+  LLM-emit effect whose key matches an internal
+  property (with a warning like `"Skipped effect on
+  internal/operator-only property '<name>' (entity=
+  '<target>', reason='LLM-emit effects cannot write
+  to internal properties; use the per-property PUT
+  endpoint to override')"`).  The LLM cannot
+  accidentally (or maliciously) tamper with these
+  bookkeeping values.
+- **Per-property PUT endpoint**
+  (`/api/entities/:id/properties/int/:key` etc.):
+  operator-only.  IS allowed to write internal
+  properties, so the operator can manually override the
+  marker (e.g. reset `last_processed_other_tick` to 0
+  to force reprocessing).  This is the documented
+  escape hatch for ops.
+
+### Adding a new internal property
+
+The workflow is:
+
+1. Add the property name to the appropriate const
+   slice (`LLM_INTERNAL_INT_PROPERTIES`,
+   `LLM_INTERNAL_FLOAT_PROPERTIES`, or
+   `LLM_INTERNAL_STRING_PROPERTIES`) in
+   `src/world_data/internal_properties.rs`.
+2. Add a doc-comment to the entry explaining what the
+   property does and who writes it.
+3. Update this docs section (§ 5c) to keep the docs
+   in sync.
+
+No code change to the LLM-facing builders or the
+effect-applier is needed — they iterate over the const
+slices.  Same for any future code path that needs to
+filter internal properties: import the const slice
+and check membership.
 
 ## 12. Auto-Tag Rules (Hidden from the LLM)
 

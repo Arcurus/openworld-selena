@@ -125,43 +125,55 @@ pub fn format_histories_for_entities(
 /// Add an action result to an entity's history.
 ///
 /// Also advances the entity's
-/// `properties_int["last_processed_other_tick"]` to the
-/// current world tick — because by the time this function
+/// `properties_int["last_processed_other_tick"]` marker to
+/// `next_marker_tick` — because by the time this function
 /// runs, the LLM has been shown the "unprocessed world
-/// actions from other entities" list, so those actions are
-/// now considered processed for this entity's history
+/// actions from other entities" list, so those actions
+/// are now considered processed for this entity's history
 /// summary purposes.  Per Arcurus 2026-06-07 (#openworld):
 /// "we can reconstruct which world actions are not yet
-/// processed for a given entity".
+/// processed for a given entity" and "it needs to be set
+/// to the creating tick time of the other history message
+/// last included in the llm to process."
 ///
-/// NOTE: the tick value passed in is the world tick at the
-/// moment the LLM call completes (== the world
-/// `action_count` after the action was committed).  We
-/// don't read it from the world here because the caller
-/// already has it in scope; threading it through keeps
-/// this function pure (no World borrow needed).
+/// `next_marker_tick` is the max tick among the entries
+/// that were rendered in the unprocessed-other-actions
+/// block during this LLM call.  The caller computes it
+/// via `context_builder::compute_max_unprocessed_tick`.
+/// If 0, the marker does NOT advance (no entries were
+/// rendered — either the filter was empty or the cap was
+/// too tight; the caller is expected to log a warning in
+/// the latter case).
+///
+/// The marker is set to `max(current, next_marker_tick)`
+/// so it never regresses (defensive — in practice
+/// next_marker_tick > current, but the guard is cheap).
 pub fn add_to_history(
     entity: &mut WorldEntity,
     action: &str,
     details: &str,
     outcome: &str,
-    world_tick: i64,
+    next_marker_tick: i64,
 ) {
     entity.add_history(action, details, outcome);
-    // Advance the marker.  If the property doesn't exist
-    // yet, this inserts it.  We use `max(..., world_tick)`
-    // so the marker never goes backwards (defensive — in
-    // practice world_tick is monotonic so this is a
-    // no-op, but the guard is cheap).
+    if next_marker_tick <= 0 {
+        // No entries were shown; do not advance the
+        // marker.  Same semantics as
+        // `build_unprocessed_other_actions_str` returning
+        // empty (per Arcurus 2026-06-07: "in this edge
+        // case marker does not advane, so we can look
+        // into it later").
+        return;
+    }
     let current = entity
         .properties_int
         .get("last_processed_other_tick")
         .copied()
         .unwrap_or(0);
-    if world_tick > current {
+    if next_marker_tick > current {
         entity
             .properties_int
-            .insert("last_processed_other_tick".to_string(), world_tick);
+            .insert("last_processed_other_tick".to_string(), next_marker_tick);
     }
 }
 

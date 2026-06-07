@@ -16,6 +16,8 @@ pub mod action_history_log;
 
 pub mod context_builder;
 
+pub mod internal_properties;
+
 pub mod tick_time;
 
 pub use world_entity::*;

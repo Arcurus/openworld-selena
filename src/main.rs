@@ -3757,6 +3757,23 @@ fn apply_effects_to_target(
             continue;
         }
 
+        // Internal-property guard (per Arcurus 2026-06-07
+        // #openworld): reject any LLM-emit effect that targets
+        // an operator-internal bookkeeping property
+        // (e.g. `last_processed_other_tick`).  These are
+        // write-protected against LLM-emit effects, but the
+        // operator can still override them via the per-property
+        // PUT endpoint (the documented escape hatch).  See
+        // `world_data::internal_properties` for the full list
+        // and rationale.
+        if crate::world_data::internal_properties::is_internal_property(prop_key) {
+            warnings.push(format!(
+                "Skipped effect on internal/operator-only property '{}' (entity='{}', reason='LLM-emit effects cannot write to internal properties; use the per-property PUT endpoint to override')",
+                prop_key, target.name
+            ));
+            continue;
+        }
+
         // Magnitude guard (non-finite or |Δ| > MAX_DELTA_ABS).
         if let Some(reason) = magnitude_check(change_val) {
             warnings.push(format!(
@@ -4521,11 +4538,41 @@ async fn process_action_handler(
 
                 // Capture world.action_count BEFORE the
                 // mutable borrow of world.entities below —
-                // we need it both for the tick stamp on the
-                // history entry and for the
-                // last_processed_other_tick marker.  Per
-                // Arcurus 2026-06-07 (#openworld).
+                // we need it for the tick stamp on the
+                // history entry.  The
+                // `last_processed_other_tick` marker is
+                // advanced separately, after we compute
+                // the max tick of the entries that were
+                // rendered in the unprocessed-other-actions
+                // block.  Per Arcurus 2026-06-07 (#openworld):
+                // "it needs to be set to the creating
+                // tick time of the other history message
+                // last included in the llm to process."
                 let stamp_tick = world.action_count as i64;
+
+                // Also capture the CURRENT marker and
+                // compute the NEXT marker BEFORE the
+                // mutable borrow of world.entities below.
+                // Default 0 if not set.
+                let current_marker = world
+                    .entities
+                    .get(&entity_id)
+                    .and_then(|e| e.properties_int.get("last_processed_other_tick").copied())
+                    .unwrap_or(0);
+                let all_entries_for_marker =
+                    world_data::action_history_log::load_all_world_actions();
+                let next_marker_tick = {
+                    let entity_for_marker = world
+                        .entities
+                        .get(&entity_id)
+                        .expect("entity_id just verified to exist");
+                    world_data::context_builder::compute_max_unprocessed_tick(
+                        &world,
+                        entity_for_marker,
+                        &all_entries_for_marker,
+                        current_marker,
+                    )
+                };
 
                 if let Some(entity) = world.entities.get_mut(&entity_id) {
                     // System entities (world_clock, meta-tagged)
@@ -4564,17 +4611,21 @@ async fn process_action_handler(
                 //       of save.owbl, survives save corruption).
                 use world_data::entity_history::add_to_history;
                 let history_timestamp = chrono::Utc::now();
-                // Pass `stamp_tick` (captured before the
-                // mutable borrow above) so the
+                // We pass `next_marker_tick` (computed
+                // before the mutable borrow above) so the
                 // `last_processed_other_tick` marker is
-                // advanced to the same tick as the history
-                // entry below.
+                // advanced to the max tick of the entries
+                // shown in the unprocessed-other-actions
+                // block.  If no entries were shown
+                // (filter empty, or cap too tight), the
+                // returned value is 0 and the marker does
+                // not advance (per Arcurus 2026-06-07).
                 add_to_history(
                     entity,
                     &action_data.action,
                     &action_data.narrative,
                     &action_data.outcome,
-                    stamp_tick,
+                    next_marker_tick,
                 );
 
                 // Build the durable JSONL entry. Deferred to AFTER

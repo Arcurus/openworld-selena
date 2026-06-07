@@ -222,6 +222,13 @@ pub fn build_action_prompt(
 fn build_property_context(entity: &WorldEntity, type_stats: Option<&EntityTypeStats>) -> String {
     let mut prop_context = String::new();
     for (key, value) in &entity.properties_int {
+        // Skip operator-internal / LLM-invisible properties
+        // (see `internal_properties::LLM_INTERNAL_INT_PROPERTIES`).
+        // The LLM must never see the marker, scheduling flags,
+        // or other bookkeeping state.
+        if crate::world_data::internal_properties::LLM_INTERNAL_INT_PROPERTIES.contains(&key.as_str()) {
+            continue;
+        }
         let relative = if let Some(ts) = type_stats {
             if let Some(stat) = ts.properties_int.get(key) {
                 World::get_relative_value(*value as f64, stat.min, stat.max, stat.avg)
@@ -234,7 +241,16 @@ fn build_property_context(entity: &WorldEntity, type_stats: Option<&EntityTypeSt
         prop_context.push_str(&format!("  - {}: {} ({})\n", key, value, relative));
     }
     for (key, value) in &entity.properties_float {
+        if crate::world_data::internal_properties::LLM_INTERNAL_FLOAT_PROPERTIES.contains(&key.as_str()) {
+            continue;
+        }
         prop_context.push_str(&format!("  - {}: {:.2}\n", key, value));
+    }
+    for (key, value) in &entity.properties_string {
+        if crate::world_data::internal_properties::LLM_INTERNAL_STRING_PROPERTIES.contains(&key.as_str()) {
+            continue;
+        }
+        prop_context.push_str(&format!("  - {}: {}\n", key, value));
     }
     prop_context
 }
@@ -404,6 +420,14 @@ fn format_nearby_entry(other: &WorldEntity, dist: f64) -> String {
     let key_props: Vec<String> = other
         .properties_int
         .iter()
+        // Skip operator-internal / LLM-invisible properties
+        // for OTHER entities too (the LLM must never see the
+        // marker, scheduling flags, or other bookkeeping
+        // state on anyone, not just on the actor).
+        .filter(|(k, _)| {
+            !crate::world_data::internal_properties::LLM_INTERNAL_INT_PROPERTIES
+                .contains(&k.as_str())
+        })
         .take(3)
         .map(|(k, v)| format!("{}: {}", k, v))
         .collect();
@@ -575,13 +599,26 @@ const MAX_UNPROCESSED_OTHER_ACTIONS_CHARS: usize = 9_500;
 ///     that they are applied already").  The LLM doesn't
 ///     need to re-emit them, just be aware of the
 ///     relationship change.
-///   - If the char cap is reached, drop the OLDEST
-///     entries (so the LLM always sees the most recent
-///     actions, which are the ones most likely to matter
-///     for its response).  This is a silent cap from the
-///     LLM's point of view; no "and N more" line is
-///     shown (per the "no hidden mechanics" rule in
-///     AGENTS.md).
+///   - Outcome truncated to 200 chars + ellipsis (matches
+///     the `recent_world_actions_str` block length).
+///   - If the char cap is reached, the OLDEST entries are
+///     KEPT and the NEWEST ones are dropped.  Per Arcurus
+///     2026-06-07: "we first fill the 10k with the oldest
+///     not processed messages, and log a warning if not
+///     all fittet in.  if the next does fit in, simply
+///     dont put it in, done.  next time it will continue
+///     with it."  The dropped rows stay above the
+///     per-entity marker, so the next LLM call re-sees
+///     them — the LLM works through the backlog
+///     chronologically.  One warning is logged per call
+///     (server-side, NOT to the LLM).
+///   - If even the first row doesn't fit (degenerate
+///     case — the cap is 9.5K chars and a typical row
+///     is ~280 chars, so 30+ rows fit), the block is
+///     omitted from the prompt, an ERROR is logged to
+///     the server log, and the per-entity marker does
+///     NOT advance (so the operator can investigate
+///     without the data slipping past).
 ///   - If the filtered list is empty, return an empty
 ///     string (don't render an empty block).
 ///
@@ -631,93 +668,185 @@ fn build_unprocessed_other_actions_str(
     if matching.is_empty() {
         return String::new();
     }
-    // Build the rows, but stop adding once the cap is
-    // reached.  We iterate oldest-first and add to the
-    // string; if adding a row would exceed the cap, we
-    // drop the oldest already-added rows to make room.
-    // (Simpler than a two-pass: just track total and
-    // trim from the front when over.)
+
+    // Build the rows.
+    //
+    // We sort the matching entries by WALL-CLOCK
+    // timestamp ASC (oldest first) so the LLM reads
+    // cause-then-effect in chronological order.  Per
+    // Arcurus 2026-06-07 (#openworld): "we first fill
+    // the 10k with the oldest not processed messages".
+    //
+    // Why timestamp and not tick: the `tick` field is
+    // monotonic for new actions (= world.action_count at
+    // commit time) but the backfilled tick values
+    // (1..=N assigned in append order during
+    // `backfill_ticks`) are not strictly wall-clock
+    // monotonic — e.g. a recent action that was written
+    // after the tick field was added carries a low tick
+    // value (the world.action_count at that moment),
+    // while an older action in the backfill might carry
+    // a much higher sequential tick.  So tick-order can
+    // produce a non-monotonic jump in wall-clock time.
+    // The wall-clock timestamp in each row is the
+    // authoritative chronology; the tick is the
+    // filter/marker key (because it's the durable
+    // monotonic counter).
+    let mut sorted_matching: Vec<&ActionHistoryEntry> = matching;
+    sorted_matching.sort_by_key(|e| e.timestamp);
+
+    let mut rows: Vec<(i64, String)> = Vec::with_capacity(sorted_matching.len());
+    for entry in &sorted_matching {
+        rows.push((entry.tick, format_unprocessed_other_action_row(entry)));
+    }
+
+    // Fill oldest-first until the cap is hit.  Per Arcurus
+    // 2026-06-07 (#openworld): "we first fill the 10k with
+    // the oldest not processed messages, and log a warning
+    // if not all fitted in.  if the next does fit in,
+    // simply dont put it in, done.  next time it will
+    // continue with it."
+    //
+    // The dropped rows (the ones that didn't fit) are the
+    // NEWEST ones.  They stay above the marker, so the
+    // next LLM call will re-see them — the LLM works
+    // through the backlog chronologically.
     let mut s = String::from(
         "## Unprocessed world actions from other entities\n\n\
          These are recent world actions from other entities that have affected you.\n\
          Their effects are already reflected in your current state. You don't need to re-emit these effects in your response.\n\n\
-         You may want to mention their impact and any change of relations in your `history_summary_replace`, so your narrative memory stays in sync with what other entities have been doing.\n\n",
+         You should mention their impact and any change of relations in your `history_summary_replace`, AND you should also include the action you just emitted itself, so your narrative memory stays in sync with what other entities have been doing and with what you just did.\n\n",
     );
-    let mut rows: Vec<String> = Vec::with_capacity(matching.len());
-    for entry in &matching {
-        rows.push(format_unprocessed_other_action_row(entry));
-    }
-    // Greedy sliding window: walk oldest-first, build up
-    // a window of rows that fits in the cap, then drop
-    // the oldest as we add newer ones.  This guarantees
-    // the OUTPUT (the rows we actually emit) is at most
-    // `cap` chars total, AND we keep the most recent rows
-    // (the ones most likely to matter for the LLM's
-    // next move).
-    //
-    // The naive "drop one oldest, try again" loop has
-    // a bug: it slides first_kept forward, but always
-    // keeps adding the new row, so the output (from
-    // first_kept to end) eventually contains ALL rows.
-    // The fix is a proper sliding window: track which
-    // rows are CURRENTLY in the window, drop the oldest
-    // while the window is over cap, and only "commit" a
-    // row to the window once we know the window will
-    // stay under cap.  Concretely: walk the rows, build
-    // a candidate window; if the window would exceed
-    // the cap, drop oldest rows from the window UNTIL
-    // it fits (not just one); THEN commit the new row.
     let header_len = s.len();
-    let mut window_start: usize = 0;  // inclusive start
-    let mut window_len: usize = 0;    // count of rows in the window
-    let mut window_chars: usize = header_len;  // header + sum of row lens in window
-    for (i, row) in rows.iter().enumerate() {
-        // Tentatively add the row.
-        let new_window_chars = window_chars + row.len();
-        if new_window_chars <= MAX_UNPROCESSED_OTHER_ACTIONS_CHARS {
-            // Fits without dropping. Commit.
-            window_chars = new_window_chars;
-            window_len = i + 1 - window_start;
-            continue;
+    let mut total_chars = header_len;
+    let mut rows_kept: usize = 0;
+    for (i, (_, row)) in rows.iter().enumerate() {
+        if total_chars + row.len() > MAX_UNPROCESSED_OTHER_ACTIONS_CHARS {
+            // This row would overflow.  Stop.  Per
+            // Arcurus 2026-06-07: the dropped row stays
+            // in the queue and gets re-shown next call.
+            break;
         }
-        // Doesn't fit. Drop oldest rows from the window
-        // until the new row fits.  Could be many drops
-        // (e.g. a very long new row needs us to drop
-        // many old ones).
-        let mut new_window_start = window_start;
-        let mut projected = window_chars + row.len();
-        while projected > MAX_UNPROCESSED_OTHER_ACTIONS_CHARS
-            && new_window_start < i
-        {
-            projected -= rows[new_window_start].len();
-            new_window_start += 1;
-        }
-        // After dropping, does the new row fit?
-        if projected <= MAX_UNPROCESSED_OTHER_ACTIONS_CHARS {
-            // Yes. Commit.
-            window_start = new_window_start;
-            window_chars = projected;
-            window_len = i + 1 - window_start;
-        } else {
-            // The new row alone is bigger than the cap
-            // headroom.  Skip it (don't add to window).
-            // (We still keep whatever's in the window
-            // for output.)
-        }
+        total_chars += row.len();
+        rows_kept = i + 1;
     }
-    if window_len == 0 {
-        // Nothing fit; the cap is so tight we can't show
-        // even the newest entry.  Just return the header
-        // so the LLM at least knows the block exists.
-        // (Edge case; in practice the cap is 9.5K and a
-        // typical row is ~280 chars, so 30+ rows fit.)
-        return s;
+
+    if rows_kept == 0 {
+        // Cap is so tight that even the first row
+        // doesn't fit.  This is a degenerate case (the
+        // cap is 9.5K chars, a typical row is ~280
+        // chars, so 30+ rows fit).  Per Arcurus
+        // 2026-06-07: log an error to the server log
+        // (NOT to the LLM prompt), do NOT add the block
+        // to the prompt, and do NOT advance the marker
+        // — so the operator can investigate and bump
+        // the cap or trim the row.
+        eprintln!(
+            "[unprocessed-other-actions] cap too tight: even the first row didn't fit for entity '{}' (cap {} chars, first row {} chars, total matching entries {}). Not advancing the marker; please inspect.",
+            entity.name,
+            MAX_UNPROCESSED_OTHER_ACTIONS_CHARS,
+            rows[0].1.len(),
+            rows.len()
+        );
+        return String::new();
     }
-    let end = window_start + window_len;
-    for row in &rows[window_start..end] {
+
+    if rows_kept < rows.len() {
+        // Some entries were dropped (they were the
+        // newest unprocessed ones).  Log a single
+        // warning per call.  Per Arcurus 2026-06-07:
+        // "log a warning if not all fittet in".
+        let oldest_kept_tick = rows[rows_kept - 1].0;
+        let newest_dropped_tick = rows[rows.len() - 1].0;
+        let dropped_count = rows.len() - rows_kept;
+        eprintln!(
+            "[unprocessed-other-actions] dropped {} newest entries for entity '{}' (oldest kept tick {}, newest dropped tick {}, cap {} chars, total matching entries {}). Next call will continue with the dropped ones.",
+            dropped_count,
+            entity.name,
+            oldest_kept_tick,
+            newest_dropped_tick,
+            MAX_UNPROCESSED_OTHER_ACTIONS_CHARS,
+            rows.len()
+        );
+    }
+
+    for (_, row) in &rows[..rows_kept] {
         s.push_str(row);
     }
     s
+}
+
+/// Compute the max tick of history entries that would be
+/// rendered in the unprocessed-other-actions block for
+/// this entity.  This is the tick value the per-entity
+/// `last_processed_other_tick` marker should advance TO
+/// after the LLM call, per Arcurus 2026-06-07 (#openworld):
+/// "it needs to be set to the creating tick time of the
+/// other history message last included in the llm to
+/// process."
+///
+/// Note: the FILTER is tick-based (so the marker
+/// advancement is well-defined and monotonic), but the
+/// RENDERER sorts by wall-clock timestamp.  So the
+/// "entries that would be rendered" are the same set
+/// filtered by tick, but ordered by timestamp; the max
+/// tick is the same either way.
+///
+/// Same filtering rules as
+/// `build_unprocessed_other_actions_str` (drop own
+/// actions, drop system entities, drop entries at or
+/// below the current marker, drop entries where no
+/// effect key starts with `"<this entity name>."`).
+/// Returns 0 if no entries match — callers should use
+/// `max(current_marker, returned_value)` so the marker
+/// never regresses.
+///
+/// Why a separate function (rather than returning the
+/// value from `build_unprocessed_other_actions_str`):
+/// the prompt-builder and the process-action handler are
+/// separate API calls with a time gap.  The prompt-builder
+/// shows the block; the process-action handler computes
+/// the max tick AGAIN (cheap; the JSONL is small) so it
+/// can advance the marker without needing the
+/// prompt-builder to round-trip the value through the
+/// API.
+///
+/// Pure: no I/O.  Tests can pass any list of entries
+/// without touching the live `action_history.jsonl` file.
+pub fn compute_max_unprocessed_tick(
+    world: &World,
+    entity: &WorldEntity,
+    all_entries: &[ActionHistoryEntry],
+    last_processed_tick: i64,
+) -> i64 {
+    if all_entries.is_empty() {
+        return 0;
+    }
+    let my_id = entity.id.to_string();
+    let my_name_prefix = format!("{}.", entity.name);
+    let mut max_tick: i64 = 0;
+    for entry in all_entries {
+        if entry.entity_id == my_id {
+            continue;  // own action
+        }
+        if entry.tick <= last_processed_tick {
+            continue;  // already processed
+        }
+        if is_system_entry(world, entry) {
+            continue;  // World Clock, meta-tagged, etc.
+        }
+        let affects_me = entry
+            .effects
+            .keys()
+            .any(|k| k.starts_with(&my_name_prefix));
+        if !affects_me {
+            continue;
+        }
+        if entry.tick > max_tick {
+            max_tick = entry.tick;
+        }
+    }
+    max_tick
 }
 
 /// Format one unprocessed-other-action row for the LLM
@@ -732,13 +861,20 @@ fn build_unprocessed_other_actions_str(
 /// state has already been updated.
 fn format_unprocessed_other_action_row(entry: &ActionHistoryEntry) -> String {
     let ts = entry.timestamp.format("%Y-%m-%d %H:%M");
+    // Truncate the LLM's free-text outcome to 200 chars +
+    // ellipsis so each row is a one-liner.  Matches the
+    // truncation length used by the older
+    // `recent_world_actions_str` block — keeps the
+    // per-row length consistent across the prompt.
+    // The full outcome text lives in action_history.jsonl
+    // if the LLM ever needs it.
     let outcome_one_line = entry
         .outcome
         .replace('\n', " ")
         .chars()
-        .take(150)
+        .take(200)
         .collect::<String>();
-    let outcome_suffix = if entry.outcome.chars().count() > 150 {
+    let outcome_suffix = if entry.outcome.chars().count() > 200 {
         "…"
     } else {
         ""
@@ -832,6 +968,30 @@ mod tests {
         let entity = make_entity("Test", 10000.0, 10000.0);
         let result = build_property_context(&entity, None);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn property_context_filters_out_internal_properties() {
+        // Per Arcurus 2026-06-07 (#openworld): the marker
+        // (and any other internal bookkeeping properties)
+        // must NOT appear in the entity's own property
+        // context block.  The LLM must never see the
+        // marker.
+        let mut entity = make_entity("Test", 10000.0, 10000.0);
+        entity.properties_int.insert("power".to_string(), 50);
+        entity
+            .properties_int
+            .insert("last_processed_other_tick".to_string(), 12345);
+        let result = build_property_context(&entity, None);
+        assert!(result.contains("power: 50"));
+        assert!(
+            !result.contains("last_processed_other_tick"),
+            "internal property marker must not appear in LLM context"
+        );
+        assert!(
+            !result.contains("12345"),
+            "internal property VALUE must not appear in LLM context"
+        );
     }
 
     #[test]
@@ -1901,11 +2061,23 @@ mod tests {
     }
 
     #[test]
-    fn unprocessed_caps_at_9500_chars() {
-        // Generate 200 fake entries, each with a long outcome,
-        // all of which affect "Me".  Verify the result is under
-        // the cap (we allow a small slop for the header, ~500
-        // chars, plus newline-included row lengths).
+    fn unprocessed_caps_at_9500_chars_oldest_kept() {
+        // Per Arcurus 2026-06-07 (#openworld): "we first
+        // fill the 10k with the oldest not processed
+        // messages, and log a warning if not all fittet
+        // in."  So when the cap is hit, the OLDEST
+        // entries are KEPT and the NEWEST ones are
+        // DROPPED.  This is the opposite of the old
+        // sliding-window behavior.
+        //
+        // Generate 200 fake entries (i=0..200) with
+        // tick=i+1 (so the first entry has tick 1, the
+        // last has tick 200).  All entries affect "Me".
+        // Each row is ~400 chars (300-char outcome +
+        // prefix).  With cap 9.5K and ~500-char header,
+        // we can fit ~22 rows.  So the OLDEST 22 entries
+        // (tick 1..=22) should be kept and the rest
+        // (tick 23..=200) should be dropped.
         let (world, me_id, bard_id) = make_world_two_non_system_entities();
         let me = world.entities.get(&me_id).unwrap();
         let mut raw: Vec<ActionHistoryEntry> = Vec::new();
@@ -1924,18 +2096,113 @@ mod tests {
             ));
         }
         let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
-        // The cap is 9.5K chars, hard.  Result must be <= cap.
+        // Cap respected.
         assert!(
             result.len() <= MAX_UNPROCESSED_OTHER_ACTIONS_CHARS,
             "result {} chars exceeds cap of {}",
             result.len(),
             MAX_UNPROCESSED_OTHER_ACTIONS_CHARS
         );
-        // The newest entries should be preserved; the oldest
-        // dropped.  (Cap drops oldest first.)
+        // The result contains the rows.
         assert!(
             result.contains("attack"),
             "result should contain at least one row"
         );
+        // Note: we don't assert the EXACT count of kept
+        // rows (depends on row width + header width),
+        // but the cap-respected assertion above
+        // guarantees we're not wildly over.
+    }
+
+    #[test]
+    fn unprocessed_keeps_oldest_drops_newest_on_overflow() {
+        // Sharper test of the oldest-first policy:
+        // generate 100 rows of ~250 chars each (forces
+        // overflow; cap is 9.5K so only ~30 rows fit)
+        // and verify the OLDEST ones are present in
+        // the result and the NEWEST ones are not.
+        let (world, me_id, bard_id) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut raw: Vec<ActionHistoryEntry> = Vec::new();
+        for i in 0..100 {
+            let mut effects = serde_json::Map::new();
+            effects.insert("Me.health".to_string(), serde_json::json!(-1));
+            let outcome = format!("OUTCOME_{:04}_{}", i, "x".repeat(180));
+            raw.push(entry_with_effects(
+                &bard_id.to_string(),
+                "Bard",
+                &format!("action_{:04}", i),
+                &outcome,
+                3000 + i,
+                i as i64 + 1,
+                effects,
+            ));
+        }
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        // The OLDEST outcome ("OUTCOME_0000") should
+        // be present (oldest is kept first).
+        assert!(
+            result.contains("OUTCOME_0000"),
+            "oldest outcome should be present (got: first 200 chars of result: {})",
+            &result[..200.min(result.len())]
+        );
+        // The NEWEST outcome ("OUTCOME_0099") should
+        // NOT be present (newest is dropped first when
+        // the cap is hit).
+        assert!(
+            !result.contains("OUTCOME_0099"),
+            "newest outcome should be dropped when cap is hit (got: tail 200 chars of result: {})",
+            &result[result.len().saturating_sub(200)..]
+        );
+    }
+
+    #[test]
+    fn unprocessed_marker_unchanged_when_nothing_shown() {
+        // When no entries match the filter, the block
+        // is empty AND (by design, not by the renderer
+        // itself) the per-entity marker should not
+        // advance.  We don't test the marker here
+        // (that's entity_history's concern) but we DO
+        // test that the renderer returns empty so the
+        // caller knows nothing was shown.
+        let (world, me_id, _) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        // No entries that affect "Me".
+        let raw: Vec<ActionHistoryEntry> = vec![];
+        let result = build_unprocessed_other_actions_str(&world, me, &raw, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn compute_max_unprocessed_tick_returns_max_of_filtered() {
+        // Marker computation: returns the max tick of
+        // entries that pass the filter.
+        let (world, me_id, bard_id) = make_world_two_non_system_entities();
+        let me = world.entities.get(&me_id).unwrap();
+        let mut raw: Vec<ActionHistoryEntry> = Vec::new();
+        for i in 0..10 {
+            let mut effects = serde_json::Map::new();
+            effects.insert("Me.health".to_string(), serde_json::json!(-1));
+            raw.push(entry_with_effects(
+                &bard_id.to_string(),
+                "Bard",
+                "attack",
+                "o",
+                3000 + i,
+                i as i64 + 1,  // ticks 1..=10
+                effects,
+            ));
+        }
+        // With marker=0, all 10 entries match, max tick = 10.
+        let max = compute_max_unprocessed_tick(&world, me, &raw, 0);
+        assert_eq!(max, 10);
+        // With marker=5, only entries with tick > 5
+        // (i.e. ticks 6..=10) match, max tick = 10.
+        let max = compute_max_unprocessed_tick(&world, me, &raw, 5);
+        assert_eq!(max, 10);
+        // With marker=10, no entries match (tick > 10
+        // is the filter), max tick = 0 (default).
+        let max = compute_max_unprocessed_tick(&world, me, &raw, 10);
+        assert_eq!(max, 0);
     }
 }
