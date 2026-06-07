@@ -45,12 +45,10 @@ If the entity already has a property (e.g. `wealth`, `power`, `morale`), use tha
 - **Emit at least one effect per entity you impact in the action** (including yourself), so each entity's history can track the ripple. If your `narrative` mentions a specific entity being affected, that entity should appear in your `effects`.
 - Property names on the right-hand side of the dot still follow the "use existing property names" rule above.
 
-**Using `visibility` as a design tool (optional, advanced):**
-- `visibility` is a signed `int` (default `0`). It changes how often the entity surfaces in *other* entities' nearby-entity lists via the formula `max(1, power + visibility) / distance`.
-- Negative = hiding (deep negatives floor at 1, so a fugitive doesn't outrank a legend by proximity alone). Currently no entity in the world uses a negative value.
-- `0` = neutral presence. Default for most entities.
-- Positive = exposing itself. **Super-positive (`> 500`) = celebrated / conspicuous presence** — a deliberately-famous figure whose narrative weight should dominate nearby lists regardless of `power` (e.g. `The Shadow Crown` at `visibility=834`). Use this when an entity's *name* should matter more than its raw power stat. See `docs/world-mechanics.md` §4 for the full semantics.
-- Visibility is a display/influence signal only — it is NOT consulted by the action selector, so setting it does not change how often *this* entity is chosen to act.
+**`visibility` (story signal only):**
+- A high `visibility` means this entity is *exposed* — it stands out, its presence is felt, and other entities will be very aware of it.
+- A low (or negative) `visibility` means the entity is *hiding* — withdrawn, concealed, easy to overlook. Other entities will be less aware of it.
+- Use it as a narrative cue: how present or absent does this entity feel in the world right now?
 
 Respond ONLY with valid JSON (no other text before or after). **Always include a `history_summary_replace` field — it is the ONLY way to update the entity's rolling history summary.** See the rules section below for how to use it.
 
