@@ -739,11 +739,16 @@ mod tests {
 
     #[test]
     fn save_load_roundtrip_preserves_name_and_entity_count() {
-        // A fresh world has 1 entity (the world clock) and 5
+        // A fresh world has 1 entity (the world clock) and 6
         // active events — see World::new() and the lore-events
-        // bootstrap.  The binary format doesn't write events, so
-        // the loaded world will have 0 active_events; the entity
-        // count IS written, so it must round-trip.
+        // bootstrap. The binary format doesn't write events, so
+        // the loader reinitializes active_events to an empty Vec;
+        // it is the CALLER's responsibility (see main.rs load
+        // path) to call seed_default_events() after a successful
+        // load so the loaded world keeps the canonical narrative
+        // context. This test exercises the lower-level loader,
+        // which by itself returns 0 events — the post-load seed
+        // is verified separately in the test below.
         let world = World::new("Roundtrip World");
         let path_str = tmp_path("name_entities").to_string_lossy().to_string();
 
@@ -758,6 +763,57 @@ mod tests {
             world.entities.len(),
             "entity count must survive round-trip"
         );
+        // Loader itself yields an empty active_events vec; the
+        // service-level load path (main.rs) re-seeds after load.
+        assert_eq!(loaded.active_events.len(), 0);
+        cleanup(&PathBuf::from(&path_str));
+    }
+
+    /// Regression test for the load-path bug observed
+    /// 2026-06-07 08:23 CEST: a live world had 18 entities but
+    /// 0 active events because the binary save format does not
+    /// persist events, and the service-level load path was
+    /// dropping the canonical lore seed on every restart. The
+    /// fix is to call `seed_default_events()` in the load path;
+    /// the test below pins that contract: after a load +
+    /// re-seed, the world has the same 6 canonical events that
+    /// `World::new()` produces.
+    #[test]
+    fn load_then_seed_default_events_restores_canonical_lore() {
+        let world = World::new("Live World With Eighteen Entities");
+        let path_str = tmp_path("reseed").to_string_lossy().to_string();
+
+        BinaryPersistence::save_world(&world, &path_str)
+            .expect("save should succeed for a fresh world");
+        let mut loaded = BinaryPersistence::load_world(&path_str)
+            .expect("load should succeed immediately after save");
+
+        // As documented, the loader returns 0 events.
+        assert_eq!(loaded.active_events.len(), 0);
+
+        // The service-level load path calls seed_default_events
+        // after a successful load. Doing so must restore the
+        // canonical 6 events from World::new() (idempotent: a
+        // no-op when the world already has any events).
+        loaded.seed_default_events();
+        assert_eq!(loaded.active_events.len(), 6);
+        assert!(loaded.active_events.iter().all(|e| e.active));
+        let names: Vec<&str> = loaded
+            .active_events
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(names.contains(&"The Shadow Awakens"));
+        assert!(names.contains(&"Velora Walks Again"));
+        assert!(names.contains(&"The Shadowmaw Stirs"));
+        assert!(names.contains(&"The Silver Wardens Mobilize"));
+        assert!(names.contains(&"The Bells of the Sunken Temple"));
+        assert!(names.contains(&"The Spring Festival of Renewal"));
+
+        // Re-seeding must be a no-op (idempotent contract).
+        loaded.seed_default_events();
+        assert_eq!(loaded.active_events.len(), 6);
+
         cleanup(&PathBuf::from(&path_str));
     }
 

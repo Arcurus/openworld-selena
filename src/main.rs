@@ -5501,6 +5501,26 @@ async fn main() {
             Ok(mut w) => {
                 // Ensure clock entity exists (for old save files)
                 w.create_clock_entity();
+                // Re-seed the canonical lore events on load. The binary
+                // save format intentionally does NOT serialize
+                // active_events (see BinaryPersistence doc comment at
+                // src/world_data/persistence.rs:704), so a loaded world
+                // always starts with active_events = Vec::new(). Without
+                // this call, every restart of the service would silently
+                // drop all events, leaving the LLM context builder with
+                // no narrative momentum (a regression observed 2026-06-07
+                // 08:23 CEST — 18 entities, 0 events). seed_default_events
+                // is idempotent and a no-op if any events are already
+                // present, so this is safe across restarts. See todo
+                // e4cc4203 for the original World::new() seeding logic.
+                let seeded_event_count = w.active_events.len();
+                w.seed_default_events();
+                if w.active_events.len() > seeded_event_count {
+                    println!(
+                        "🌱 Re-seeded {} canonical lore event(s) on load (was empty)",
+                        w.active_events.len()
+                    );
+                }
                 // Sanitize int AND float properties on system entities. This
                 // cleans up garbage values that were written by LLM effects
                 // before the c7f3bc27 upstream protection landed (todo
