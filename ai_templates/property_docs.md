@@ -106,26 +106,21 @@ keeping in mind:
   defiance) act openly suspicious and their
   `suspicion` can legitimately **soar** without it
   being a discovery — it's a declaration, not a slip.
-  The tag rule below fires normally on them.
-
-The server enforces a tag rule on this property: when
-`max(1, power) - suspicion < -1` the entity gets the
-`suspicious` tag (NPCs treat them with caution, gates close
-to them, etc.). The tag is removed when the gap is positive
-again. The dead zone of `[-1, 0]` prevents flicker right at
-the boundary. A high-`power` entity needs *more* suspicion
-to be tagged (a power-100 entity needs `suspicion > 101`;
-a power-10 entity only needs `suspicion > 11`).
 
 ## Common generic properties
 
 These appear in many entities and are worth recognising by
 name.
 
-- `power` — entity's overall strength tier; the cap for many
-  other mechanics. Almost universal.
-- `wealth` — money, treasure, material resources. Used by
-  factions, merchants, kingdoms.
+- `power` — how powerful this entity is, not only physical
+  strength — also magical, political, economic, anything
+  that gives the entity weight in the world. Required for
+  every entity.
+- `wealth` — money, treasure, material resources. Applies
+  broadly: factions, merchants, kingdoms, villages,
+  individual characters — anyone with a treasury or a
+  purse. Merchants and certain guilds care a great deal
+  about it; their power and survival often ride on it.
 - `morale` — fighting spirit, hope, determination. Can go
   negative (despair) or very positive (eager, fanatical).
 - `knowledge` — accumulated lore, secrets learned, lost
@@ -135,21 +130,3 @@ name.
   they here" signal, `reputation` is a longer-term
   "what do people think of them" signal.
 
-## Writing effects
-
-In your `effects` block, use the dot-prefix form for both
-self-effects and cross-entity effects. Server-side per-target
-safety nets still apply: magnitude cap, per-target
-normalization, and the system-entity guard (the World Clock
-and anything tagged `meta` cannot be written to). Negative
-values are fine (corruption, visibility, morale) — they're
-signed integers.
-
-```json
-"effects": {
-  "self.visibility": -3,
-  "self.corruption": 4,
-  "Mira the Merchant.wealth": -5,
-  "The Sunken Temple.phenomenon_count": 1
-}
-```
