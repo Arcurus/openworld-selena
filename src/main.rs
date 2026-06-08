@@ -2613,9 +2613,20 @@ pub struct ApplyReplaceResult {
     pub new_summary: Option<String>,
     /// True if the result was truncated to fit `max_chars`.
     pub truncated: bool,
-    /// Per-replace warnings (old_part not found, current empty, etc.).
+    /// Per-replace warnings (old_part not found, etc.).
     /// Operator-facing, surfaced via the LLM log + response.
+    /// Use for actionable observations only.
     pub warnings: Vec<String>,
+    /// Per-replace informational notes (non-actionable observations).
+    /// Operator-facing, surfaced via the LLM log + response.
+    /// Use for benign outcomes the operator should know about
+    /// but doesn't need to act on — e.g. the LLM sent a
+    /// non-empty old_part but the history was empty, so we
+    /// applied new_part as the initial content.
+    /// (Per Arcurus 2026-06-08 #openworld: distinguishes "the
+    /// LLM did something we need to recover from" from "the
+    /// LLM did something unusual but we handled it cleanly".)
+    pub infos: Vec<String>,
 }
 
 /// Apply a chain of `HistorySummaryReplace` operations to a current
@@ -2971,6 +2982,7 @@ pub fn apply_history_summary_replaces(
     max_chars: usize,
 ) -> ApplyReplaceResult {
     let mut warnings: Vec<String> = Vec::new();
+    let mut infos: Vec<String> = Vec::new();
     let mut state: String = current.unwrap_or("").to_string();
 
     for (i, rep) in replaces.iter().enumerate() {
@@ -2994,27 +3006,41 @@ pub fn apply_history_summary_replaces(
             }
         } else {
             if state.is_empty() {
-                // Non-empty old_part but nothing to search in: skip
-                // with a warning. The LLM probably wanted to do a
-                // find-replace but the summary is empty; the safest
-                // behavior is to skip and let the operator decide.
+                // History is empty but the LLM sent a non-empty
+                // old_part. The LLM probably wanted to do a
+                // find-replace but there's nothing to search in.
                 //
-                // Include a 100-char preview of the non-empty
-                // `old_part` so the operator can tell, at a glance,
-                // whether the LLM was emitting the standard
-                // "(no history summary yet)" placeholder for a fresh
-                // entity (benign — happens on the entity's first
-                // action) versus trying to find-replace a stale
-                // sentence from a previous turn that the truncation
-                // already dropped (actionable — the LLM is confused
-                // about state). Without the preview, both cases look
-                // identical in the log and the operator has to dig
-                // out the raw LLM response to tell them apart. 100
-                // chars is enough to disambiguate the common
-                // placeholder variants and a few words into a real
-                // sentence, but short enough to keep the warning
-                // line readable when many of them fire in a row.
-                // (Per Arcurus 2026-06-08 #openworld.)
+                // Per Arcurus 2026-06-08 #openworld: just apply
+                // the new_part as the entity's initial content
+                // and log an INFORMATION (not a warning). This
+                // mirrors the symmetric case above (empty
+                // old_part + empty state) where new_part is
+                // already used as the initial content. The LLM's
+                // new_text is exactly what the entity's history
+                // should be after this turn, so discarding it
+                // would be strictly worse than applying it.
+                //
+                // The info includes a 100-char preview of
+                // old_part so the operator can see at a glance
+                // what the LLM was trying to find-replace. The
+                // two common cases are:
+                //   - LLM dutifully emitting the standard
+                //     "(no history summary yet)" placeholder
+                //     (benign — happens on the entity's first
+                //     action). 14/14 parsed cases in the
+                //     2026-06-07/08 llm-log used this
+                //     placeholder.
+                //   - LLM confused by state and trying to
+                //     find-replace a sentence that doesn't
+                //     exist (the LLM misread the history).
+                //     Actionable in spirit, but applying
+                //     new_part is still the right recovery
+                //     because the LLM did write a real new
+                //     sentence.
+                // Either way the entity ends up with the LLM's
+                // intended new content, so this is logged as
+                // info (operator awareness) rather than warning
+                // (operator action).
                 const EMPTY_PREVIEW_CHARS: usize = 100;
                 let old_chars = rep.old_part.chars().count();
                 let preview: String = rep
@@ -3027,55 +3053,56 @@ pub fn apply_history_summary_replaces(
                     } else {
                         ""
                     };
-                warnings.push(format!(
-                    "history_summary_replace[{}]: current summary is empty; cannot search for non-empty old_part; skipped (old_part: {:?})",
+                infos.push(format!(
+                    "history_summary_replace[{}]: current summary was empty; inserted new_text as initial content (old_part preview: {:?})",
                     i,
                     preview
                 ));
-                continue;
-            }
-            match find_replace_range(&state, &rep.old_part) {
-                Some((idx, end)) => {
-                    // find() returns a char-boundary by definition,
-                    // so the byte index is safe to slice at.
-                    let mut s = String::with_capacity(state.len() + rep.new_part.len());
-                    s.push_str(&state[..idx]);
-                    s.push_str(&rep.new_part);
-                    s.push_str(&state[end..]);
-                    state = s;
-                }
-                None => {
-                    // Per the rule: not-found is a WARNING, not an
-                    // error. The rest of the chain still applies.
-                    // The message includes a 60-char preview of the
-                    // missing `old_part` so the operator can see at
-                    // a glance which sentence the LLM was looking
-                    // for. Most of the time the LLM is recalling a
-                    // stale sentence from a previous turn (e.g.
-                    // "She travels..." when the stored summary
-                    // already has "She traveled..." or has dropped
-                    // the sentence entirely), and the preview makes
-                    // that obvious without having to dig out the
-                    // raw LLM log. 60 chars is long enough to
-                    // disambiguate but short enough to keep the
-                    // warning line scannable in a list of many.
-                    const PREVIEW_CHARS: usize = 60;
-                    let preview: String = rep
-                        .old_part
-                        .chars()
-                        .take(PREVIEW_CHARS)
-                        .collect::<String>()
-                        + if rep.old_part.chars().count() > PREVIEW_CHARS {
-                            "…"
-                        } else {
-                            ""
-                        };
-                    warnings.push(format!(
-                        "history_summary_replace[{}]: old_part not found in current summary (length {}); skipped (looking for: {:?})",
-                        i,
-                        state.chars().count(),
-                        preview
-                    ));
+                state = rep.new_part.clone();
+            } else {
+                match find_replace_range(&state, &rep.old_part) {
+                    Some((idx, end)) => {
+                        // find() returns a char-boundary by definition,
+                        // so the byte index is safe to slice at.
+                        let mut s = String::with_capacity(state.len() + rep.new_part.len());
+                        s.push_str(&state[..idx]);
+                        s.push_str(&rep.new_part);
+                        s.push_str(&state[end..]);
+                        state = s;
+                    }
+                    None => {
+                        // Per the rule: not-found is a WARNING, not an
+                        // error. The rest of the chain still applies.
+                        // The message includes a 60-char preview of the
+                        // missing `old_part` so the operator can see at
+                        // a glance which sentence the LLM was looking
+                        // for. Most of the time the LLM is recalling a
+                        // stale sentence from a previous turn (e.g.
+                        // "She travels..." when the stored summary
+                        // already has "She traveled..." or has dropped
+                        // the sentence entirely), and the preview makes
+                        // that obvious without having to dig out the
+                        // raw LLM log. 60 chars is long enough to
+                        // disambiguate but short enough to keep the
+                        // warning line scannable in a list of many.
+                        const PREVIEW_CHARS: usize = 60;
+                        let preview: String = rep
+                            .old_part
+                            .chars()
+                            .take(PREVIEW_CHARS)
+                            .collect::<String>()
+                            + if rep.old_part.chars().count() > PREVIEW_CHARS {
+                                "…"
+                            } else {
+                                ""
+                            };
+                        warnings.push(format!(
+                            "history_summary_replace[{}]: old_part not found in current summary (length {}); skipped (looking for: {:?})",
+                            i,
+                            state.chars().count(),
+                            preview
+                        ));
+                    }
                 }
             }
         }
@@ -3128,6 +3155,7 @@ pub fn apply_history_summary_replaces(
         new_summary,
         truncated,
         warnings,
+        infos,
     }
 }
 
@@ -4901,6 +4929,14 @@ async fn process_action_handler(
             );
 
             let mut warnings: Vec<String> = Vec::new();
+            // Per-replace informational notes (non-actionable
+            // observations, e.g. "history was empty; inserted
+            // new_text as initial content"). Surfaced alongside
+            // warnings in the response + LLM log so the
+            // operator can tell at a glance whether the LLM
+            // call had a recoverable hiccup vs an actual
+            // anomaly.  Per Arcurus 2026-06-08 #openworld.
+            let mut infos: Vec<String> = Vec::new();
             // Surface the tolerant-repair warning (if any) first
             // so it shows up at the top of the warnings vec in
             // the response and the LLM-call log. This makes
@@ -5095,6 +5131,9 @@ async fn process_action_handler(
                         for w in result.warnings {
                             warnings.push(w);
                         }
+                        for i in result.infos {
+                            infos.push(i);
+                        }
                         if result.truncated {
                             summary_truncated = true;
                         }
@@ -5223,9 +5262,10 @@ async fn process_action_handler(
                     tick: stamp_tick,
                 };
                 let parsing_outcome = format!(
-                    "Applied {} effects. Warnings: {:?}",
+                    "Applied {} effects. Warnings: {:?}. Info: {:?}",
                     applied_effects.len(),
-                    warnings
+                    warnings,
+                    infos
                 );
                 if let Ok(mut logger) = state.logger.lock() {
                     logger.ensure_today(&PathBuf::from("logs"));
@@ -5259,6 +5299,7 @@ async fn process_action_handler(
                     "narrative": action_data.narrative,
                     "history_summary": applied_summary,
                     "warnings": warnings,
+                    "infos": infos,
                 });
                 let response = success_json(response_json).into_response();
                 // `entity` and `world` mutable borrows end here.
@@ -9161,38 +9202,79 @@ mod history_summary_replace_tests {
         assert!(result.warnings[0].contains("old_part not found"));
     }
 
-    // -- matrix row 7: non-empty old_part + None summary → warning, skip --
+    // -- matrix row 7: non-empty old_part + None summary → info, apply new_part --
     #[test]
-    fn non_empty_old_part_with_none_summary_warns_and_skips() {
+    fn non_empty_old_part_with_none_summary_infos_and_applies_new_part() {
+        // Per Arcurus 2026-06-08 #openworld: when the history is
+        // empty but the LLM still sent a non-empty old_part,
+        // APPLY the new_part as the entity's initial content and
+        // log an INFORMATION (not a warning). The old behavior
+        // (skip + warning) was strictly worse than this — the
+        // LLM did write a real new sentence, and discarding it
+        // leaves the entity with no history at all.
+        //
         // Use a distinctive old_part so the regression assertion
         // below can verify the 100-char preview is actually
-        // included in the warning (and not, say, just the
+        // included in the info (and not, say, just the
         // "(no history summary yet)" placeholder text the LLM
-        // typically emits). Per Arcurus 2026-06-08 #openworld.
+        // typically emits).
         let result = apply_history_summary_replaces(
             None,
             &[r("the Wandering Bard sang a truth-song at the Spring Festival",
                "updated text")],
             10_000,
         );
-        // No change (no summary to start with, can't search).
-        assert_eq!(result.new_summary, None);
-        // Warning logged.
-        assert_eq!(result.warnings.len(), 1);
-        assert!(result.warnings[0].contains("current summary is empty"));
-        // The old_part preview must appear in the warning so the
+        // The new_part IS the new state — the LLM's text is
+        // applied as the entity's initial history content.
+        assert_eq!(result.new_summary.as_deref(), Some("updated text"));
+        // Info logged (not warning) — this is benign and
+        // expected on every fresh entity's first action.
+        assert!(result.warnings.is_empty(),
+            "expected no warnings, got: {:?}", result.warnings);
+        assert_eq!(result.infos.len(), 1);
+        assert!(result.infos[0].contains("current summary was empty"));
+        assert!(result.infos[0].contains("inserted new_text as initial content"));
+        // The old_part preview must appear in the info so the
         // operator can tell at a glance whether the LLM was
         // emitting the standard "(no history summary yet)"
-        // placeholder for a fresh entity (benign) versus trying to
-        // find-replace stale text that no longer exists
-        // (actionable). Locks in the per-Arcurus 2026-06-08
-        // #openworld fix.
+        // placeholder for a fresh entity (benign) versus trying
+        // to find-replace stale text that no longer exists
+        // (the LLM is confused, but applying new_part is still
+        // the right recovery). 100-char preview (locks in the
+        // 2026-06-08 preview helper; same constant as the
+        // predecessor warning).
         assert!(
-            result.warnings[0]
+            result.infos[0]
                 .contains("the Wandering Bard sang a truth-song at the Spring Festival"),
-            "warning should include the old_part preview, got: {:?}",
-            result.warnings[0]
+            "info should include the old_part preview, got: {:?}",
+            result.infos[0]
         );
+    }
+
+    // -- matrix row 7b: non-empty old_part with the standard
+    // "(no history summary yet)" placeholder, + None summary →
+    // info with the placeholder visible in the preview --
+    #[test]
+    fn empty_history_with_placeholder_old_part_still_applies_new_text() {
+        // The LLM dutifully emits the standard placeholder for
+        // a fresh entity per the EntityAction.md prompt. The
+        // operator scanning the log should be able to recognize
+        // this pattern at a glance and know it was benign.
+        // The 100-char preview is short enough that the
+        // "(no history summary yet)" placeholder (28 chars)
+        // appears verbatim in the info.
+        let result = apply_history_summary_replaces(
+            None,
+            &[r("(no history summary yet)", "She is a Wandering Bard seeking truth in the realm.")],
+            10_000,
+        );
+        assert_eq!(
+            result.new_summary.as_deref(),
+            Some("She is a Wandering Bard seeking truth in the realm.")
+        );
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.infos.len(), 1);
+        assert!(result.infos[0].contains("(no history summary yet)"));
     }
 
     // -- matrix row 8: multi-replace chain (array) -- both apply in order --
