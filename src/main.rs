@@ -2996,9 +2996,39 @@ pub fn apply_history_summary_replaces(
                 // with a warning. The LLM probably wanted to do a
                 // find-replace but the summary is empty; the safest
                 // behavior is to skip and let the operator decide.
+                //
+                // Include a 100-char preview of the non-empty
+                // `old_part` so the operator can tell, at a glance,
+                // whether the LLM was emitting the standard
+                // "(no history summary yet)" placeholder for a fresh
+                // entity (benign — happens on the entity's first
+                // action) versus trying to find-replace a stale
+                // sentence from a previous turn that the truncation
+                // already dropped (actionable — the LLM is confused
+                // about state). Without the preview, both cases look
+                // identical in the log and the operator has to dig
+                // out the raw LLM response to tell them apart. 100
+                // chars is enough to disambiguate the common
+                // placeholder variants and a few words into a real
+                // sentence, but short enough to keep the warning
+                // line readable when many of them fire in a row.
+                // (Per Arcurus 2026-06-08 #openworld.)
+                const EMPTY_PREVIEW_CHARS: usize = 100;
+                let old_chars = rep.old_part.chars().count();
+                let preview: String = rep
+                    .old_part
+                    .chars()
+                    .take(EMPTY_PREVIEW_CHARS)
+                    .collect::<String>()
+                    + if old_chars > EMPTY_PREVIEW_CHARS {
+                        "…"
+                    } else {
+                        ""
+                    };
                 warnings.push(format!(
-                    "history_summary_replace[{}]: current summary is empty; cannot search for non-empty old_part; skipped",
-                    i
+                    "history_summary_replace[{}]: current summary is empty; cannot search for non-empty old_part; skipped (old_part: {:?})",
+                    i,
+                    preview
                 ));
                 continue;
             }
@@ -8395,9 +8425,15 @@ mod history_summary_replace_tests {
     // -- matrix row 7: non-empty old_part + None summary → warning, skip --
     #[test]
     fn non_empty_old_part_with_none_summary_warns_and_skips() {
+        // Use a distinctive old_part so the regression assertion
+        // below can verify the 100-char preview is actually
+        // included in the warning (and not, say, just the
+        // "(no history summary yet)" placeholder text the LLM
+        // typically emits). Per Arcurus 2026-06-08 #openworld.
         let result = apply_history_summary_replaces(
             None,
-            &[r("X", "Y")],
+            &[r("the Wandering Bard sang a truth-song at the Spring Festival",
+               "updated text")],
             10_000,
         );
         // No change (no summary to start with, can't search).
@@ -8405,6 +8441,19 @@ mod history_summary_replace_tests {
         // Warning logged.
         assert_eq!(result.warnings.len(), 1);
         assert!(result.warnings[0].contains("current summary is empty"));
+        // The old_part preview must appear in the warning so the
+        // operator can tell at a glance whether the LLM was
+        // emitting the standard "(no history summary yet)"
+        // placeholder for a fresh entity (benign) versus trying to
+        // find-replace stale text that no longer exists
+        // (actionable). Locks in the per-Arcurus 2026-06-08
+        // #openworld fix.
+        assert!(
+            result.warnings[0]
+                .contains("the Wandering Bard sang a truth-song at the Spring Festival"),
+            "warning should include the old_part preview, got: {:?}",
+            result.warnings[0]
+        );
     }
 
     // -- matrix row 8: multi-replace chain (array) -- both apply in order --
