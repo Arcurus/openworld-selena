@@ -74,6 +74,12 @@ OPENWORLD_LOG_CHANNEL_ID = "1511696310984773633"  # #openworld-log
 # scripts agree on what "duplicate" means.
 _REL_SPLIT = re.compile(r"\s*→\s*")
 
+# History-summary cap. Matches the Rust `default_max_history_summary_chars`
+# in src/main.rs:503. The /api/entities/:id response includes the
+# effective per-entity cap; the default is 10000 unless settings.json
+# overrides it.
+DEFAULT_HISTORY_SUMMARY_CAP = 10000
+
 # ---------------------------------------------------------------------------
 # Discord post (copied from ow_sanity_check.py so the two scripts are
 # independent and either can run without the other)
@@ -257,19 +263,25 @@ def build_replacement_plan(
     findings: List[Dict[str, Any]],
     strategy: str,
     only_entity_id: Optional[str] = None,
+    cap: int = DEFAULT_HISTORY_SUMMARY_CAP,
 ) -> List[Dict[str, Any]]:
     """For each finding, build the per-entity merge plan.
 
     A "plan" entry contains:
         entity_id, entity_name, strategy,
         merges: [{canonical, old_line, new_line, dropped_lines}],
-        expected_new_summary_chars: int
+        expected_new_summary_chars: int,
+        over_cap_by: int  (positive = merge pushes past `cap`)
 
     We use the full original "→ canonical: text" line as `old_line` so
     the find-replace matches exactly (incl. the `→` prefix). This
     relies on the same `→` convention as the LLM emits and the API
     accepts. We replace ONE occurrence per call (the API does the
     first-match replace; subsequent calls keep shrinking the dup set).
+
+    The `cap` argument defaults to DEFAULT_HISTORY_SUMMARY_CAP. The
+    /api/entities/:id response may report a different per-entity
+    cap; callers can pass that value to make the cap check accurate.
     """
     plan: List[Dict[str, Any]] = []
     for f in findings:
@@ -296,13 +308,16 @@ def build_replacement_plan(
         # This is an upper bound; truncation may still kick in.
         cur = f["current_summary"]
         delta = sum(len(m["new_line"]) - len(m["old_line"]) for m in merges)
+        expected = len(cur) + delta
         plan.append({
             "entity_id": f["entity_id"],
             "entity_name": f["entity_name"],
             "strategy": strategy,
             "current_summary_chars": len(cur),
             "merges": merges,
-            "expected_new_summary_chars": len(cur) + delta,
+            "expected_new_summary_chars": expected,
+            "cap": cap,
+            "over_cap_by": max(0, expected - cap),
         })
     return plan
 
@@ -389,7 +404,16 @@ def render_plan_report(plan: List[Dict[str, Any]], strategy: str) -> str:
         parts.append("✅ No duplicate relations to merge.")
         return "\n".join(parts)
     total_merges = sum(len(p["merges"]) for p in plan)
+    over_cap = [p for p in plan if p["over_cap_by"] > 0]
     parts.append(f"📋 {len(plan)} entities / {total_merges} merge operations planned.")
+    if over_cap:
+        cap = over_cap[0]["cap"]
+        parts.append(f"⚠️  {len(over_cap)} entity(ies) would exceed cap ({cap} chars) post-merge:")
+        for p in over_cap:
+            parts.append(f"   - {p['entity_name']}: {p['expected_new_summary_chars']} chars "
+                         f"(+{p['over_cap_by']} over)")
+        parts.append("   → server would silently truncate; use --strategy=keep-first/keep-last/longest "
+                     "or pass --ignore-cap to override.")
     for p in plan:
         parts.append(f"  • **{p['entity_name']}** ({p['entity_id'][:8]}..): "
                      f"{p['current_summary_chars']} → ~{p['expected_new_summary_chars']} chars")
@@ -454,6 +478,11 @@ def main() -> int:
                    help="emit machine-readable JSON to stdout instead of Markdown")
     p.add_argument("--no-backup", action="store_true",
                    help="skip the save.owbl snapshot (not recommended)")
+    p.add_argument("--cap", type=int, default=DEFAULT_HISTORY_SUMMARY_CAP,
+                   help=f"history_summary char cap (default {DEFAULT_HISTORY_SUMMARY_CAP}, "
+                        "matches src/main.rs default_max_history_summary_chars)")
+    p.add_argument("--ignore-cap", action="store_true",
+                   help="apply even if a merge would push an entity past --cap (server will truncate)")
     args = p.parse_args()
 
     # Fetch entities
@@ -468,7 +497,7 @@ def main() -> int:
         return 2
 
     findings = find_duplicates(entities)
-    plan = build_replacement_plan(findings, args.strategy, only_entity_id=args.entity)
+    plan = build_replacement_plan(findings, args.strategy, only_entity_id=args.entity, cap=args.cap)
 
     if args.json:
         out = {
@@ -503,6 +532,20 @@ def main() -> int:
     if not plan:
         print("Nothing to apply.")
         return 0
+
+    # Cap safety: refuse to apply if any entity would exceed --cap
+    # (the server would silently truncate, making the merge partial
+    # and the dropped variants effectively lost). --ignore-cap is
+    # the explicit escape hatch.
+    over_cap = [p for p in plan if p["over_cap_by"] > 0]
+    if over_cap and not args.ignore_cap:
+        print(f"ERROR: {len(over_cap)} entity(ies) would exceed --cap ({args.cap} chars):", file=sys.stderr)
+        for p in over_cap:
+            print(f"  • {p['entity_name']}: {p['expected_new_summary_chars']} chars "
+                  f"(+{p['over_cap_by']} over)", file=sys.stderr)
+        print("Re-run with --ignore-cap to override (server will truncate).", file=sys.stderr)
+        print("Or switch to a non-growing strategy (keep-first/keep-last/longest).", file=sys.stderr)
+        return 2
 
     backup_path = None
     if not args.no_backup:

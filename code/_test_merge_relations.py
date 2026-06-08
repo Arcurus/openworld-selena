@@ -261,7 +261,52 @@ print(f"OK: render_plan_report emits a {len(text)}-char plan report (safe to pri
 
 
 # ---------------------------------------------------------------------------
-# 7) integration: dry-run against the LIVE server (if reachable)
+# 7) cap-check safety: an over-cap merge is flagged in the plan and
+#    the report mentions the cap. This is the safety net that
+#    prevents the apply path from silently producing a truncated
+#    history_summary.
+# ---------------------------------------------------------------------------
+from merge_relations import DEFAULT_HISTORY_SUMMARY_CAP
+
+# A 9900-char summary with a 500-char duplicate group; combine would
+# push it over the default 10000 cap.
+big_old = "x" * 500
+big_new = "x" * 600
+entities_cap = [
+    {
+        "id": "e_cap",
+        "name": "CapTest",
+        "history_summary": f"intro. → Big: {big_old}\n→ Big: {big_new}",
+    }
+]
+finds_cap = find_duplicates(entities_cap)
+assert finds_cap, "test setup: synthetic entity should yield a duplicate group"
+assert finds_cap[0]["duplicates"], "test setup: duplicate group should have entries"
+
+# Use a small cap so the synthetic triggers over-cap without huge strings.
+TEST_CAP = 1500
+plan_cap = build_replacement_plan(finds_cap, "combine", cap=TEST_CAP)
+assert plan_cap[0]["over_cap_by"] > 0, (
+    f"combine with growth should flag over_cap_by>0, got {plan_cap[0]['over_cap_by']}"
+)
+print(f"OK: cap-check flags over-cap merge (over_cap_by={plan_cap[0]['over_cap_by']})")
+
+# The report should mention the cap and the over-cap entity.
+report_cap = render_plan_report(plan_cap, "combine")
+assert "would exceed cap" in report_cap, f"report should warn about cap, got:\n{report_cap}"
+assert "CapTest" in report_cap
+print(f"OK: cap-check warning appears in plan report")
+
+# keep-first (no growth) should NOT flag over_cap_by.
+plan_kf = build_replacement_plan(finds_cap, "keep-first", cap=TEST_CAP)
+assert plan_kf[0]["over_cap_by"] == 0, (
+    f"keep-first should not grow, but over_cap_by={plan_kf[0]['over_cap_by']}"
+)
+print(f"OK: non-growing strategy has over_cap_by=0")
+
+
+# ---------------------------------------------------------------------------
+# 8) integration: dry-run against the LIVE server (if reachable)
 #     This is best-effort — if the server isn't running we skip, not fail.
 # ---------------------------------------------------------------------------
 import urllib.request
