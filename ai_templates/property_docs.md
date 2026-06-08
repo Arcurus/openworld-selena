@@ -33,9 +33,18 @@ entity feel in the world right now?
 
 A high `corruption` means this entity is *corrupted* — its
 essence has been twisted, its actions serve darker ends, and
-its narrative arc is one of taint or fall. Use it to track
-how far a character, location, or artifact has slipped from
-its original nature.
+its narrative arc is one of taint. Use it to track how far
+a character, location, or artifact has slipped from its
+original nature.
+
+Corrupted entities are typically **very selfish** — their
+actions prioritise their own gain or pleasure at the
+expense of others, and they often **spread corruption
+further in the world**, whether consciously (a villain
+who deliberately poisons the minds of followers) or
+unconsciously (a curse-bearer whose mere presence
+withers what they touch). A corrupted being corrupts
+by being what it is.
 
 A negative `corruption` means the entity is *purified* —
 cleansed, sanctified, or otherwise resistant to corruption.
@@ -51,13 +60,17 @@ social leverage* — the ability to sway decisions, broker
 deals, or rally others. Think back-room dealers, queens, guild
 masters, and respected elders.
 
-`influence` is **distinct from `power`** (which is closer to
-military / combat strength) and **from `reputation`** (which
-is how the world SEES the entity). A queen can have very
-high `influence` while being personally weak; a back-room
-dealer can have high `influence` even if nobody respects them.
-A high-`influence` entity is someone whose words and gestures
-move other actors, whether or not those actors like them.
+`influence` is **distinct from `power`** (which is the
+entity's general power, considering all of its strengths —
+military, magical, economic, political, anything that
+gives the entity weight in the world) and **from `reputation`**
+(which is how the world SEES the entity). A queen can
+have very high `influence` (lineage, network, veto power)
+while her `power` is moderate; a back-room dealer can
+have high `influence` even if `reputation` is low. A
+high-`influence` entity is someone whose words and
+gestures move other actors, whether or not those actors
+like them.
 
 Use it to model "soft power" — diplomacy, negotiation,
 recruitment, vote outcomes, who gets a seat at the table.
@@ -71,11 +84,29 @@ be followed, investigated, or refused service. A negative
 a trusted hero, a public official, a beloved community
 member.
 
-` suspicion` is **perception, not reality** — distinct from
+`suspicion` is **perception, not reality** — distinct from
 `corruption`, which is actual evil. A pure-hearted reformer
 can carry high `suspicion` if the public doesn't trust their
 motives; a guilty party can carry low `suspicion` if they've
 hidden their tracks well.
+
+`suspicion` is also a property the LLM can deliberately
+**shape** based on the entity's behaviour, not just a
+passive reflection of what they are. Two patterns worth
+keeping in mind:
+
+- **Corrupted political beings or heroes** typically
+  *hide* their nature — bribes, alibis, public-image
+  work. Their `suspicion` should usually move **down**
+  (or stay low) even as their `corruption` rises.
+  They're working to prevent the world from seeing
+  what they are.
+- **Powerful beings who don't care what others think**
+  (a tyrant, a self-righteous god, a demon in open
+  defiance) act openly suspicious and their
+  `suspicion` can legitimately **soar** without it
+  being a discovery — it's a declaration, not a slip.
+  The tag rule below fires normally on them.
 
 The server enforces a tag rule on this property: when
 `max(1, power) - suspicion < -1` the entity gets the
