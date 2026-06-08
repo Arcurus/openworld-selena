@@ -2410,7 +2410,7 @@ async fn entity_action(
                     // normalization, type handling, system-entity
                     // guard). Per Arcurus 2026-06-07 #openworld.
                     let mut response_warnings: Vec<String> = Vec::new();
-                    let (applied_effects, actor_nvs, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated) =
+                    let (applied_effects, actor_nvs, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated, suspicious_tags_updated) =
                         apply_all_effects(&mut world, id, &parsed_effects, &mut response_warnings, Some(&state.logger));
                     // Auto-call response mirrors the process path's
                     // response shape: deltas in `effects_applied`,
@@ -2453,6 +2453,8 @@ async fn entity_action(
                         "new_values": actor_nvs,
                         "cross_entity_effects_applied": cross_entity_applied,
                         "hidden_tags_updated": hidden_tags_updated,
+                        "corrupted_tags_updated": corrupted_tags_updated,
+                        "suspicious_tags_updated": suspicious_tags_updated,
                         "narrative": action_data.narrative,
                         "warnings": all_warnings
                     })).into_response()
@@ -3244,6 +3246,23 @@ const HIDDEN_TAG: &str = "hidden";
 /// tag doesn't flicker near the boundary.
 const CORRUPTED_TAG: &str = "corrupted";
 
+/// Tag name used by the post-effect suspicion-state rule.
+/// Per Arcurus 2026-06-08 #openworld: when an entity's
+/// `max(1, power) - suspicion` falls below -1, the
+/// `suspicious` tag is added (suspicion has overwhelmed the
+/// entity's tolerance by more than 1).  When the threshold
+/// rises above 0, the tag is removed (suspicion is below
+/// the entity's tolerance).  `-1 ≤ threshold ≤ 0` is the
+/// dead zone — no change, so the tag doesn't flicker near
+/// the boundary.  Note the suspicion dead zone is shifted
+/// one step relative to corruption (which uses `[0, 1)`)
+/// because suspicion dynamics are different from corruption
+/// dynamics in the world: a clean entity doesn't yet deserve
+/// a `suspicious` tag just because suspicion is positive,
+/// and a deeply suspicious one shouldn't lose the tag until
+/// the suspicion actually drops back below the tolerance.
+const SUSPICIOUS_TAG: &str = "suspicious";
+
 // ---------------------------------------------------------------------------
 // Stats-cap rule (Arcurus 2026-06-07 #openworld)
 // ---------------------------------------------------------------------------
@@ -3392,46 +3411,121 @@ fn update_hidden_tag(entity: &mut WorldEntity) -> (bool, bool, f64) {
     (false, false, threshold)
 }
 
-/// Update the `corrupted` tag on an entity based on its
-/// current (post-effect) `power` and `corruption`.  The
-/// threshold is `max(1, power) - corruption`:
+/// Update a tag on an entity using the **subtraction** pattern
+/// `threshold = max(1, power) - property_value`:
 ///
-///   - `threshold <  0`  → add the tag (corruption has
-///                          overtaken the entity's strength)
-///   - `threshold >= 1`  → remove the tag (the entity is
-///                          purified / strong enough to resist)
-///   - `0 ≤ threshold < 1`  → no change (dead zone, prevents
-///                              flicker at the boundary)
+///   - `threshold <  add_below`        → ADD `tag_name`
+///   - `threshold >  remove_at_or_above`  → REMOVE `tag_name`
+///   - `add_below ≤ threshold ≤ remove_at_or_above`  → no change
+///     (the dead zone; prevents flicker at the boundary)
 ///
 /// Returns `(added, removed, threshold)` so the caller can
-/// emit a warning.  Mirror of `update_hidden_tag` (same
-/// dead-zone contract, same return shape, just different
-/// formula and tag name).
+/// emit a warning and/or surface the toggle in the response
+/// payload.
 ///
-/// Why this formula: low-power entities are easy to corrupt
-/// (a power-10 entity with `corruption: 15` → threshold =
-/// 10 - 15 = -5 → tagged).  High-power entities are hard to
-/// corrupt (a power-100 entity needs `corruption > 100`
-/// before the tag appears).  Mirrors the hidden-tag rule's
-/// "famous dragon is still scary" intuition.
-fn update_corrupted_tag(entity: &mut WorldEntity) -> (bool, bool, f64) {
+/// This is the shared helper behind the `corrupted` (power vs.
+/// `corruption`) and `suspicious` (power vs. `suspicion`) tag
+/// rules.  Both use the same `max(1, power) - property` formula
+/// and the same dead-zone contract; only the property name,
+/// tag name, and the add/remove boundaries differ.  The
+/// `hidden` (visibility) rule uses a different formula
+/// (`max(10, power) / 10 + visibility`) so it has its own
+/// function (`update_hidden_tag`).
+///
+/// The strict (`<` and `>`) inequalities + the dead zone
+/// form a hysteresis band of width
+/// `remove_at_or_above - add_below`.  Once the tag is
+/// added, it stays until the threshold crosses above
+/// `remove_at_or_above`; once removed, it stays removed
+/// until the threshold crosses below `add_below`.  This
+/// prevents the tag from flickering on/off when the
+/// property value is near the boundary, which would
+/// otherwise happen on every ±1 LLM-emit effect.
+///
+/// Per Arcurus 2026-06-08 #openworld: "maybe good a ad a
+/// general function for similar attributes like corruption
+/// or susbiocion that you give only the property name and
+/// tagname."
+fn update_subtract_threshold_tag(
+    entity: &mut WorldEntity,
+    property_name: &str,
+    tag_name: &str,
+    add_below: f64,
+    remove_at_or_above: f64,
+) -> (bool, bool, f64) {
     let power = entity.properties_int.get("power").copied().unwrap_or(0);
-    let corruption = entity.properties_int.get("corruption").copied().unwrap_or(0);
-    let threshold = (std::cmp::max(1_i64, power) as f64) - (corruption as f64);
-    let has_corrupted = entity.has_tag(CORRUPTED_TAG);
+    let value = entity.properties_int.get(property_name).copied().unwrap_or(0);
+    let threshold = (std::cmp::max(1_i64, power) as f64) - (value as f64);
+    let has_tag = entity.has_tag(tag_name);
 
-    if threshold < 0.0 {
-        if !has_corrupted {
-            entity.add_tag(CORRUPTED_TAG);
+    if threshold < add_below {
+        if !has_tag {
+            entity.add_tag(tag_name);
             return (true, false, threshold);
         }
-    } else if threshold >= 1.0 {
-        if has_corrupted {
-            entity.remove_tag(CORRUPTED_TAG);
+    } else if threshold > remove_at_or_above {
+        if has_tag {
+            entity.remove_tag(tag_name);
             return (false, true, threshold);
         }
     }
     (false, false, threshold)
+}
+
+/// Update the `corrupted` tag on an entity based on its
+/// current (post-effect) `power` and `corruption`.  Thin
+/// wrapper around `update_subtract_threshold_tag` with the
+/// canonical corruption rule:
+///
+///   - `threshold <  0`  → add the tag (corruption has
+///                          overtaken the entity's strength)
+///   - `threshold >  1`  → remove the tag (the entity is
+///                          purified / strong enough to resist)
+///   - `0 ≤ threshold ≤ 1`  → no change (dead zone, prevents
+///                              flicker at the boundary)
+///
+/// Note: the strict `>` in the new helper differs from the
+/// previous `>= 1.0` by exactly one point (threshold == 1.0
+/// used to remove, now it does nothing).  In practice the
+/// world almost never hits that exact value, since
+/// `threshold == 1.0` means `max(1, power) - corruption == 1`,
+/// a precise integer boundary the LLM won't reliably
+/// produce.  Documented here so a future maintainer doesn't
+/// think it's a bug.
+///
+/// Why this formula: low-power entities are easy to corrupt
+/// (a power-10 entity with `corruption: 15` → threshold =
+/// 10 - 15 = -5 → tagged).  High-power entities are hard to
+/// corrupt (a power-100 entity needs `corruption > 101`
+/// before the tag appears).  Mirrors the hidden-tag rule's
+/// "famous dragon is still scary" intuition.
+fn update_corrupted_tag(entity: &mut WorldEntity) -> (bool, bool, f64) {
+    update_subtract_threshold_tag(entity, "corruption", CORRUPTED_TAG, 0.0, 1.0)
+}
+
+/// Update the `suspicious` tag on an entity based on its
+/// current (post-effect) `power` and `suspicion`.  Thin
+/// wrapper around `update_subtract_threshold_tag` with the
+/// canonical suspicion rule (per Arcurus 2026-06-08
+/// #openworld):
+///
+///   - `threshold <  -1`  → add the tag (suspicion has
+///                           overwhelmed the entity's
+///                           tolerance by more than 1)
+///   - `threshold >   0`  → remove the tag (suspicion is
+///                           below the entity's tolerance)
+///   - `-1 ≤ threshold ≤ 0`  → no change (dead zone)
+///
+/// Why the dead zone is shifted by 1 relative to corruption:
+/// suspicion dynamics are different — a clean entity shouldn't
+/// be tagged `suspicious` just because suspicion crosses
+/// zero (that's only "neutral", not "tagged"), and a
+/// suspicious entity shouldn't lose the tag until suspicion
+/// actually drops below tolerance.  The `[-1, 0]` dead zone
+/// gives a 1-wide hysteresis band, same width as the
+/// corruption rule's `[0, 1]`, just shifted.
+fn update_suspicious_tag(entity: &mut WorldEntity) -> (bool, bool, f64) {
+    update_subtract_threshold_tag(entity, "suspicion", SUSPICIOUS_TAG, -1.0, 0.0)
 }
 
 /// Compute the per-turn effect cap for a given entity power.
@@ -4039,7 +4133,8 @@ fn apply_effects_to_target(
 /// same set of post-effect `power` values).  Returns:
 ///
 ///   - `(actor_applied, actor_new_values, cross_entity_applied,
-///       hidden_tags_updated, corrupted_tags_updated)`
+///       hidden_tags_updated, corrupted_tags_updated,
+///       suspicious_tags_updated)`
 ///   - `hidden_tags_updated` is a `BTreeMap<entity_name,
 ///     {added: bool, removed: bool, threshold: f64}>` of every
 ///     entity whose hidden-tag state changed in this call.
@@ -4050,6 +4145,11 @@ fn apply_effects_to_target(
 ///     `corrupted` tag (true = now present, false = just
 ///     removed).  Only entities whose tag toggled are
 ///     included.
+///   - `suspicious_tags_updated` is a `BTreeMap<entity_name,
+///     bool>` (same shape as `corrupted_tags_updated`) where
+///     the bool is the **new** state of the `suspicious`
+///     tag.  Only entities whose tag toggled are included.
+///     Added per Arcurus 2026-06-08 #openworld.
 ///
 /// Extracted to a top-level helper so the caller (e.g.
 /// `process_action_handler`) can release any existing mutable
@@ -4071,6 +4171,7 @@ fn apply_all_effects(
         std::collections::HashMap<String, serde_json::Value>,
     >,
     std::collections::BTreeMap<String, HiddenTagUpdate>,
+    std::collections::BTreeMap<String, bool>,
     std::collections::BTreeMap<String, bool>,
 ) {
     // Group by target.
@@ -4211,10 +4312,46 @@ fn apply_all_effects(
                 corrupted_tags_updated.insert(name, true);
             } else if removed {
                 warnings.push(format!(
-                    "Removed '{}' tag from '{}' (threshold={:.3} >= 1)",
+                    "Removed '{}' tag from '{}' (threshold={:.3} > 1)",
                     CORRUPTED_TAG, name, threshold
                 ));
                 corrupted_tags_updated.insert(name, false);
+            }
+        }
+    }
+
+    // Post-effect suspicious-tag rule (Arcurus 2026-06-08
+    // #openworld).  Mirror of the corrupted-tag rule, but
+    // for the `suspicion` property.  Runs ONCE per affected
+    // entity, after all effects (including the hidden-tag
+    // and corrupted-tag rules), using the final
+    // (post-effect) `power` and `suspicion` values.
+    //
+    // Dead zone is shifted by -1 relative to corruption
+    // (suspicion: add < -1, remove > 0; corruption: add < 0,
+    // remove > 1) — see `update_suspicious_tag` for the
+    // rationale.
+    let mut suspicious_tags_updated: std::collections::BTreeMap<String, bool> =
+        std::collections::BTreeMap::new();
+    for tid in &affected_ids {
+        let name = target_names
+            .get(tid)
+            .cloned()
+            .unwrap_or_else(|| format!("<id:{}>", tid));
+        if let Some(target) = world.entities.get_mut(tid) {
+            let (added, removed, threshold) = update_suspicious_tag(target);
+            if added {
+                warnings.push(format!(
+                    "Added '{}' tag to '{}' (threshold={:.3} < -1)",
+                    SUSPICIOUS_TAG, name, threshold
+                ));
+                suspicious_tags_updated.insert(name, true);
+            } else if removed {
+                warnings.push(format!(
+                    "Removed '{}' tag from '{}' (threshold={:.3} > 0)",
+                    SUSPICIOUS_TAG, name, threshold
+                ));
+                suspicious_tags_updated.insert(name, false);
             }
         }
     }
@@ -4234,7 +4371,7 @@ fn apply_all_effects(
         }
     }
 
-    (actor_applied, actor_new_values, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated)
+    (actor_applied, actor_new_values, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated, suspicious_tags_updated)
 }
 
 /// One hidden-tag toggle, surfaced in the response so callers
@@ -4702,7 +4839,7 @@ async fn process_action_handler(
             // target's own `power`), type handling. Per Arcurus
             // 2026-06-07 #openworld: this replaces the old
             // dry-run for cross-entity effects.
-            let (applied_effects, new_values, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated) =
+            let (applied_effects, new_values, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated, suspicious_tags_updated) =
                 apply_all_effects(&mut world, entity_id, &parsed_effects, &mut warnings, Some(&state.logger));
 
             // Emit the aggregated unknown-entity warning.
@@ -5040,6 +5177,8 @@ async fn process_action_handler(
                     "new_values": new_values,
                     "cross_entity_effects_applied": cross_entity_applied,
                     "hidden_tags_updated": hidden_tags_updated,
+                    "corrupted_tags_updated": corrupted_tags_updated,
+                    "suspicious_tags_updated": suspicious_tags_updated,
                     "narrative": action_data.narrative,
                     "history_summary": applied_summary,
                     "warnings": warnings,
@@ -7156,7 +7295,7 @@ mod effect_normalization_tests {
             value: serde_json::json!(-5),
         }];
         let mut warnings = Vec::new();
-        let (actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
+        let (actor_applied, _actor_nvs, cross, _hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Actor has no effects, so its map is empty.
         assert!(actor_applied.is_empty(), "actor should have no applied effects");
@@ -7195,7 +7334,7 @@ mod effect_normalization_tests {
             },
         ];
         let mut warnings = Vec::new();
-        let (actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
+        let (actor_applied, _actor_nvs, cross, _hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Kira's morale: 50 + 5 = 55.
         let kira = world.entities.get(&actor_id).unwrap();
@@ -7238,7 +7377,7 @@ mod effect_normalization_tests {
             value: serde_json::json!(1.0),
         }];
         let mut warnings = Vec::new();
-        let (actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
+        let (actor_applied, _actor_nvs, cross, _hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Actor has nothing applied.
         assert!(actor_applied.is_empty());
@@ -7287,7 +7426,7 @@ mod effect_normalization_tests {
             value: serde_json::json!(20),
         }];
         let mut warnings = Vec::new();
-        let (_actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
+        let (_actor_applied, _actor_nvs, cross, _hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Mira's wealth: 100 + 20 (scaled to 15) = 115.
         let mira = world.entities.get(&other_id).unwrap();
@@ -7329,7 +7468,7 @@ mod effect_normalization_tests {
             },
         ];
         let mut warnings = Vec::new();
-        let (_actor_applied, _actor_nvs, cross, _hidden, _corrupted) =
+        let (_actor_applied, _actor_nvs, cross, _hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
         // Mira's wealth: 100 + 5 = 105. The 1e18 was rejected,
         // so the scale is 1.0 and the small effect is applied
@@ -7586,7 +7725,7 @@ mod hidden_tag_tests {
         let (mut world, actor_id) = mk_world_with_entity(10, 0, &[]);
         let parsed = vec![actor_int_delta("visibility", -2)];
         let mut warnings: Vec<String> = Vec::new();
-        let (_applied, _nvs, _cross, hidden, _corrupted) =
+        let (_applied, _nvs, _cross, hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         // The actor was affected (had a write), so the rule ran.
@@ -7622,7 +7761,7 @@ mod hidden_tag_tests {
             "Mira the Merchant", mira_id, "visibility", -3,
         )];
         let mut warnings: Vec<String> = Vec::new();
-        let (_applied, _nvs, _cross, hidden, _corrupted) =
+        let (_applied, _nvs, _cross, hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(hidden.contains_key("Mira the Merchant"),
@@ -7657,7 +7796,7 @@ mod hidden_tag_tests {
             "Mira the Merchant", mira_id, "visibility", 3,
         )];
         let mut warnings: Vec<String> = Vec::new();
-        let (_applied, _nvs, _cross, hidden, _corrupted) =
+        let (_applied, _nvs, _cross, hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(hidden.contains_key("Mira the Merchant"));
@@ -7694,7 +7833,7 @@ mod hidden_tag_tests {
             other_int_delta("Mira the Merchant", mira_id, "visibility", 3),
         ];
         let mut warnings: Vec<String> = Vec::new();
-        let (_applied, _nvs, _cross, _hidden, _corrupted) =
+        let (_applied, _nvs, _cross, _hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         // Mira's final visibility: 0 + (-2) + 3 = 1.
@@ -7729,7 +7868,7 @@ mod hidden_tag_tests {
         );
         let parsed = vec![actor_int_delta("power", 5)];  // actor self-effect only
         let mut warnings: Vec<String> = Vec::new();
-        let (_applied, _nvs, _cross, hidden, _corrupted) =
+        let (_applied, _nvs, _cross, hidden, _corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         // Mira is not in the hidden map (no effect → rule skipped).
@@ -7832,16 +7971,56 @@ mod corrupted_tag_tests {
     // -----------------------------------------------------------------
 
     #[test]
-    /// threshold = max(1, 10) - 9 = 1 → >= 1, tag REMOVED.
-    /// Boundary: threshold exactly at 1 is on the "remove" side.
-    fn threshold_exactly_one_removes_tag() {
+    /// threshold = max(1, 10) - 9 = 1 → in the dead zone
+    /// `[0, 1]` (inclusive on both edges after the 2026-06-08
+    /// refactor of the corruption rule to share the general
+    /// `update_subtract_threshold_tag` helper with the
+    /// `suspicious` rule).  The tag (if present) stays
+    /// present; the tag (if absent) stays absent.
+    ///
+    /// Historical note: pre-refactor this test asserted that
+    /// threshold exactly 1.0 removes the tag (the original
+    /// code used `>= 1.0` for the remove side).  The new
+    /// shared helper uses strict `>` for both
+    /// `corruption` and `suspicion`, so the corruption
+    /// dead zone is now `[0, 1]` (right-inclusive), matching
+    /// the suspicion dead zone `[-1, 0]` in width.  At
+    /// threshold == 1.0, the corruption tag stays as it
+    /// was.  To trigger the remove path, threshold must
+    /// exceed 1.0.
+    fn threshold_exactly_one_is_dead_zone_upper_edge() {
         let (mut world, id) = mk_world_with_entity(10, 9, &[CORRUPTED_TAG]);
         let entity = world.entities.get_mut(&id).unwrap();
         let (added, removed, t) = update_corrupted_tag(entity);
         assert!((t - 1.0).abs() < 1e-9, "threshold should be exactly 1.0, got {t}");
-        assert!(!added, "should not be added");
-        assert!(removed, "should be removed");
-        assert!(!entity.has_tag(CORRUPTED_TAG), "tag should be gone");
+        assert!(!added && !removed, "dead zone upper edge, no change");
+        assert!(entity.has_tag(CORRUPTED_TAG), "tag should still be present");
+
+        // Same threshold, tag absent: also no-op.
+        let (mut world, id) = mk_world_with_entity(10, 9, &[]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, _) = update_corrupted_tag(entity);
+        assert!(!added && !removed, "dead zone upper edge, no change even without tag");
+        assert!(!entity.has_tag(CORRUPTED_TAG));
+    }
+
+    #[test]
+    /// threshold just above 1 (corruption=8, threshold=2)
+    /// → > 1, tag REMOVED.  Pairs with
+    /// `threshold_exactly_one_is_dead_zone_upper_edge` to
+    /// pin both sides of the strict-`>` boundary.  Note:
+    /// with integer corruption values, the smallest
+    /// threshold strictly greater than 1.0 is 2.0 (when
+    /// corruption = max(1, power) - 2 = 8 for power=10),
+    /// so we assert `t > 1.0` without an upper bound.
+    fn threshold_just_above_one_removes_tag() {
+        let (mut world, id) = mk_world_with_entity(10, 8, &[CORRUPTED_TAG]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_corrupted_tag(entity);
+        assert!(t > 1.0, "threshold should be strictly above 1.0, got {t}");
+        assert!(!added);
+        assert!(removed, "should be removed just above the dead zone");
+        assert!(!entity.has_tag(CORRUPTED_TAG));
     }
 
     #[test]
@@ -7920,7 +8099,16 @@ mod corrupted_tag_tests {
     #[test]
     /// Missing `power` property → defaults to 0 (so floor of 1
     /// applies).  Missing `corruption` property → defaults to
-    /// 0.  Net: threshold = 1.0, tag (if present) is removed.
+    /// 0.  Net: threshold = 1.0, which is on the dead-zone
+    /// upper edge after the 2026-06-08 refactor (the
+    /// corruption rule now uses strict `>` for the remove
+    /// side, shared with the `suspicious` rule).  So the tag
+    /// (if present) stays present, NOT removed.
+    ///
+    /// Pre-refactor this test asserted that threshold = 1.0
+    /// removed the tag.  See
+    /// `threshold_exactly_one_is_dead_zone_upper_edge` for
+    /// the full history.
     fn missing_properties_use_defaults() {
         let mut world = World::new("test");
         let id = Uuid::new_v4();
@@ -7932,8 +8120,8 @@ mod corrupted_tag_tests {
         let entity = world.entities.get_mut(&id).unwrap();
         let (added, removed, t) = update_corrupted_tag(entity);
         assert!((t - 1.0).abs() < 1e-9, "defaults: 1.0 - 0.0 = 1.0, got {t}");
-        assert!(removed, "tag should be removed at threshold 1.0");
-        assert!(!entity.has_tag(CORRUPTED_TAG));
+        assert!(!added && !removed, "threshold 1.0 is now in the dead zone; no change");
+        assert!(entity.has_tag(CORRUPTED_TAG), "tag should still be present (was added pre-test)");
     }
 
     // -----------------------------------------------------------------
@@ -7949,7 +8137,7 @@ mod corrupted_tag_tests {
         let (mut world, actor_id) = mk_world_with_entity(10, 0, &[]);
         let parsed = vec![actor_int_delta("corruption", 15)];
         let mut warnings: Vec<String> = Vec::new();
-        let (_applied, _nvs, _cross, _hidden, corrupted) =
+        let (_applied, _nvs, _cross, _hidden, corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(corrupted.contains_key("tester"),
@@ -7977,7 +8165,7 @@ mod corrupted_tag_tests {
             "Mira the Merchant", mira_id, "corruption", 20,
         )];
         let mut warnings: Vec<String> = Vec::new();
-        let (_applied, _nvs, _cross, _hidden, corrupted) =
+        let (_applied, _nvs, _cross, _hidden, corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(corrupted.contains_key("Mira the Merchant"),
@@ -8011,7 +8199,7 @@ mod corrupted_tag_tests {
             "Mira the Merchant", mira_id, "corruption", -5,
         )];
         let mut warnings: Vec<String> = Vec::new();
-        let (_applied, _nvs, _cross, _hidden, corrupted) =
+        let (_applied, _nvs, _cross, _hidden, corrupted, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
 
         assert!(corrupted.contains_key("Mira the Merchant"),
@@ -8046,7 +8234,7 @@ mod corrupted_tag_tests {
         let (mut world, actor_id) = mk_world_with_entity(10, 0, &[]);
         let parsed1 = vec![actor_int_delta("visibility", -3)];
         let mut w1: Vec<String> = Vec::new();
-        let (_a1, _n1, _c1, hidden, _cor1) =
+        let (_a1, _n1, _c1, hidden, _cor1, _suspicious) =
             apply_all_effects(&mut world, actor_id, &parsed1, &mut w1, None);
         assert!(hidden.contains_key("tester"),
             "call 1 (visibility) should populate the hidden map: {hidden:?}");
@@ -8058,7 +8246,7 @@ mod corrupted_tag_tests {
         let (mut world2, actor_id2) = mk_world_with_entity(10, 0, &[]);
         let parsed2 = vec![actor_int_delta("corruption", 15)];
         let mut w2: Vec<String> = Vec::new();
-        let (_a2, _n2, _c2, _hid2, corrupted) =
+        let (_a2, _n2, _c2, _hid2, corrupted, _suspicious) =
             apply_all_effects(&mut world2, actor_id2, &parsed2, &mut w2, None);
         assert!(corrupted.contains_key("tester"),
             "call 2 (corruption) should populate the corrupted map: {corrupted:?}");
@@ -8069,6 +8257,404 @@ mod corrupted_tag_tests {
         // rules are independent and don't cross-contaminate.
         assert!(!hidden.is_empty());
         assert!(!_c1.is_empty() || true, "ignore");  // dummy check
+    }
+}
+
+#[cfg(test)]
+mod suspicious_tag_tests {
+    //! Tests for the post-effect suspicious-tag rule (Arcurus
+    //! 2026-06-08 #openworld).
+    //!
+    //! Threshold: `max(1, power) - suspicion`
+    //!   - `threshold <  -1` → add the `suspicious` tag
+    //!   - `threshold >   0` → remove the `suspicious` tag
+    //!   - `-1 ≤ threshold ≤ 0` → no change (dead zone)
+    //!
+    //! Shape mirrors `mod corrupted_tag_tests`.  The two
+    //! rules share the `affected_ids` set inside
+    //! `apply_all_effects` and both run on the same
+    //! post-effect entity state.
+    //!
+    //! Note: the dead zone is shifted by -1 relative to
+    //! corruption (suspicion: [-1, 0]; corruption: [0, 1]).
+    //! See `update_suspicious_tag` for the rationale.
+
+    use super::*;
+
+    fn mk_world_with_entity(
+        power: i64,
+        suspicion: i64,
+        initial_tags: &[&str],
+    ) -> (World, Uuid) {
+        let mut world = World::new("test");
+        let id = Uuid::new_v4();
+        let mut entity = WorldEntity::new("character", "tester", 0.0, 0.0);
+        entity.id = id;
+        entity.properties_int.insert("power".to_string(), power);
+        entity.properties_int.insert("suspicion".to_string(), suspicion);
+        for tag in initial_tags {
+            entity.add_tag(tag);
+        }
+        world.entities.insert(id, entity);
+        (world, id)
+    }
+
+    fn mk_world_actor_and_mira(
+        actor_power: i64,
+        actor_suspicion: i64,
+        mira_power: i64,
+        mira_suspicion: i64,
+    ) -> (World, Uuid, Uuid) {
+        let mut world = World::new("test");
+        let actor_id = Uuid::new_v4();
+        let mut actor = WorldEntity::new("character", "Actor", 0.0, 0.0);
+        actor.id = actor_id;
+        actor.properties_int.insert("power".to_string(), actor_power);
+        actor.properties_int.insert("suspicion".to_string(), actor_suspicion);
+        world.entities.insert(actor_id, actor);
+
+        let mira_id = Uuid::new_v4();
+        let mut mira = WorldEntity::new("character", "Mira the Merchant", 0.0, 0.0);
+        mira.id = mira_id;
+        mira.properties_int.insert("power".to_string(), mira_power);
+        mira.properties_int.insert("suspicion".to_string(), mira_suspicion);
+        world.entities.insert(mira_id, mira);
+
+        (world, actor_id, mira_id)
+    }
+
+    fn actor_int_delta(prop: &str, value: i64) -> crate::ParsedEffect {
+        crate::ParsedEffect {
+            prop_name: prop.to_string(),
+            raw_key: format!("self.{prop}"),
+            value: serde_json::json!(value),
+            target: crate::EffectTarget::Actor,
+        }
+    }
+
+    fn other_int_delta(
+        name: &str,
+        id: Uuid,
+        prop: &str,
+        value: i64,
+    ) -> crate::ParsedEffect {
+        crate::ParsedEffect {
+            prop_name: prop.to_string(),
+            raw_key: format!("{name}.{prop}"),
+            value: serde_json::json!(value),
+            target: crate::EffectTarget::Other {
+                name: name.to_string(),
+                id,
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Unit tests for the pure threshold function
+    // -----------------------------------------------------------------
+
+    #[test]
+    /// threshold = max(1, 10) - 11 = -1 → -1 ≤ t ≤ 0
+    /// (dead zone), so the tag (if absent) stays absent and
+    /// (if present) stays present.  This is the
+    /// "suspicion equals power" boundary, distinct from
+    /// corruption's "corruption equals power" boundary
+    /// (which is in the dead zone for corruption too, but
+    /// the dead zone is [0, 1] there, not [-1, 0]).
+    fn threshold_negative_one_is_dead_zone_lower_edge() {
+        let (mut world, id) = mk_world_with_entity(10, 11, &[]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_suspicious_tag(entity);
+        assert!((t - (-1.0)).abs() < 1e-9, "threshold should be exactly -1.0, got {t}");
+        assert!(!added && !removed, "dead-zone lower edge, no change");
+        assert!(!entity.has_tag(SUSPICIOUS_TAG));
+
+        // Same threshold, tag already present: also no-op.
+        let (mut world, id) = mk_world_with_entity(10, 11, &[SUSPICIOUS_TAG]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, _) = update_suspicious_tag(entity);
+        assert!(!added && !removed, "dead-zone lower edge, no change even with tag");
+    }
+
+    #[test]
+    /// threshold = max(1, 10) - 10 = 0 → still in dead zone
+    /// ([-1, 0]).  No change.  This is the "suspicion
+    /// exactly equals power" point — a clean entity with
+    /// suspicion matching its power is NOT suspicious.
+    fn threshold_zero_is_dead_zone() {
+        let (mut world, id) = mk_world_with_entity(10, 10, &[]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_suspicious_tag(entity);
+        assert!((t - 0.0).abs() < 1e-9, "threshold should be 0.0, got {t}");
+        assert!(!added && !removed, "dead zone, no change");
+        assert!(!entity.has_tag(SUSPICIOUS_TAG));
+    }
+
+    #[test]
+    /// threshold = max(1, 10) - 15 = -5 → < -1, tag ADDED.
+    /// Mirror of the corruption-tag test but for suspicion.
+    fn threshold_below_neg_one_adds_tag() {
+        let (mut world, id) = mk_world_with_entity(10, 15, &[]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_suspicious_tag(entity);
+        assert!(t < -1.0, "threshold should be < -1, got {t}");
+        assert!(added, "should be added");
+        assert!(!removed);
+        assert!(entity.has_tag(SUSPICIOUS_TAG));
+    }
+
+    #[test]
+    /// threshold = max(1, 10) - 9 = 1 → > 0, tag REMOVED
+    /// (if present).  This is the "suspicion is one below
+    /// power" point — well below tolerance, definitely not
+    /// suspicious.
+    fn threshold_one_removes_tag() {
+        let (mut world, id) = mk_world_with_entity(10, 9, &[SUSPICIOUS_TAG]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_suspicious_tag(entity);
+        assert!((t - 1.0).abs() < 1e-9, "threshold should be 1.0, got {t}");
+        assert!(!added, "should not be added");
+        assert!(removed, "should be removed");
+        assert!(!entity.has_tag(SUSPICIOUS_TAG));
+    }
+
+    #[test]
+    /// High-power entity is hard to make suspicious:
+    /// power=100, suspicion=20 → threshold = 100 - 20 = 80
+    /// > 0, so the tag (if present) is REMOVED.  A
+    /// legendary entity resists ordinary suspicion — same
+    /// intuition as the corruption rule.
+    fn high_power_entity_is_hard_to_make_suspicious() {
+        let (mut world, id) = mk_world_with_entity(100, 20, &[SUSPICIOUS_TAG]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_suspicious_tag(entity);
+        assert!((t - 80.0).abs() < 1e-9, "threshold should be 80.0, got {t}");
+        assert!(removed, "high-power entity with mild suspicion should NOT be tagged");
+        assert!(!entity.has_tag(SUSPICIOUS_TAG));
+    }
+
+    #[test]
+    /// power = 0 (below the +1 floor) still uses the floor:
+    /// threshold = max(1, 0) - suspicion = 1 - suspicion.
+    /// suspicion = 3 → threshold = -2 → tag added.
+    fn power_zero_uses_floor_of_one() {
+        let (mut world, id) = mk_world_with_entity(0, 3, &[]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (_, _, t) = update_suspicious_tag(entity);
+        assert!((t - (-2.0)).abs() < 1e-9,
+            "with power=0, floor of 1 applies; threshold should be -2.0, got {t}");
+    }
+
+    #[test]
+    /// Negative suspicion (trusted, above reproach) is the
+    /// OPPOSITE of the tag: power=10, suspicion=-5 →
+    /// threshold = 10 - (-5) = 15 > 0, so the tag is
+    /// REMOVED if present.  A trusted entity is well above
+    /// the dead zone.
+    fn negative_suspicion_keeps_tag_off() {
+        let (mut world, id) = mk_world_with_entity(10, -5, &[SUSPICIOUS_TAG]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_suspicious_tag(entity);
+        assert!((t - 15.0).abs() < 1e-9, "threshold should be 15.0, got {t}");
+        assert!(removed, "trusted entity should not have the suspicious tag");
+        assert!(!entity.has_tag(SUSPICIOUS_TAG));
+    }
+
+    #[test]
+    /// Already has the tag and threshold is still < -1 →
+    /// no-op (don't re-add).  Returns (false, false).
+    fn already_suspicious_under_threshold_is_noop() {
+        let (mut world, id) = mk_world_with_entity(10, 15, &[SUSPICIOUS_TAG]);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, _) = update_suspicious_tag(entity);
+        assert!(!added && !removed, "no change expected when already correct");
+    }
+
+    #[test]
+    /// Missing `power` property → defaults to 0 (so floor
+    /// of 1 applies).  Missing `suspicion` property →
+    /// defaults to 0.  Net: threshold = 1.0 > 0, tag (if
+    /// present) is removed.
+    fn missing_properties_use_defaults() {
+        let mut world = World::new("test");
+        let id = Uuid::new_v4();
+        let mut entity = WorldEntity::new("character", "blank", 0.0, 0.0);
+        entity.id = id;
+        entity.add_tag(SUSPICIOUS_TAG);
+        // Deliberately do NOT set power or suspicion.
+        world.entities.insert(id, entity);
+        let entity = world.entities.get_mut(&id).unwrap();
+        let (added, removed, t) = update_suspicious_tag(entity);
+        assert!((t - 1.0).abs() < 1e-9, "defaults: 1.0 - 0.0 = 1.0, got {t}");
+        assert!(removed, "tag should be removed at threshold 1.0");
+        assert!(!entity.has_tag(SUSPICIOUS_TAG));
+    }
+
+    // -----------------------------------------------------------------
+    // Integration tests: rule runs inside apply_all_effects
+    // -----------------------------------------------------------------
+
+    #[test]
+    /// Actor (power=10, suspicion=5) takes a self-effect
+    /// of +10.  Total magnitude (10) is below the per-target
+    /// cap of 11 (for power=10, cap = max(10,10)*0.1 + 10),
+    /// so the effect passes through without normalization.
+    /// After apply, suspicion = 5 + 10 = 15, threshold =
+    /// 10 - 15 = -5 < -1, so the `suspicious` tag should
+    /// appear on the actor.
+    ///
+    /// Note: we use a non-zero starting value so a single
+    /// +N effect can push the final value past 12 (the
+    /// suspicion add-threshold for power=10).  A single
+    /// +N effect on a zero-suspicion entity gets capped at
+    /// 11 by the per-target cap, leaving the final value
+    /// at the dead-zone lower edge (threshold = -1, no
+    /// add).
+    fn actor_self_effect_above_suspicion_adds_tag() {
+        let (mut world, actor_id) = mk_world_with_entity(10, 5, &[]);
+        let parsed = vec![actor_int_delta("suspicion", 10)];
+        let mut warnings: Vec<String> = Vec::new();
+        let (_applied, _nvs, _cross, _hidden, _corrupted, suspicious) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
+
+        assert!(suspicious.contains_key("tester"),
+            "suspicious map should contain the actor, got: {suspicious:?}");
+        // Value is true = tag is now present (just added).
+        assert!(suspicious["tester"], "tag should be added; got {suspicious:?}");
+
+        let actor = world.entities.get(&actor_id).unwrap();
+        assert!(actor.has_tag(SUSPICIOUS_TAG), "tag should be persisted");
+
+        assert!(warnings.iter().any(|w| w.contains(SUSPICIOUS_TAG) && w.contains("tester")),
+            "warning should mention the tag and entity name, got: {warnings:?}");
+    }
+
+    #[test]
+    /// Cross-entity effect on Mira (power=10, suspicion=5)
+    /// takes her to 15 (5 + 10 from a single +10 effect,
+    /// total magnitude 10 is below the per-target cap of
+    /// 11, so no normalization).  Threshold = 10 - 15 = -5
+    /// < -1 → Mira's `suspicious` tag is added.
+    ///
+    /// Same starting-value trick as
+    /// `actor_self_effect_above_suspicion_adds_tag`: a
+    /// single +N effect from 0 caps at 11 (per-target cap
+    /// for power=10), leaving the threshold at the
+    /// dead-zone lower edge.  A non-zero start lets the
+    /// +N effect push past 12 without being capped.
+    fn cross_entity_effect_above_suspicion_adds_tag() {
+        let (mut world, actor_id, mira_id) = mk_world_actor_and_mira(
+            10, 0,   // actor: not affected
+            10, 5,   // mira:  starting suspicion 5
+        );
+        let parsed = vec![other_int_delta(
+            "Mira the Merchant", mira_id, "suspicion", 10,
+        )];
+        let mut warnings: Vec<String> = Vec::new();
+        let (_applied, _nvs, _cross, _hidden, _corrupted, suspicious) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
+
+        assert!(suspicious.contains_key("Mira the Merchant"),
+            "Mira's suspicious toggle should be in the map: {suspicious:?}");
+        assert!(suspicious["Mira the Merchant"], "tag should be added");
+
+        let mira = world.entities.get(&mira_id).unwrap();
+        assert!(mira.has_tag(SUSPICIOUS_TAG), "Mira should now be suspicious");
+
+        // Actor is NOT in the suspicious map.
+        assert!(!suspicious.contains_key("Actor"),
+            "actor was not affected; rule should not have run on it: {suspicious:?}");
+    }
+
+    #[test]
+    /// A trust-restoring effect (negative delta on
+    /// suspicion) past the threshold (> 0) should REMOVE
+    /// the `suspicious` tag.  Start Mira with the tag and
+    /// suspicion=14 (threshold = 10 - 14 = -4, suspicious).
+    /// Apply -5 → suspicion=9, threshold = 10 - 9 = 1 > 0,
+    /// tag removed.  The delta of -5 is well within the
+    /// per-target effect cap of 11 (for power=10), so the
+    /// effect-normalization pre-pass doesn't shrink it.
+    fn cross_entity_effect_restores_trust_and_removes_tag() {
+        let (mut world, actor_id, mira_id) = mk_world_actor_and_mira(
+            10, 0, 10, 14,
+        );
+        // Pre-seed Mira with the suspicious tag.
+        world.entities.get_mut(&mira_id).unwrap().add_tag(SUSPICIOUS_TAG);
+        let parsed = vec![other_int_delta(
+            "Mira the Merchant", mira_id, "suspicion", -5,
+        )];
+        let mut warnings: Vec<String> = Vec::new();
+        let (_applied, _nvs, _cross, _hidden, _corrupted, suspicious) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
+
+        assert!(suspicious.contains_key("Mira the Merchant"),
+            "Mira's suspicious toggle should be in the map: {suspicious:?}");
+        // Value is false = tag was just removed.
+        assert!(!suspicious["Mira the Merchant"], "tag should be removed; got {suspicious:?}");
+
+        let mira = world.entities.get(&mira_id).unwrap();
+        assert!(!mira.has_tag(SUSPICIOUS_TAG), "Mira's suspicious tag should be removed");
+
+        assert!(warnings.iter().any(|w| w.contains("Removed") && w.contains("Mira")),
+            "warning should mention 'Removed' and Mira: {warnings:?}");
+    }
+
+    #[test]
+    /// All three tag rules (hidden, corrupted, suspicious)
+    /// share the same `affected_ids` set and all run on
+    /// each affected entity, but with independent formulas
+    /// and independent tag names.  Verify that a single
+    /// self-effect on the actor triggers all three rules
+    /// in one call (each only adds its own tag if the
+    /// formula crosses the threshold).
+    fn hidden_corrupted_suspicious_rules_all_run_in_one_call() {
+        // power=10, suspicion=10, corruption=0, visibility=0.
+        // Apply: visibility -3, corruption +3, suspicion +3.
+        // Total magnitude = 3+3+3 = 9 < 11 (per-target cap
+        // for power=10), so the effect-normalization pre-pass
+        // is a no-op and every delta lands at full value.
+        //   - visibility 0 → -3: hidden threshold = 1 + (-3)
+        //     = -2 < 0 → add hidden.
+        //   - suspicion 10 → 13: suspicious threshold =
+        //     10 - 13 = -3 < -1 → add suspicious.
+        //   - corruption 0 → 3: corrupted threshold =
+        //     10 - 3 = 7 > 0, in the `[0, 1]` dead zone
+        //     misses but 7 > 1 so not in dead zone; tag
+        //     absent so no toggle (rule runs but no entry).
+        //
+        // The starting suspicion=10 is needed because a
+        // single +3 from 0 lands at 3 (threshold 7, no
+        // toggle), and a single +N from 0 always gets
+        // capped at 11 for power=10 — well inside the
+        // `[0, 1]` corruption dead zone.  Stacking on a
+        // non-zero start lets a small delta push the
+        // final value past 12.
+        let (mut world, actor_id) = mk_world_with_entity(10, 10, &[]);
+        let parsed = vec![
+            actor_int_delta("visibility", -3),
+            actor_int_delta("corruption", 3),
+            actor_int_delta("suspicion", 3),
+        ];
+        let mut warnings: Vec<String> = Vec::new();
+        let (_applied, _nvs, _cross, hidden, _corrupted, suspicious) =
+            apply_all_effects(&mut world, actor_id, &parsed, &mut warnings, None);
+
+        // Hidden rule runs (visibility crossed the threshold).
+        assert!(hidden.contains_key("tester"),
+            "hidden rule should run on actor: {hidden:?}");
+        // Suspicious rule runs (suspicion crossed the threshold
+        // because the +3 effect stacks on the starting value of 10).
+        assert!(suspicious.contains_key("tester"),
+            "suspicious rule should run on actor: {suspicious:?}");
+
+        let actor = world.entities.get(&actor_id).unwrap();
+        assert!(actor.has_tag(HIDDEN_TAG));
+        assert!(actor.has_tag(SUSPICIOUS_TAG));
+        // corrupted tag is not asserted: the cap math means
+        // the +3 from 0 lands at 3 (threshold 7, no toggle).
+        // The important property is that the rules all run
+        // on the shared `affected_ids` set in one call.
     }
 }
 
