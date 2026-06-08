@@ -680,6 +680,35 @@ sees when and how it triggered.
 
 `src/world_data/entity_history.rs` require a service restart.
 
+## 6b. Shared source of truth with the Python CLI
+
+*(Added 2026-06-08 per Arcurus #openworld — the cap formula, the internal-properties filter, and `stats_sum` are mirrored across two languages: the Rust runtime in `src/main.rs` and the Python CLI in `code/normalize_stats.py`. Both sides MUST read from the same source of truth, not re-implement. This is the open-world instance of the general DRY rule in `AGENTS.md → 🔁 DRY / Shared Functions`.)*
+
+### The three shared sources of truth
+
+| Concern | Rust source | Python source | Shared source of truth |
+|---|---|---|---|
+| **Cap formula** (`cap = max(1, base) + max(1, power) * multiplier`) | `src/main.rs` (hardcoded defaults) | `code/normalize_stats.py` (mirrored constants) | **Env vars** `OPENWORLD_STATS_CAP_BASE`, `OPENWORLD_STATS_CAP_POWER_FLOOR`, `OPENWORLD_STATS_CAP_POWER_MULTIPLIER`. Both sides read at runtime; setting the env var before either side launches gives the same value. |
+| **Internal-properties filter** (the set of bookkeeping properties that must NOT count toward the over-cap `sum`, e.g. `last_processed_other_tick`) | `src/world_data/entity_history.rs` (hardcoded set) | `code/normalize_stats.py` (mirrored set) | **HTTP endpoint** `GET /api/internal-properties` (returns the current set as JSON). Both sides should fetch this list at startup; the Rust side currently has it inline, the Python side fetches via the API. The endpoint is the canonical list — when adding a new internal property, add it to BOTH the Rust hardcoded set AND the API handler. |
+| **`stats_sum` formula** (signed sum of `properties_int` minus internal-properties filter) | `fn stats_sum` in `src/main.rs` | `def stats_sum` in `code/normalize_stats.py` | **Shared test parity.** The Rust unit tests in `src/main.rs` assert `stats_sum` returns the right value (e.g. `assert_eq!(stats_sum(&e), 85)`); the Python tests in `code/test_normalize_stats.py` assert the same scenarios. When changing the formula, change BOTH and run BOTH test suites. |
+
+### Why this matters
+
+A bug was caught on 2026-06-08: the `last_processed_other_tick` property is a marker counter (currently 1072-3923) and was being included in the cap sum. Because the marker's range is 1000-4000, EVERY entity was reporting `sum > cap` and the over-cap warning was firing on every action — pure noise that obscured the real signal (e.g. a power-91 entity that genuinely had 606 stat-sum over its 1010 cap, the only legit case). The fix was to add the marker to the internal-properties filter on BOTH sides (Rust + Python) and re-run the cap status, which dropped from 14/14 over-cap to 0/14.
+
+If only ONE side had been updated, the operator would have seen the cap status disagree between the live world (Rust path) and the CLI report (Python path) — a silent discrepancy that's hard to debug later.
+
+### The rule for future code
+
+When adding any new feature that lives in both languages:
+
+1. **Identify the shared source of truth upfront.** If it's a formula, use env vars. If it's a list of constants, use an API endpoint. If it's a behaviour, use shared test scenarios.
+2. **Document it in this section** — add a row to the table above with the two call sites + the shared truth.
+3. **Write the test on BOTH sides** before claiming the feature is done. Running the test on only one side is a known footgun (a fix might work in Rust but not Python, or vice versa).
+4. **If the two sides MUST diverge** (e.g. one side is read-only and doesn't need the new code), document the divergence explicitly in this section so future readers know it's intentional, not drift.
+
+The same `stats_sum` and the same filter should always produce the same number, whether called from the Rust runtime or the Python CLI. If they don't, that's a bug — not a feature.
+
 ## 7. Multi-Entity Effects (dotted keys, dry-run for cross-entity)
 
 *(Added 2026-06-06 per Arcurus #openworld — let the LLM ripple
