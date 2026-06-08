@@ -3301,7 +3301,7 @@ fn check_stats_cap_warn(
     if sum > cap {
         let overage = sum - cap;
         warnings.push(format!(
-            "Stats cap exceeded for '{}': sum={} > cap={} (overage={}, cap formula = max(1, {}*5) + 100 = {}). Run `python3 code/normalize_stats.py normalize` to fix.",
+            "Stats cap exceeded for '{}': sum={} > cap={} (overage={}, cap formula = max(1, {}*5) + 100 = {}). Run `python3 ../selena-project/code/normalize_stats.py normalize` to fix.",
             entity.name, sum, cap, overage, power, cap
         ));
     }
@@ -8118,6 +8118,38 @@ mod stats_cap_tests {
         assert!(warnings[0].contains("sum=260"));
         assert!(warnings[0].contains("cap=150"));
         assert!(warnings[0].contains("overage=110"));
+    }
+
+    #[test]
+    fn warn_includes_correct_normalize_script_path() {
+        // Regression: the warning used to say
+        //   `python3 code/normalize_stats.py normalize`
+        // which is broken because the script lives in the sibling
+        // `selena-project/` project, not inside `open-world-selena/code/`.
+        // Operators hitting this warning in production would copy-paste
+        // the command and get `python3: can't open file ...` — a real
+        // paper-cut, since stats-cap warnings are a normal occurrence
+        // for high-power entities.
+        let e = mk_entity("character", "Pathy", &[
+            ("power", 10),
+            ("morale", 200),
+            ("wealth", 50),
+        ]);
+        let mut warnings: Vec<String> = Vec::new();
+        check_stats_cap_warn(&e, &mut warnings);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("selena-project/code/normalize_stats.py"),
+            "warning should point at the sibling project, got: {:?}",
+            warnings[0]
+        );
+        // The old (wrong) bare path must not appear, because that is
+        // the command operators were copy-pasting.
+        assert!(
+            !warnings[0].contains("Run `python3 code/normalize_stats.py"),
+            "warning still has the broken bare path: {:?}",
+            warnings[0]
+        );
     }
 
     #[test]
