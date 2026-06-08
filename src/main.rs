@@ -4346,12 +4346,47 @@ fn parse_llm_action_response(raw: &str) -> Result<(LlmActionResponse, Option<Str
                 }
             }
 
+            // **Fixup #3 — strip `+` sign from positive numbers in
+            // number-value positions** (per selena-open-world-worker
+            // 2026-06-08 #openworld): the LLM has been emitting
+            // effects like `"self.visibility": +2` instead of
+            // `"self.visibility": 2` (JSON does not allow a
+            // leading `+` on numbers — only `-` is permitted).
+            // Root cause was the YAML-style signed numbers in the
+            // example JSON block of `ai_templates/EntityAction.md`
+            // (since fixed); this fixup is the safety net for
+            // in-flight responses and the LLM's tendency to keep
+            // reproducing the shape even after the prompt is
+            // corrected. We apply on top of fixup #2 so a response
+            // that has *all three* bugs (empty-key + double-brace
+            // + signed-positive) is also recovered.
+            let candidate2 = if repaired2 != candidate { repaired2.as_str() } else { candidate };
+            let repaired3 = strip_plus_signs_from_numbers_outside_strings(candidate2);
+            if repaired3 != candidate2 {
+                if let Ok(parsed) = serde_json::from_str::<LlmActionResponse>(&repaired3) {
+                    return Ok((parsed, Some(format!(
+                        "parse_llm_action_response: LLM response matched a known \
+                         malformed pattern and was repaired (stripped leading `+` \
+                         from positive numbers in number-value positions — LLM has \
+                         been emitting e.g. `\"self.visibility\": +2`; root cause \
+                         was the YAML-style signed numbers in the example block of \
+                         ai_templates/EntityAction.md, see 2026-06-08 #openworld)."
+                    ))));
+                }
+            }
+
             // No fixup produced a parseable string. Surface the
             // most useful error.
-            if repaired2 != candidate {
-                // The candidate post-fixup-#2 still doesn't parse.
-                // Show the post-fixup-#2 parse error if we can get
-                // one, otherwise fall back to the original error.
+            if repaired3 != candidate2 {
+                // The candidate post-fixup-#3 still doesn't parse.
+                let e3 = serde_json::from_str::<LlmActionResponse>(&repaired3)
+                    .err()
+                    .unwrap_or(e);
+                Err(format!(
+                    "JSON parse error: {} - Input (after repair attempt): {}",
+                    e3, repaired3
+                ))
+            } else if repaired2 != candidate {
                 let e2 = serde_json::from_str::<LlmActionResponse>(&repaired2)
                     .err()
                     .unwrap_or(e);
@@ -4465,6 +4500,81 @@ fn strip_double_braces_outside_strings(s: &str) -> String {
             out.push('}');
             chars.next(); // consume the second `}`
             continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Strip a leading `+` sign from numbers in number-value positions
+/// (outside of JSON strings).
+///
+/// **Background.** M2.7-highspeed (and similar models) have been
+/// emitting effects like `"self.visibility": +2` instead of
+/// `"self.visibility": 2`. JSON does not allow a leading `+` on
+/// numbers — only `-` is permitted (RFC 8259 §6) — so this fails
+/// the strict `serde_json` parse. We've been seeing this in
+/// production logs since 2026-06-08 across multiple entity types
+/// (e.g. "plant_double_agent_in_crossroads_market" at 11:53:30,
+/// "perform_dawnward_covenant_invocation" at 11:56:08,
+/// "offer_sanctuary_training_to_knight" at 11:58:43, etc.). The
+/// root cause was the example JSON block in
+/// `ai_templates/EntityAction.md` which used YAML-style signed
+/// numbers (`"self.power": +3`) — the LLM copied that literally.
+/// The prompt was fixed on 2026-06-08 (selena-open-world-worker)
+/// to use proper JSON (`"self.power": 3`), but old responses and
+/// in-flight prompts still produce the bug, so this fixup is the
+/// safety net.
+///
+/// **The fix.** Conservative string-aware collapse:
+/// - We track JSON string boundaries (with backslash-escape
+///   awareness), so a literal `+` that appears *inside* a string
+///   value is left alone.
+/// - Outside of strings, when we see a `+` immediately followed
+///   by a digit (or `.` then a digit, for floats), we drop the
+///   `+` (the number stays positive). In valid JSON, a number
+///   value cannot start with `+`, so any `+<digit>` outside a
+///   string is always the LLM bug.
+fn strip_plus_signs_from_numbers_outside_strings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escape = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+        // Drop a `+` that introduces a number value
+        // (outside a string). The next char must be a digit
+        // (so `+` followed by whitespace, quote, comma, etc.
+        // is left untouched — those are not the bug we
+        // observed, and dropping them might mask a real
+        // parse error in legitimate-but-weird JSON).
+        if c == '+' {
+            let next = chars.peek().copied();
+            let next_is_digit = matches!(next, Some(d) if d.is_ascii_digit());
+            // Also support `+.<digit>` for floats like
+            // `+1.5` (rare, but a possible LLM slip).
+            let next_is_dot_then_digit = next == Some('.')
+                && chars.clone().nth(1).map_or(false, |d| d.is_ascii_digit());
+            if next_is_digit || next_is_dot_then_digit {
+                // Drop the `+`; the next iteration will
+                // emit the digit (and any `.`) normally.
+                continue;
+            }
         }
         out.push(c);
     }
@@ -9042,6 +9152,130 @@ mod fix_known_malformed_patterns_tests {
         let unrelated = r#"{"":"unexpected_value","x":"y"}"#;
         let repaired = fix_known_malformed_patterns(unrelated);
         assert_eq!(repaired, unrelated);
+    }
+}
+
+#[cfg(test)]
+mod strip_plus_signs_from_numbers_outside_strings_tests {
+    //! Tests for the third fixup pass in `parse_llm_action_response`:
+    //! the LLM has been emitting signed-positive numbers
+    //! (e.g. `"self.visibility": +2`) which is invalid JSON.
+    //! The fixup is string-aware so a `+` that appears *inside* a
+    //! string value is left alone.
+    use super::strip_plus_signs_from_numbers_outside_strings;
+
+    #[test]
+    fn repairs_plus_in_effect_int_value() {
+        // The exact pattern from the 2026-06-08 11:53:30 error
+        // log: M2.7-highspeed emitted
+        //   {"self.visibility": +2, "self.morale": +2, ...}
+        // which fails the strict serde parse. The fixup should
+        // produce parseable JSON with positive numeric values.
+        let broken = r#"{"self.visibility": +2, "self.morale": +2, "self.wealth": -1}"#;
+        let repaired = strip_plus_signs_from_numbers_outside_strings(broken);
+        let parsed: serde_json::Value = serde_json::from_str(&repaired)
+            .expect("repaired string must parse");
+        assert_eq!(parsed["self.visibility"], serde_json::json!(2));
+        assert_eq!(parsed["self.morale"], serde_json::json!(2));
+        assert_eq!(parsed["self.wealth"], serde_json::json!(-1));
+    }
+
+    #[test]
+    fn repairs_plus_in_float_value() {
+        // Float variant: `+1.5` should become `1.5`.
+        let broken = r#"{"self.magic_activity": +1.5}"#;
+        let repaired = strip_plus_signs_from_numbers_outside_strings(broken);
+        let parsed: serde_json::Value = serde_json::from_str(&repaired)
+            .expect("repaired string must parse");
+        assert_eq!(parsed["self.magic_activity"], serde_json::json!(1.5));
+    }
+
+    #[test]
+    fn leaves_negative_numbers_unchanged() {
+        // `-5` is valid JSON and must pass through untouched so
+        // the equality check `repaired != json_str` in the caller
+        // works correctly (and we don't waste a parse attempt).
+        let ok = r#"{"self.power": -12, "self.morale": -3}"#;
+        let repaired = strip_plus_signs_from_numbers_outside_strings(ok);
+        assert_eq!(repaired, ok);
+    }
+
+    #[test]
+    fn leaves_unprefixed_positive_numbers_unchanged() {
+        // Sanity: a well-formed `2` (no `+` prefix) must pass
+        // through untouched. The function only operates on `+`.
+        let ok = r#"{"self.visibility": 2, "self.morale": 1}"#;
+        let repaired = strip_plus_signs_from_numbers_outside_strings(ok);
+        assert_eq!(repaired, ok);
+    }
+
+    #[test]
+    fn does_not_touch_plus_inside_string_values() {
+        // A literal `+2` that appears *inside* a string value
+        // (e.g. inside `narrative`) must NOT be modified, even
+        // though the string contains a quote+colon pattern that
+        // *could* be mistaken for a key. The string-aware walker
+        // tracks JSON string boundaries with backslash-escape
+        // awareness.
+        let narrative_with_plus = r#"{"narrative":"the witchfen said: \": +2 to my stats\"","self.morale": +1}"#;
+        let repaired = strip_plus_signs_from_numbers_outside_strings(narrative_with_plus);
+        // The `+2` inside the narrative string is preserved
+        // (it's part of the spoken text), but the `+1` outside
+        // is repaired to `1`.
+        let parsed: serde_json::Value = serde_json::from_str(&repaired)
+            .expect("repaired string must parse");
+        // The narrative still contains the literal `+2` text
+        // (we don't lose information from the LLM's response).
+        assert!(parsed["narrative"]
+            .as_str()
+            .unwrap()
+            .contains("+2"));
+        // And the value is now a plain positive number.
+        assert_eq!(parsed["self.morale"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn repairs_plus_inside_full_llm_response_shape() {
+        // A realistic full LLM action response with effects using
+        // signed-positive numbers, a negative number, and a string
+        // value that contains a `+`. After repair, the whole
+        // object must parse.
+        let broken = r#"{
+  "action": "plant_double_agent_in_crossroads_market",
+  "outcome": "The Court dispatches an agent.",
+  "effects": {
+    "self.visibility": +2,
+    "self.morale": +2,
+    "self.wealth": -1,
+    "The Crimson Veil.visibility": +1
+  },
+  "narrative": "They shout: 'add +1 to your courage' as they depart."
+}"#;
+        let repaired = strip_plus_signs_from_numbers_outside_strings(broken);
+        let parsed: serde_json::Value = serde_json::from_str(&repaired)
+            .expect("repaired string must parse");
+        assert_eq!(parsed["action"], "plant_double_agent_in_crossroads_market");
+        assert_eq!(parsed["effects"]["self.visibility"], serde_json::json!(2));
+        assert_eq!(parsed["effects"]["self.morale"], serde_json::json!(2));
+        assert_eq!(parsed["effects"]["self.wealth"], serde_json::json!(-1));
+        assert_eq!(parsed["effects"]["The Crimson Veil.visibility"], serde_json::json!(1));
+        // The `+1` inside the narrative is preserved verbatim.
+        assert!(parsed["narrative"]
+            .as_str()
+            .unwrap()
+            .contains("+1"));
+    }
+
+    #[test]
+    fn does_not_drop_lone_plus_not_followed_by_digit() {
+        // `+` followed by something other than a digit (whitespace,
+        // quote, comma, etc.) is not the bug we observed. Leave it
+        // alone so we don't mask a real parse error in unusual JSON
+        // shapes. The strict parse will then surface the error
+        // normally.
+        let weird = r#"{"x": + "y", "z": +}"#;
+        let repaired = strip_plus_signs_from_numbers_outside_strings(weird);
+        assert_eq!(repaired, weird);
     }
 }
 
