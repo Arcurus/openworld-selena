@@ -246,6 +246,52 @@ Exit codes: `0` = clean, `1` = findings (non-fatal), `2` = runtime error (couldn
 
 **Scheduling:** the check is **on-demand**, not cron-scheduled. Run it after a service restart, after seeding entities, or whenever you want a one-shot report. The script defaults to the open-world server at `http://127.0.0.1:8081`; override with `--api-url=URL` for a remote box.
 
+### 🧬 Merge Relations
+
+A read-AND-write companion to the sanity check is bundled at `code/merge_relations.py`. The sanity check *reports* duplicate relations; this tool *fixes* them, with human review.
+
+It scans every entity's `history_summary` for the same relation name appearing more than once, builds a merge plan, and (in `--apply` mode) POSTs one first-match find-replace per duplicate group to the existing `POST /api/entities/:id/history-summary/replace` endpoint. Default is **dry-run** — it prints the plan and exits with `1` if there are findings.
+
+**Safety rails** (per Arcurus 2026-06-07 #openworld):
+- `--apply` requires `--yes` (typed confirmation token) — there's no silent apply path.
+- The script snapshots `world_data/save.owbl` to `world_data/backups/save-pre-merge-{ts}.owbl` before the first apply. Timestamped, never overwritten. Use `--no-backup` to skip (not recommended).
+- It reuses the exact `→` relation-split regex from `ow_sanity_check.py` so the two scripts agree on what "duplicate" means.
+- All HTTP calls go through the cookie auth; if the server rejects auth, the script exits with `2` and a clear message.
+
+**Strategies** (the merge logic for choosing the survivor text):
+- `keep-first` (default for "least change") — take the first occurrence as-is, drop the rest.
+- `keep-last` (default in the script) — take the most recent LLM "understanding" of the relation. Loses older nuance.
+- `longest` — keep the variant with the most text. Preserves max info, but may include stale wording.
+- `combine` — concatenate all unique variants with ` | `. Most info-preserving, can grow the summary.
+
+Usage:
+
+```bash
+# dry-run (default): scan + print plan, no changes
+python3 code/merge_relations.py
+
+# machine-readable JSON plan
+python3 code/merge_relations.py --json
+
+# apply with keep-last (the recommended default for "most recent wins")
+python3 code/merge_relations.py --apply --yes
+
+# apply with a different strategy
+python3 code/merge_relations.py --strategy=longest --apply --yes
+python3 code/merge_relations.py --strategy=combine --apply --yes
+
+# only act on one entity
+python3 code/merge_relations.py --entity=<id> --apply --yes
+
+# post the report to #openworld-log (1511696310984773633)
+python3 code/merge_relations.py --post                  # plan-only post
+python3 code/merge_relations.py --post --apply --yes    # apply + post the result
+```
+
+Exit codes: `0` = clean / all applied, `1` = findings (dry-run refused to apply), `2` = runtime error, `3` = partial apply (some merges failed).
+
+**Tests:** `code/_test_merge_relations.py` covers the offline parts (`split_relations`, `normalize_rel_name`, `choose_winner`, `find_duplicates`, `build_replacement_plan`, `render_plan_report`) with synthesized entity data, plus a best-effort live-server integration check. Run: `python3 code/_test_merge_relations.py`.
+
 ---
 
 ## 🌐 API Endpoints
