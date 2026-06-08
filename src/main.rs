@@ -1,4 +1,5 @@
 mod world_data;
+mod scheduler;
 use crate::world_data::default_true;
 
 // ---------------------------------------------------------------------------
@@ -6834,6 +6835,16 @@ async fn main() {
         ))),
     };
 
+    // Spawn the in-process world scheduler (added 2026-06-08 per
+    // Arcurus #openworld: 'the selena project should be
+    // independent of the open world project').  Replaces the
+    // Python scheduler that ran as a background thread in
+    // selena-project.  The scheduler is self-driving and uses
+    // HTTP calls to its own endpoints (matching the old Python
+    // design).  See src/scheduler.rs for the full design.
+    scheduler::start();
+    println!("🕒  In-process scheduler spawned (src/scheduler.rs)");
+
     println!(
         "🌍   LLM rate limit: enabled={}, max_calls_per_hour={}",
         settings.llm.calls_per_hour_enabled, settings.llm.max_calls_per_hour
@@ -10217,4 +10228,12 @@ mod parse_llm_action_response_repair_warning_tests {
         let result = parse_llm_action_response(garbage);
         assert!(result.is_err(), "unparseable input must error");
     }
+}
+
+#[cfg(test)]
+mod test_load_only {
+    use super::*;
+    use std::process::Command;
+    // We can't easily test the load function in isolation from within the binary,
+    // but we can use the existing test infrastructure.
 }

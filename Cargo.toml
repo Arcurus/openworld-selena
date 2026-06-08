@@ -36,6 +36,10 @@ tracing-subscriber = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 urlencoding = "2"
 
+# Used by the in-process scheduler (src/scheduler.rs) for the
+# weighted-sample-without-replacement entity selection.
+rand = "0.8"
+
 # For vector search later (commented out for now)
 # meilisearch-sdk = "0.27"
 # pinecone = "0.5"

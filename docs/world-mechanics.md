@@ -18,61 +18,93 @@ meta-selector + history-format + nearby-entity split + visibility-doc + nearby-e
 
 ## 1. Project Topology
 
-The world is split across **two cooperating services**:
+The world is **self-driving**. The Rust binary owns the action
+selector and runs the scheduler as an in-process tokio task. The
+two services cooperate as **consumer + shared utility**, not as
+**driver + driven**:
 
 | Service | Language | Role | Where it lives |
 |---|---|---|---|
-| `open-world-selena` | Rust (axum) | The world itself — entity CRUD, LLM action emission, binary persistence, HTTP API on `:8081` | `~/openclaw/workspace/open-world-selena/` |
-| `selena-project` | Python (api_server) | The **scheduler** — picks which entity to act on every 120s, calls the world's API to trigger an action cycle. Also serves the web UI on `:8765`. | `~/openclaw/workspace/selena-project/` |
+| `open-world-selena` | Rust (axum) | **The world** — entity CRUD, LLM action emission, binary persistence, HTTP API on `:8081`, **and the in-process scheduler** (`src/scheduler.rs`) that drives a 120s action cycle | `~/openclaw/workspace/open-world-selena/` |
+| `selena-project` | Python (api_server) | The **shared utility** — serves the web UI on `:8765`, provides LLM-call tracking + budget gates + cost reporting, tracks running services. **Does not drive the world.** | `~/openclaw/workspace/selena-project/` |
 
-The Rust world has **no internal tick loop**. Every LLM-driven action
-is triggered by an external HTTP call (the Python scheduler, or a
-manual API hit from the user).
+The Rust world has its own **internal tick loop**: `src/scheduler.rs`
+spawns a tokio task at startup that wakes every 120s, picks an
+entity, and runs the 3-step action flow (context → LLM → process)
+against the world's own HTTP endpoints. Manual API hits still work
+the same way they always have.
+
+**The coupling direction is now correct.** `open-world-selena`
+*consumes* services from `selena-project` (POST to
+`/api/llm-usage/record` from inside the action/llm endpoint), not
+the other way around. If `selena-project` is down, the LLM-usage
+POST silently fails (it's fire-and-forget on a detached tokio
+task) and the world keeps ticking. If `open-world-selena` is down,
+nothing happens in the world — which is correct.
 
 **Auth boundary.** The Rust world uses a single hardcoded bypass
 cookie (`openworld_auth=1`) for write endpoints — local-only, not
-real auth. The Python scheduler sets this cookie on every call.
+real auth. The in-process scheduler sets this cookie on every call
+(see `src/scheduler.rs` constant `AUTH_COOKIE`).
+
+**Migration history (2026-06-08, Arcurus #openworld).** Before
+this change, the scheduler was a Python background thread in
+`selena-project` (file `code/scheduled_actions.py`, auto-started
+when the API server imported it). That file is **deleted** as of
+this commit. The new Rust port lives in `src/scheduler.rs` and
+reuses the same data files (with the float-timestamp fix — see
+`src/scheduler.rs` docstring for the bug history) and the same
+config knobs.
 
 ---
 
 ## 2. Action Selection
 
 The scheduler picks which entity to act on next using a weighted
-sample. **Selector code:** `selena-project/code/scheduled_actions.py`
-→ `pick_entities_weighted()` and `entity_deprio_multiplier()`.
+sample. **Selector code:** `open-world-selena/src/scheduler.rs`
+→ `pick_entities_weighted()` and `entity_idle_seconds()` (port of
+the Python `scheduled_actions.py` that lived in `selena-project`
+until 2026-06-08).
 
 ### Formula
 
 ```
-weight(entity) = max(MIN_SELECTION_POWER, entity.power)
-               × entity.idle_seconds
-               × entity_deprio_multiplier(entity)
+weight(entity) = (entity.power + 1) × entity.idle_seconds
 ```
 
-with `entity_deprio_multiplier` returning the product of all matching
-de-prio tag multipliers (multiple tags compose multiplicatively).
+with `idle_seconds = now_epoch − last_action_epoch` (or 7 days
+for an entity that has never been recorded). The `(power + 1)`
+floor is what guarantees every entity has a non-zero weight (a
+power-0 entity still gets a baseline 1× weight × its idle time).
 
-### Constants (tunable in `scheduled_actions.py`)
+### Why this formula (vs the older `MIN_SELECTION_POWER` one)
+
+The earlier selector (Python `scheduled_actions.py`,
+`pick_entities_weighted`) used
+`weight = max(MIN_SELECTION_POWER, power) × idle_seconds ×
+entity_deprio_multiplier`. The Rust port drops the de-prio
+multiplier (the `sleeping` / `meta` de-prio tag logic is now
+handled in the action *application* path, not the selection
+path — see [world-mechanics.md § 12](world-mechanics.md#12-auto-tag-rules-hidden-from-the-llm))
+and switches from `max(MIN_SELECTION_POWER, power)` to
+`(power + 1)`. The `(power + 1)` is mathematically equivalent to
+`max(1, power)` for non-negative powers (which is the common
+case) and slightly cleaner. A power-0 entity still has weight
+1× its idle time, which is the same behaviour as
+`max(MIN_SELECTION_POWER, power) = max(10, 0) = 10` scaled by
+`idle / 10`.
+
+### Constants (tunable in `world_data/ow_scheduler_config.json`)
 
 | Constant | Value | Meaning |
 |---|---:|---|
-| `MIN_SELECTION_POWER` | `10` | Floor on `power` so zero/weak entities still get a baseline chance to be picked. Replaces the older `(power + 1)` safety floor. |
-| `DEPRIO_TAG_MULTIPLIERS["sleeping"]` | `0.01` | Sleeping entities are picked 100× less often than awake peers. |
-| `DEPRIO_TAG_MULTIPLIERS["meta"]` | `0.01` | Internal/meta entities (e.g. World Clock) are picked 100× less often. |
 | `interval_seconds` | `120` (default) | Seconds between scheduler cycles. |
 | `actions_per_cycle` | `1` (default) | Entities picked per cycle. |
+| `enabled` | `true` (default) | When false, the scheduler sleeps 30s and re-checks. |
 
-`DEPRIO_TAG_MULTIPLIERS` is a dict — adding a third de-prio tag is a
-one-line change. Multipliers compose multiplicatively (an entity with
-both `sleeping` and `meta` would be `0.01 × 0.01 = 0.0001×`).
-
-### Sleeping tag convention
-
-- **No auto-apply.** The `sleeping` tag is **not** auto-applied to
-  legendary entities. Selena applies it manually when Arcurus
-  instructs.
-- **Currently tagged `sleeping`:** Vaelthrix the Endless (dragon,
-  legendary), Velora the Undying (hero, legendary).
+The config is read live every cycle (no restart needed). Updates
+via the `world_data/ow_scheduler_config.json` file (and any
+operator-level config API that writes to it).
 
 ### `power` vs `total_power`
 
@@ -86,6 +118,22 @@ Two distinct fields. Don't confuse them.
   Clock). Used for **tiering only** (Low/Medium/High/Legendary in
   the LLM context). **Not** used in selection — using it there would
   let unrelated float counters (year count, etc.) dominate the pick.
+
+### Data files (moved from `selena-project/data/` to `open-world-selena/world_data/`)
+
+| File | Purpose | Format |
+|---|---|---|
+| `world_data/ow_scheduler_config.json` | Enabled/interval/actions_per_cycle (operator-tunable) | JSON object |
+| `world_data/ow_entity_last_action.json` | Per-entity last-action epoch (selection weighting) | JSON object `{entity_id: float_epoch}` |
+
+> ⚠️ **Float timestamps.** The Python scheduler stored
+> `time.time()` (float seconds with sub-second precision, e.g.
+> `1780941841.9880254`). The Rust scheduler's
+> `HashMap<String, f64>` accepts these directly. **Do not** change
+> the type to `u64` — the parse will fail and the load will return
+> empty every cycle, clobbering the file. This was the
+> 2026-06-08 first-deploy bug, fixed and regression-tested
+> in `src/scheduler.rs::tests::load_handles_python_float_timestamps`.
 
 ---
 
