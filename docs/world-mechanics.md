@@ -709,6 +709,12 @@ When adding any new feature that lives in both languages:
 
 The same `stats_sum` and the same filter should always produce the same number, whether called from the Rust runtime or the Python CLI. If they don't, that's a bug — not a feature.
 
+## 6c. Property Catalog (Operator Reference)
+
+> **Added 2026-06-08 per Arcurus #openworld:** the LLM-facing property dictionary ([`ai_templates/property_docs.md`](../ai_templates/property_docs.md)) tells the narrator what each property means; the **operator-facing property catalog** ([`docs/property-catalog.md`](property-catalog.md)) tells us what each property *does* — the formulas, the tag rules, the surface area, the cap mechanics. Two distinct audiences, two distinct files.
+
+The catalog has one section per property (summary + impact mechanics + LLM dictionary pointer + see-also), a table of the three auto-tag rules (hidden / corrupted / suspicious) + the stats-cap warning, and a separate section for the operator-only internal/bookkeeping properties. The full content lives in [`docs/property-catalog.md`](property-catalog.md) — when you add a new named property, add it to **both** files (the LLM-facing dictionary learns the schema; the catalog records the mechanics). The two-file split is a permanent rule, not a one-time split: don't merge them, don't put mechanics in the LLM dictionary (the LLM shouldn't reason about the formula), don't put the LLM-facing story-signal framing in the catalog (the operator doesn't need it).
+
 ## 7. Multi-Entity Effects (dotted keys, dry-run for cross-entity)
 
 *(Added 2026-06-06 per Arcurus #openworld — let the LLM ripple
