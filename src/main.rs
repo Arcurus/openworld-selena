@@ -2410,15 +2410,22 @@ async fn entity_action(
                     // normalization, type handling, system-entity
                     // guard). Per Arcurus 2026-06-07 #openworld.
                     let mut response_warnings: Vec<String> = Vec::new();
-                    let (mut applied_effects, _actor_nvs, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated) =
+                    let (applied_effects, actor_nvs, cross_entity_applied, hidden_tags_updated, corrupted_tags_updated) =
                         apply_all_effects(&mut world, id, &parsed_effects, &mut response_warnings, Some(&state.logger));
-                    // Auto-call response format uses NEW VALUES
-                    // (not deltas — the pre-refactor auto-call used
-                    // deltas but the cleaner form is the same as
-                    // the process path). The process path is the
-                    // source of truth for post-action state; this
-                    // is just a best-effort preview.
-                    applied_effects = applied_effects;
+                    // Auto-call response mirrors the process path's
+                    // response shape: deltas in `effects_applied`,
+                    // post-state absolute values in `new_values`,
+                    // cross-entity map separately. The web UI
+                    // (`web-client/index.html` ~line 4303) reads
+                    // both fields and shows the delta with a
+                    // "(now: <new_value>)" suffix when `new_values`
+                    // is present. Previously the auto-call path
+                    // emitted a no-op `applied_effects = applied_effects;`
+                    // and omitted `new_values`, so the UI never got
+                    // the "now:" suffix from auto-call responses. The
+                    // process path is still the source of truth for
+                    // post-action state; this is just a best-effort
+                    // preview aligned with that shape.
 
                     if !unknown_entity_names.is_empty() {
                         let mut w = format!(
@@ -2443,6 +2450,7 @@ async fn entity_action(
                         "action": action_data.action,
                         "outcome": action_data.outcome,
                         "effects_applied": applied_effects,
+                        "new_values": actor_nvs,
                         "cross_entity_effects_applied": cross_entity_applied,
                         "hidden_tags_updated": hidden_tags_updated,
                         "narrative": action_data.narrative,
