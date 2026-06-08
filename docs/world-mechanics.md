@@ -56,6 +56,39 @@ reuses the same data files (with the float-timestamp fix — see
 `src/scheduler.rs` docstring for the bug history) and the same
 config knobs.
 
+**Detailed migration log** (what changed, what moved where):
+
+| What | Before (2026-06-08 and earlier) | After (2026-06-08 refactor) | Reason |
+|---|---|---|---|
+| Scheduler code | `selena-project/code/scheduled_actions.py` (Python, 568 lines, auto-started as a background thread when `api_server.py` imported it) | `open-world-selena/src/scheduler.rs` (Rust, ~21KB, spawned as a `tokio::spawn` task in `main()`) | selena-project should be independent of open-world; the world is now self-driving |
+| Scheduler config | `selena-project/data/ow_scheduler_config.json` | `open-world-selena/world_data/ow_scheduler_config.json` | Lives where the scheduler lives now |
+| Per-entity last-action map | `selena-project/data/ow_entity_last_action.json` | `open-world-selena/world_data/ow_entity_last_action.json` | Same — moved with the scheduler |
+| Selector formula | `weight = max(MIN_SELECTION_POWER, power) × idle_seconds × entity_deprio_multiplier` (with `entity_deprio_multiplier` applying 0.01× for `sleeping` and `meta` tags) | `weight = (power + 1) × idle_seconds` (clean) | The de-prio logic moved to the action-*application* path (the auto-tag rules in `src/main.rs`), not the selection path. The selector is now a clean weighted sample. |
+| `/api/ow/scheduler/config` endpoint | Read the Python scheduler's in-process state | Reads the config from the world's new data dir; returns a static "scheduler now lives in the world binary" status note | The Python scheduler has no in-process state to query from selena-project anymore |
+| LLM-usage tracking | Same as before (POST to `/api/llm-usage/record` from inside the action/llm endpoint) | Same — unchanged | The world still records every LLM call to selena-project's call tracker |
+| selena-project's role | Driver of open-world + utility | Utility only | Per Arcurus 2026-06-08 #openworld: "the selena project should be independent of the open world project. it should just treat open world like any other service" |
+
+**Float-timestamp fix (the bug that almost slipped through).** The
+Python scheduler stored `time.time()` values as floats with
+sub-second precision (e.g. `1780941841.9880254`). The Rust
+port's first version declared the type as `HashMap<String, u64>`,
+which caused `serde_json` to fail the parse, the load to return
+empty, and every cycle to wipe the file down to 1-3 entries. The
+visible symptom: every cycle picked the same entity (World Clock)
+because all 49 other entities had 7-day default idle (load
+returned empty). Fix: change the type to `HashMap<String, f64>`.
+Regression test: `scheduler::tests::load_handles_python_float_timestamps`
+in `src/scheduler.rs`. **Do not change the type back to `u64`** —
+the parse will fail and the load will return empty every cycle.
+
+**Why this matters in the long run.** The world no longer depends
+on selena-project for its heartbeat. Restarting selena-api doesn't
+kill the world's action loop — it just means the LLM-usage
+tracking is degraded until selena-api is back. Restarting
+open-world-selena *does* kill the heartbeat (by design — the
+scheduler is part of that binary now), but the restart is a
+30-second affair with the world save backed up first.
+
 ---
 
 ## 2. Action Selection
