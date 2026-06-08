@@ -100,7 +100,12 @@ keeping in mind:
   work. Their `suspicion` should usually move **down**
   (or stay low) even as their `corruption` rises.
   They're working to prevent the world from seeing
-  what they are.
+  what they are — *except when they're exposed by
+  others* (a whistleblowing insider, a rival faction
+  leaking evidence, a journalist's investigation).
+  Exposure breaks the cover: `suspicion` can spike
+  hard in a single action when the hidden truth
+  comes out.
 - **Powerful beings who don't care what others think**
   (a tyrant, a self-righteous god, a demon in open
   defiance) act openly suspicious and their
