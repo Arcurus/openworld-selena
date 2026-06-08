@@ -862,9 +862,9 @@ without putting a real auth layer in front. Currently bound to
 | `max_history_summary_chars` (per-world) | `WorldSettings.max_history_summary_chars` | `0` (use global) | Per-entity override of the cap. |
 | `EFFECT_NORMALIZATION_CAP_PCT` | `main.rs` | `0.10` | Per-turn cap on total `|Δ|` of effects, as a fraction of `power`. Lower → tighter LLM constraints; higher → more room for big swings per turn. |
 | `EFFECT_NORMALIZATION_MIN_CAP` | `main.rs` | `1.0` | Hard floor on the per-turn effect cap (so power-0 entities still have a tiny budget). |
-| `STATS_CAP_POWER_MULTIPLIER` | `main.rs` | `5` | Per-entity stats-cap budget scales with this × power. |
-| `STATS_CAP_BASE` | `main.rs` | `100` | Per-entity stats-cap budget gets this baseline on top of the power-scaled part. |
-| `STATS_CAP_POWER_FLOOR` | `main.rs` | `1` | Floor on the power-multiplier (so power-0 entities still get a small budget). |
+| `STATS_CAP_POWER_MULTIPLIER` | `main.rs` (env: `OPENWORLD_STATS_CAP_MULTIPLIER`) | `10` (was `5` pre-2026-06-08) | Per-entity stats-cap budget scales with this × power. Default raised 5→10 per Arcurus 2026-06-08 #openworld "give more room." |
+| `STATS_CAP_BASE` | `main.rs` (env: `OPENWORLD_STATS_CAP_BASE`) | `100` | Per-entity stats-cap budget gets this baseline on top of the power-scaled part. |
+| `STATS_CAP_POWER_FLOOR` | `main.rs` (env: `OPENWORLD_STATS_CAP_FLOOR`) | `1` | Floor on the power-multiplier (so power-0 entities still get a small budget). |
 | Hidden-tag threshold | `main.rs → update_hidden_tag` | `max(10, power)/10 + visibility` | Deep hider (threshold < 0) gets the `hidden` tag; ≥ 1 removes it. |
 | Corrupted-tag threshold | `main.rs → update_corrupted_tag` | `max(1, power) - corruption` | Threshold < 0 adds `corrupted`; ≥ 1 removes it. |
 | Hidden/corrupted dead zone | `main.rs → update_hidden_tag`, `update_corrupted_tag` | `[0, 1)` | Tag state doesn't change in this band, so the tag doesn't flicker at the boundary. |
@@ -994,15 +994,36 @@ at the same time).
 For every entity affected by an action, recompute:
 
   cap = `max(STATS_CAP_POWER_FLOOR, power * STATS_CAP_POWER_MULTIPLIER) + STATS_CAP_BASE`
-  sum = signed sum of all `properties_int` values
+  sum = signed sum of all `properties_int` values, EXCLUDING
+         any property in § 5c's internal-properties list
+         (currently just `last_processed_other_tick`).  The
+         marker is a bookkeeping counter, not part of the
+         entity's "stuff", and counting it would inflate
+         every entity's over-cap warning by ~3000-4000
+         (the marker's current range).
   sum > cap  → emit a warning, do NOT normalize
 
 The runtime path only **warns** (it does not normalize), so a
 single big effect doesn't silently shrink an entity mid-action.
-The standalone `selena-project/code/normalize_stats.py` script
-does the actual proportional scaling when the operator wants to
-fix the over-cap entities (run `preview` first to see the planned
-deltas, then `normalize --yes` to apply).
+The standalone `open-world-selena/code/normalize_stats.py` script
+(moved here from `selena-project/code/normalize_stats.py` per
+Arcurus 2026-06-08 #openworld "`code` that changes stats in
+open world should clearly be in open world project") does the
+actual proportional scaling when the operator wants to fix the
+over-cap entities.  Run `preview` first to see the planned
+deltas, then `normalize --yes` to apply.  The script also has
+a `selftest` subcommand that doesn't talk to the API and
+verifies the env-var override works.
+
+The cap formula and the internal-properties filter are the
+**same on both sides**: the Rust binary and the Python
+script both read the env vars
+`OPENWORLD_STATS_CAP_MULTIPLIER` /
+`OPENWORLD_STATS_CAP_BASE` / `OPENWORLD_STATS_CAP_FLOOR` and
+both fetch the internal-properties list from the
+`/api/internal-properties` endpoint.  An `export
+OPENWORLD_STATS_CAP_MULTIPLIER=15` in the shell covers both
+sides.
 
 The cap is keyed on the **original** (pre-normalize) power of
 the entity, and `normalize_entity_stats` scales `power` along
