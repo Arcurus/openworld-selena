@@ -293,8 +293,42 @@ async fn scheduler_loop() {
             sleep(Duration::from_secs(30)).await;
             continue;
         }
+        // Per Arcurus 2026-06-10 #cost-tracker: scale the cycle
+        // interval based on the live MiniMax budget so the world
+        // backs off when we're near the 5h cap. The gate is
+        // computed from `data/budget_gate.json` (refreshed every
+        // 5 min by the selena-project budget-gate.timer via
+        // `mmx quota`). We don't block on the file: if the read
+        // fails, fall back to the operator-configured interval
+        // (so a selena-project outage doesn't take the world down).
+        //
+        // Thresholds (from Arcurus 2026-06-10 #cost-tracker):
+        //   - used_pct < 50% : normal cadence (cfg.interval_seconds)
+        //   - 50% ≤ used_pct < 90% : 5x longer interval (1/5 calls/h)
+        //   - used_pct ≥ 90% : skip this cycle entirely
+        let gate = read_budget_gate();
+        let (effective_interval, gate_state) =
+            apply_budget_throttle(cfg.interval_seconds, gate.used_pct);
+        if last_signature.as_ref().map(|s| s.0) != Some(cfg.enabled)
+            || (last_signature.as_ref().map(|s| s.1) != Some(effective_interval))
+        {
+            eprintln!(
+                "[scheduler] cadence: configured={}s effective={}s used_pct={:.0}% gate={}",
+                cfg.interval_seconds, effective_interval, gate.used_pct, gate_state
+            );
+        }
+        if matches!(gate_state, GateState::Closed) {
+            eprintln!(
+                "[scheduler] === cycle SKIPPED (budget gate closed, used={:.0}%) ===",
+                gate.used_pct
+            );
+            // Wake up on a faster cadence (60s) so we resume as soon
+            // as the budget drops below the 90% threshold.
+            sleep(Duration::from_secs(60)).await;
+            continue;
+        }
         execute_cycle(&url, &client, cfg.actions_per_cycle).await;
-        sleep(Duration::from_secs(cfg.interval_seconds)).await;
+        sleep(Duration::from_secs(effective_interval)).await;
     }
 }
 
@@ -436,6 +470,114 @@ async fn execute_cycle(url: &str, client: &reqwest::Client, actions_per_cycle: u
 /// for in-process clients; a future refactor could move to a
 /// proper token, but this matches the existing model.
 const AUTH_COOKIE: &str = "openworld_auth=1";
+
+// --- Budget gate (added 2026-06-10 per Arcurus #cost-tracker) -----------
+//
+// The world is the single biggest MiniMax consumer (see MEMORY.md,
+// AGI cost note: open-world-selena). To avoid blowing the 5h budget
+// during heavy turns, the scheduler reads the live budget gate
+// (selena-project's `data/budget_gate.json`, refreshed every 5 min
+// via `mmx quota`) and applies a 3-tier throttle:
+//
+//   used_pct < 50%            -> normal cadence (configured interval)
+//   50% <= used_pct < 90%     -> 5x longer interval (1/5 calls/h)
+//   used_pct >= 90%           -> cycle skipped entirely; the
+//                                scheduler wakes every 60s to
+//                                check whether the gate has reopened
+//
+// The path is overridable via the OPEN_WORLD_BUDGET_GATE env var
+// (useful for tests). If the file is missing or malformed, we
+// fall back to the operator-configured interval — a selena-project
+// outage should NOT take the world down. The world is a consumer
+// of services, not the other way around (per 2026-06-08 #openworld
+// decoupling).
+const DEFAULT_BUDGET_GATE_PATH: &str =
+    "/home/openclaw/openclaw/workspace/selena-project/data/budget_gate.json";
+const BUDGET_THROTTLE_THRESHOLD_PCT: f64 = 50.0;
+const BUDGET_HALT_THRESHOLD_PCT: f64 = 90.0;
+const BUDGET_THROTTLE_MULTIPLIER: u64 = 5;
+const BUDGET_GATE_POLL_SECONDS: u64 = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    /// < 50% used, or file missing/malformed (fail-open by design).
+    Open,
+    /// 50%..90% used; 5x longer interval.
+    Throttled,
+    /// >= 90% used; skip cycles until the gate reopens.
+    Closed,
+}
+
+impl std::fmt::Display for GateState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GateState::Open => f.write_str("open"),
+            GateState::Throttled => f.write_str("throttled"),
+            GateState::Closed => f.write_str("closed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BudgetSnapshot {
+    used_pct: f64,
+    state: String,
+}
+
+impl Default for BudgetSnapshot {
+    fn default() -> Self {
+        Self {
+            used_pct: 0.0,
+            state: "unknown".to_string(),
+        }
+    }
+}
+
+fn read_budget_gate() -> BudgetSnapshot {
+    let path = std::env::var("OPEN_WORLD_BUDGET_GATE")
+        .unwrap_or_else(|_| DEFAULT_BUDGET_GATE_PATH.to_string());
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return BudgetSnapshot::default(),
+    };
+    let v: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return BudgetSnapshot::default(),
+    };
+    let used_pct = v
+        .get("used_pct")
+        .and_then(|x| x.as_f64())
+        .or_else(|| {
+            v.get("used_pct")
+                .and_then(|x| x.as_i64())
+                .map(|n| n as f64)
+        })
+        .unwrap_or(0.0);
+    let state = v
+        .get("state")
+        .and_then(|x| x.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    BudgetSnapshot { used_pct, state }
+}
+
+fn apply_budget_throttle(
+    configured_interval_s: u64,
+    used_pct: f64,
+) -> (u64, GateState) {
+    if used_pct >= BUDGET_HALT_THRESHOLD_PCT {
+        // Caller uses this to skip the cycle entirely; the actual
+        // sleep is `BUDGET_GATE_POLL_SECONDS` (60s).
+        (BUDGET_GATE_POLL_SECONDS, GateState::Closed)
+    } else if used_pct >= BUDGET_THROTTLE_THRESHOLD_PCT {
+        let throttled = configured_interval_s
+            .saturating_mul(BUDGET_THROTTLE_MULTIPLIER)
+            .max(1);
+        (throttled, GateState::Throttled)
+    } else {
+        (configured_interval_s, GateState::Open)
+    }
+}
 
 async fn fetch_entities(url: &str, client: &reqwest::Client) -> Result<Vec<Value>, String> {
     let resp = client
@@ -652,4 +794,67 @@ mod tests {
         assert_eq!(entity_power(&e), 0);
     }
 
+    // --- Budget-gate throttle (added 2026-06-10 per Arcurus #cost-tracker) -
+
+    #[test]
+    fn throttle_below_50_pct_is_open() {
+        let (interval, state) = apply_budget_throttle(120, 30.0);
+        assert_eq!(state, GateState::Open);
+        assert_eq!(interval, 120);
+    }
+
+    #[test]
+    fn throttle_50_to_90_pct_is_5x() {
+        let (interval, state) = apply_budget_throttle(120, 50.0);
+        assert_eq!(state, GateState::Throttled);
+        assert_eq!(interval, 600);
+        let (i2, _) = apply_budget_throttle(120, 89.9);
+        assert_eq!(i2, 600);
+    }
+
+    #[test]
+    fn throttle_90_pct_or_above_closes() {
+        let (interval, state) = apply_budget_throttle(120, 90.0);
+        assert_eq!(state, GateState::Closed);
+        assert_eq!(interval, 60); // poll interval, not interval_seconds
+        let (i2, s2) = apply_budget_throttle(120, 100.0);
+        assert_eq!(s2, GateState::Closed);
+        assert_eq!(i2, 60);
+    }
+
+    #[test]
+    fn read_budget_gate_missing_file_is_default() {
+        // No env override + the default path may or may not exist
+        // on a test box; either way we get a valid snapshot back
+        // (no panic, no Err) and used_pct is 0.0 (fail-open).
+        let snap = read_budget_gate();
+        // When the file is missing we get defaults; when it
+        // exists we get whatever's in it. We can't assert on a
+        // specific number, just that the call doesn't panic and
+        // the snapshot is well-formed.
+        assert!(snap.used_pct >= 0.0);
+    }
+
+    #[test]
+    fn read_budget_gate_respects_env_override() {
+        let tmp = std::env::temp_dir().join("ow_test_budget_gate.json");
+        std::fs::write(
+            &tmp,
+            r#"{"used_pct": 77.0, "state": "closed-80"}"#,
+        )
+        .unwrap();
+        // Save and restore the env var so the test is hermetic.
+        let prev = std::env::var("OPEN_WORLD_BUDGET_GATE").ok();
+        std::env::set_var("OPEN_WORLD_BUDGET_GATE", &tmp);
+        let snap = read_budget_gate();
+        // Restore.
+        if let Some(v) = prev {
+            std::env::set_var("OPEN_WORLD_BUDGET_GATE", v);
+        } else {
+            std::env::remove_var("OPEN_WORLD_BUDGET_GATE");
+        }
+        std::fs::remove_file(&tmp).ok();
+        assert!((snap.used_pct - 77.0).abs() < 0.01);
+        assert_eq!(snap.state, "closed-80");
+    }
 }
