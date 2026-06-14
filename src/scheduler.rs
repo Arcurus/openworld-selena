@@ -304,8 +304,9 @@ async fn scheduler_loop() {
         //
         // Thresholds (from Arcurus 2026-06-10 #cost-tracker):
         //   - used_pct < 50% : normal cadence (cfg.interval_seconds)
-        //   - 50% ≤ used_pct < 90% : 5x longer interval (1/5 calls/h)
-        //   - used_pct ≥ 90% : skip this cycle entirely
+        //   - 50% ≤ used_pct < 80% : 5x longer interval (1/5 calls/h)
+        //   - used_pct ≥ 80% : skip this cycle entirely (universal
+        //                       80% rule per Arcurus 2026-06-10)
         let gate = read_budget_gate();
         let (effective_interval, gate_state) =
             apply_budget_throttle(cfg.interval_seconds, gate.used_pct);
@@ -476,8 +477,9 @@ const AUTH_COOKIE: &str = "openworld_auth=1";
 // The world is the single biggest MiniMax consumer (see MEMORY.md,
 // AGI cost note: open-world-selena). To avoid blowing the 5h budget
 // during heavy turns, the scheduler reads the live budget gate
-// (selena-project's `data/budget_gate.json`, refreshed every 5 min
-// via `mmx quota`) and applies a 3-tier throttle:
+// (selena-project's `data/budget_gate.json`, refreshed every 10 sec
+// via `mmx quota`; was 5 min before 2026-06-11 per Arcurus #lunar-project)
+// and applies a 3-tier throttle:
 //
 //   used_pct < 50%            -> normal cadence (configured interval)
 //   50% <= used_pct < 90%     -> 5x longer interval (1/5 calls/h)
@@ -493,8 +495,12 @@ const AUTH_COOKIE: &str = "openworld_auth=1";
 // decoupling).
 const DEFAULT_BUDGET_GATE_PATH: &str =
     "/home/openclaw/openclaw/workspace/selena-project/data/budget_gate.json";
+// Per Arcurus 2026-06-10 #lunar-project: the universal 80% rule applies
+// to ALL autonomous agents, including the OW scheduler.  The throttle
+// tier (50%..80%) is a soft signal to slow down; the halt threshold
+// (80%) is the hard stop that matches the global gate.
 const BUDGET_THROTTLE_THRESHOLD_PCT: f64 = 50.0;
-const BUDGET_HALT_THRESHOLD_PCT: f64 = 90.0;
+const BUDGET_HALT_THRESHOLD_PCT: f64 = 80.0;
 const BUDGET_THROTTLE_MULTIPLIER: u64 = 5;
 const BUDGET_GATE_POLL_SECONDS: u64 = 60;
 
@@ -502,9 +508,10 @@ const BUDGET_GATE_POLL_SECONDS: u64 = 60;
 enum GateState {
     /// < 50% used, or file missing/malformed (fail-open by design).
     Open,
-    /// 50%..90% used; 5x longer interval.
+    /// 50%..80% used; 5x longer interval.
     Throttled,
-    /// >= 90% used; skip cycles until the gate reopens.
+    /// >= 80% used; skip cycles until the gate reopens.  Matches
+    /// the universal 80% rule in selena-project/code/budget_gate.py.
     Closed,
 }
 
@@ -794,7 +801,9 @@ mod tests {
         assert_eq!(entity_power(&e), 0);
     }
 
-    // --- Budget-gate throttle (added 2026-06-10 per Arcurus #cost-tracker) -
+    // --- Budget-gate throttle (added 2026-06-10 per Arcurus #cost-tracker;
+    //     updated 2026-06-10 to use the universal 80% halt threshold
+    //     per Arcurus #lunar-project) ---
 
     #[test]
     fn throttle_below_50_pct_is_open() {
@@ -804,17 +813,18 @@ mod tests {
     }
 
     #[test]
-    fn throttle_50_to_90_pct_is_5x() {
+    fn throttle_50_to_80_pct_is_5x() {
         let (interval, state) = apply_budget_throttle(120, 50.0);
         assert_eq!(state, GateState::Throttled);
         assert_eq!(interval, 600);
-        let (i2, _) = apply_budget_throttle(120, 89.9);
+        let (i2, _) = apply_budget_throttle(120, 79.9);
         assert_eq!(i2, 600);
     }
 
     #[test]
-    fn throttle_90_pct_or_above_closes() {
-        let (interval, state) = apply_budget_throttle(120, 90.0);
+    fn throttle_80_pct_or_above_closes() {
+        // Universal 80% rule (per Arcurus 2026-06-10 #lunar-project).
+        let (interval, state) = apply_budget_throttle(120, 80.0);
         assert_eq!(state, GateState::Closed);
         assert_eq!(interval, 60); // poll interval, not interval_seconds
         let (i2, s2) = apply_budget_throttle(120, 100.0);

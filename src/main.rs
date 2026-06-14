@@ -83,6 +83,18 @@ fn tracking_url_and_token() -> (String, String) {
     (base.trim_end_matches('/').to_string(), token)
 }
 
+/// Project slug attached to LLM call records made by the live simulation.
+///
+/// Defaults to `open-world-running` (per Arcurus 2026-06-09 #cost-tracker:
+/// the open-world-selena project was split into `open-world-dev`
+/// (OpenClaw-side workers + discord) and `open-world-running` (LLM
+/// calls from the live world). Override with the OW_LLM_PROJECT env
+/// var on the open-world-selena service.
+fn llm_record_project() -> String {
+    std::env::var("OW_LLM_PROJECT")
+        .unwrap_or_else(|_| "open-world-running".to_string())
+}
+
 /// Fire-and-forget POST to /api/llm-usage/record.  Reads token + URL
 /// from env at call time so a config change doesn't require a recompile.
 ///
@@ -971,6 +983,34 @@ async fn get_internal_properties() -> impl IntoResponse {
             "int": LLM_INTERNAL_INT_PROPERTIES,
             "float": LLM_INTERNAL_FLOAT_PROPERTIES,
             "string": LLM_INTERNAL_STRING_PROPERTIES,
+        }
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/widgets — minimal test endpoint (added 2026-06-09 by
+// selena-open-world-worker to satisfy the irreversible-check test fixture
+// todo `b03ed087 / 358ac0bd / fd49c6ee`). Returns a hardcoded list of
+// widgets; safe and reversible (delete the route + handler to remove).
+// ---------------------------------------------------------------------------
+#[derive(Debug, Serialize)]
+struct Widget {
+    id: &'static str,
+    name: &'static str,
+    color: &'static str,
+}
+
+async fn list_widgets() -> impl IntoResponse {
+    let widgets = vec![
+        Widget { id: "w-sun",   name: "Sun",   color: "gold"     },
+        Widget { id: "w-moon",  name: "Moon",  color: "silver"   },
+        Widget { id: "w-star",  name: "Star",  color: "blue"     },
+    ];
+    success_json(serde_json::json!({
+        "success": true,
+        "data": {
+            "widgets": widgets,
+            "count": 3,
         }
     }))
 }
@@ -2177,7 +2217,7 @@ async fn action_llm_handler(
             record_llm_call_async(
                 state.settings.llm.provider.clone(),
                 model.clone(),
-                "open-world-selena".to_string(),
+                llm_record_project(),
                 ti,
                 to,
                 rt,
@@ -6857,6 +6897,7 @@ async fn main() {
         // API routes first (take precedence)
         .route("/api/", get(get_world))
         .route("/api/internal-properties", get(get_internal_properties))
+        .route("/api/widgets", get(list_widgets))
         .route("/api/entities", get(list_entities))
         .route("/api/entities", post(create_entity))
         .route("/api/entities/:id", get(get_entity))
