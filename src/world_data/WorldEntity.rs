@@ -76,24 +76,134 @@ pub struct WorldEntity {
     /// History of events/actions
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
-    
+
     /// History summary (updated periodically)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_summary: Option<String>,
-    
+
     /// When this entity was last active in a world action
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_action_at: Option<DateTime<Utc>>,
-    
+
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
-    
+
     /// Last update timestamp
     pub updated_at: DateTime<Utc>,
-    
+
     /// Time preferences for this entity
     #[serde(default)]
     pub time_preferences: EntityTimePreferences,
+
+    // -------------------------------------------------------------------
+    // Hardcoded game-relationship fields (added 2026-06-15 per Arcurus
+    // #openworld: "fractionId, fractionSecretLoyalId, homeLocationId,
+    // birthLocationId, leaderId, regionId ... to the hard coded entity
+    // data fields").
+    //
+    // All six are `Option<Uuid>`: an entity that does not belong to a
+    // faction / does not have a home / etc. simply has `None`. This
+    // mirrors the `owner_id` precedent: it is also `Option<Uuid>` and
+    // the LLM never sees it, the operator sets it via the API.
+    //
+    // These are REAL struct fields (not `properties_int` keys) so:
+    //   1. The LLM effect writer cannot tamper with them — they're
+    //      not in any property map, so the per-property PUT is the
+    //      only way to change them (operator-only).
+    //   2. The LLM-facing property context builder never lists them
+    //      (it iterates the property maps, not the struct fields).
+    //   3. Save/load round-trips them as first-class fields via the
+    //      binary format (ENTITY_VERSION bumped 1→2 on 2026-06-15).
+    //   4. We can index them / build lookups (faction → members)
+    //      without scanning every entity's `properties_int`.
+    //
+    // Naming note: Arcurus wrote "fractionId" in chat; the in-world
+    // term (and the existing `entity_type`) is "faction". We use
+    // `faction_id` everywhere in the codebase to match the lore and
+    // the rest of the engine (confirmed by Arcurus 2026-06-15).
+    // -------------------------------------------------------------------
+
+    /// Primary faction this entity belongs to. `None` for unaffiliated
+    /// entities (most locations, lone heroes, dragons, artifacts).
+    /// For a faction entity itself, this is `None` — a faction is the
+    /// top of the membership chain, not a member of itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faction_id: Option<Uuid>,
+
+    /// Secret loyalty to a different faction. Set ONLY when this entity
+    /// is publicly a member of one faction (`faction_id`) but secretly
+    /// loyal to another (a spy / double agent). For most entities this
+    /// is `None`. Like `faction_id`, `None` for faction entities.
+    /// The "secret" semantic is important: the LLM context builder
+    /// should NOT show this field to the LLM (a faction member's
+    /// secret loyalty is a spoiler for the simulator). Kept off the
+    /// LLM-emit surface entirely; only the operator can set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faction_secret_loyal_id: Option<Uuid>,
+
+    /// Home location for entities that can return "home" (most
+    /// characters; a few locations like sanctuaries). `None` for
+    /// entities without a fixed home (wanderers, dragons, etc.).
+    /// For a location entity, `home_location_id` is `None` — a
+    /// location IS a place, it does not have a separate "home".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_location_id: Option<Uuid>,
+
+    /// Birthplace of this entity. `None` when lore does not pin a
+    /// specific birthplace. Conceptually distinct from `home_location_id`
+    /// (where they live now vs. where they were born).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birth_location_id: Option<Uuid>,
+
+    /// Leader of this entity. Convention (per Arcurus 2026-06-15):
+    ///   - For a FACTION entity, `leader_id` points to the character
+    ///     who leads that faction.
+    ///   - For a CHARACTER entity, `leader_id` may point to another
+    ///     character/leader they follow (e.g. a squire following a
+    ///     knight commander). For most current characters this is
+    ///     `None` — we add character→leader links as the lore grows.
+    ///   - For a LOCATION/DRAGON/ARTIFACT entity, `leader_id` is
+    ///     `None` (locations are not "led" by anyone; dragons are
+    ///     solitary sovereigns).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_id: Option<Uuid>,
+
+    /// Region this entity belongs to. Currently the world has one
+    /// region (the realm itself) — see the region entity created in
+    /// the v2 rollout (`The Realm of Shadows`, `entity_type="region"`).
+    /// System entities (World Clock and any `meta`-tagged entity) have
+    /// `region_id = None` and the system-entity guard prevents the
+    /// LLM from setting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_id: Option<Uuid>,
+
+    // -------------------------------------------------------------------
+    // Marker field (moved out of `properties_int` on 2026-06-15).
+    // -------------------------------------------------------------------
+    /// Per-entity "processed up to" marker for the unprocessed-other-
+    /// actions LLM block. After every LLM call that showed this entity
+    /// the "actions from other entities" list, the orchestrator
+    /// advances this marker to the max tick of the entries that were
+    /// rendered, so future calls don't re-show the same entries.
+    ///
+    /// **Previously** this lived in `properties_int["last_processed_other_tick"]`
+    /// (the LLM-internal bookkeeping list). The move to a struct field
+    /// (per Arcurus 2026-06-15 #openworld: "we dont mix anymore
+    /// programatical stuff with game based values") keeps the
+    /// LLM-internal bookkeeping list clean and gives the marker a
+    /// dedicated, well-typed slot.
+    ///
+    /// The v1→v2 migration in `persistence.rs::deserialize_world`
+    /// reads the existing value from `properties_int` on first load
+    /// and seeds this field. The old `properties_int` key is kept in
+    /// the entity map (per Arcurus "let the old ... field in for now
+    /// just update the code to use the new one. once all works we can
+    /// delet it"). The code path uses ONLY this field; the old key in
+    /// `properties_int` is dead data, pending a future cleanup pass.
+    ///
+    /// Default: 0 (never processed any other-entity actions).
+    #[serde(default)]
+    pub last_processed_other_tick: i64,
 }
 
 impl WorldEntity {
@@ -120,6 +230,18 @@ impl WorldEntity {
             created_at: now,
             updated_at: now,
             time_preferences: EntityTimePreferences::new(),
+            // Hardcoded game-relationship fields (2026-06-15). All
+            // default to None; the operator / API sets them when the
+            // entity is created or via PUT.
+            faction_id: None,
+            faction_secret_loyal_id: None,
+            home_location_id: None,
+            birth_location_id: None,
+            leader_id: None,
+            region_id: None,
+            // Marker for the unprocessed-other-actions LLM block.
+            // Default 0 = "never processed any other-entity actions".
+            last_processed_other_tick: 0,
         }
     }
     
@@ -339,6 +461,70 @@ mod tests {
         let e1 = WorldEntity::new("location", "A", 0.0, 0.0);
         let e2 = WorldEntity::new("location", "B", 3.0, 4.0);
         assert!((e1.distance_to(&e2) - 5.0).abs() < 0.001);
+    }
+
+    // -------------------------------------------------------------------
+    // v2 relationship-fields tests (2026-06-15, per Arcurus #openworld)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn new_entity_has_all_relationship_fields_set_to_none() {
+        // The default for the six relationship fields (and the
+        // marker) must be `None` / 0, so a freshly-created entity
+        // is "unaffiliated, no home, no leader, no region" out of
+        // the box.  The operator sets the actual values via the
+        // API.
+        let e = WorldEntity::new("character", "Lonely", 0.0, 0.0);
+        assert!(e.faction_id.is_none());
+        assert!(e.faction_secret_loyal_id.is_none());
+        assert!(e.home_location_id.is_none());
+        assert!(e.birth_location_id.is_none());
+        assert!(e.leader_id.is_none());
+        assert!(e.region_id.is_none());
+        assert_eq!(e.last_processed_other_tick, 0);
+    }
+
+    #[test]
+    fn relationship_fields_round_trip_through_serde() {
+        // Sanity check that the new fields are part of the JSON
+        // serialization (they ARE because of `Serialize` on the
+        // struct, but the `skip_serializing_if` and `default`
+        // annotations need a moment of attention).  The serde
+        // shape we expect on the wire: a v2 entity JSON includes
+        // the six fields as `null` when not set, and as a UUID
+        // string when set.
+        let mut e = WorldEntity::new("character", "Kira", 0.0, 0.0);
+        let faction = Uuid::new_v4();
+        let region = Uuid::new_v4();
+        e.faction_id = Some(faction);
+        e.region_id = Some(region);
+        e.last_processed_other_tick = 1234;
+
+        let json = serde_json::to_string(&e).unwrap();
+        // Both set fields present as JSON strings.
+        assert!(json.contains(&format!("\"faction_id\":\"{}\"", faction)));
+        assert!(json.contains(&format!("\"region_id\":\"{}\"", region)));
+        assert!(json.contains("\"last_processed_other_tick\":1234"));
+        // The unset fields are SKIPPED on serialize (we use
+        // `skip_serializing_if = "Option::is_none"`), so they
+        // must NOT be present in the JSON.
+        assert!(!json.contains("faction_secret_loyal_id"));
+        assert!(!json.contains("home_location_id"));
+        assert!(!json.contains("birth_location_id"));
+        assert!(!json.contains("leader_id"));
+
+        // Deserialize back and confirm the values survived.
+        let de: WorldEntity = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.faction_id, Some(faction));
+        assert_eq!(de.region_id, Some(region));
+        assert_eq!(de.last_processed_other_tick, 1234);
+        // The fields we left None on the original must come
+        // back as None on the deserialized value (serde's
+        // `default` annotation gives us this for free).
+        assert!(de.faction_secret_loyal_id.is_none());
+        assert!(de.home_location_id.is_none());
+        assert!(de.birth_location_id.is_none());
+        assert!(de.leader_id.is_none());
     }
 
     #[test]

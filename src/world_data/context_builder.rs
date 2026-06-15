@@ -52,7 +52,7 @@ pub struct ActionContext {
     /// `entity_id != this` AND the entry's effects mention
     /// this entity by dotted name AND the entry's `tick` is
     /// greater than the entity's
-    /// `properties_int["last_processed_other_tick"]`
+    /// `last_processed_other_tick` field
     /// (or 0 if unset).  Rendered compact, oldest first,
     /// capped at `MAX_UNPROCESSED_OTHER_ACTIONS_CHARS` chars
     /// total.  The LLM uses this to keep its
@@ -143,11 +143,12 @@ pub fn build_action_context(
             // cap) and let the renderer cap by char count.
             // This is a one-shot scan of the whole JSONL log,
             // which at 5-10K entries is sub-millisecond.
-            let last_processed_tick = entity
-                .properties_int
-                .get("last_processed_other_tick")
-                .copied()
-                .unwrap_or(0);
+            //
+            // 2026-06-15: the marker moved from
+            // `properties_int["last_processed_other_tick"]` to the
+            // dedicated `WorldEntity::last_processed_other_tick`
+            // field. Read the field directly.
+            let last_processed_tick = entity.last_processed_other_tick;
             let raw = action_history_log::load_all_world_actions();
             build_unprocessed_other_actions_str(
                 world,
@@ -584,12 +585,13 @@ const MAX_UNPROCESSED_OTHER_ACTIONS_CHARS: usize = 9_500;
 ///   3. The action must NOT be from a system entity
 ///      (World Clock etc.) — bookkeeping noise.
 ///   4. The entry's `tick` must be strictly greater than
-///      `entity.properties_int["last_processed_other_tick"]`
+///      `entity.last_processed_other_tick`
 ///      (or 0 if unset).  This is the "processed up to"
 ///      marker that advances on every LLM call for this
 ///      entity (see `tick_unprocessed_other_actions` in
-///      main.rs) and is operator-settable via the
-///      per-property PUT endpoint.
+///      main.rs) and is operator-settable via direct
+///      struct-field assignment.  (2026-06-15: moved out of
+///      `properties_int` to a first-class field.)
 ///
 /// Render rules:
 ///   - Chronological (oldest first) — natural reading
@@ -1020,20 +1022,28 @@ mod tests {
         // must NOT appear in the entity's own property
         // context block.  The LLM must never see the
         // marker.
+        //
+        // 2026-06-15: the marker moved to a first-class
+        // `WorldEntity::last_processed_other_tick` field
+        // (no longer in `properties_int`).  The defense
+        // is now architectural: the property context is
+        // built from `properties_int` only, so a name
+        // that's not in `properties_int` can't appear in
+        // the LLM context regardless of the internal-
+        // property list.  This test pins the new
+        // mechanism: the struct field is NEVER rendered.
         let mut entity = make_entity("Test", 10000.0, 10000.0);
         entity.properties_int.insert("power".to_string(), 50);
-        entity
-            .properties_int
-            .insert("last_processed_other_tick".to_string(), 12345);
+        entity.last_processed_other_tick = 12345;
         let result = build_property_context(&entity, None);
         assert!(result.contains("power: 50"));
         assert!(
             !result.contains("last_processed_other_tick"),
-            "internal property marker must not appear in LLM context"
+            "marker field must not appear in LLM context (architectural, not filter-based)"
         );
         assert!(
             !result.contains("12345"),
-            "internal property VALUE must not appear in LLM context"
+            "marker value must not appear in LLM context"
         );
     }
 

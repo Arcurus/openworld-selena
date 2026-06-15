@@ -17,7 +17,27 @@ use std::io::{Read, Write, BufReader, BufWriter};
 const MAGIC: &[u8; 4] = b"OWBL"; // Open World Binary
 const VERSION: u32 = 3; // Increment when world format changes
                          // v2 → v3: added max_history_summary_chars to WorldSettings
-const ENTITY_VERSION: u32 = 1; // Increment when entity format changes
+// Entity format version history (ENTITY_VERSION):
+//   1: original entity layout (no faction_id / secret_loyal /
+//      home_location / birth_location / leader / region /
+//      last_processed_other_tick field — those lived in
+//      `properties_int` for the marker, and the rest didn't exist).
+//   2 (2026-06-15 per Arcurus #openworld): added seven new top-
+//      level fields to `WorldEntity`:
+//        - faction_id, faction_secret_loyal_id, home_location_id,
+//          birth_location_id, leader_id, region_id (all
+//          `Option<Uuid>`)
+//        - last_processed_other_tick (i64, the unprocessed-other-
+//          actions marker that previously lived in
+//          `properties_int["last_processed_other_tick"]`).
+//      v1→v2 migration on load: read the marker from
+//      `properties_int`, seed the new field. The old key in
+//      `properties_int` is KEPT (per Arcurus "let the old ...
+//      field in for now just update the code to use the new one.
+//      once all works we can delet it"). The code path uses
+//      ONLY the new field; the old property is dead data pending
+//      a future cleanup pass.
+const ENTITY_VERSION: u32 = 2;
 
 pub struct BinaryPersistence;
 
@@ -218,6 +238,23 @@ impl BinaryPersistence {
         // Timestamps
         Self::write_datetime(&entity.created_at, data);
         Self::write_datetime(&entity.updated_at, data);
+
+        // --- v2 (2026-06-15): seven new top-level fields ---
+        // The order MUST match `read_entity` exactly. Bumping
+        // ENTITY_VERSION to 2 means every new save carries these;
+        // v1 readers cannot decode this byte stream (their cursor
+        // would not match the file layout) and would error out
+        // before reaching this point.
+        //
+        // 1) Hardcoded game-relationship fields: six Option<Uuid>.
+        Self::write_option_uuid(entity.faction_id, data);
+        Self::write_option_uuid(entity.faction_secret_loyal_id, data);
+        Self::write_option_uuid(entity.home_location_id, data);
+        Self::write_option_uuid(entity.birth_location_id, data);
+        Self::write_option_uuid(entity.leader_id, data);
+        Self::write_option_uuid(entity.region_id, data);
+        // 2) The marker that moved out of `properties_int`.
+        Self::write_i64(entity.last_processed_other_tick, data);
     }
 
     /// Write UUID
@@ -464,6 +501,9 @@ impl BinaryPersistence {
             properties_string,
             last_world_action,
             action_count,
+            action_count_24h: 0, // Recomputed on every /api/ read from action_history.jsonl (rolling 24h window, see count_actions_in_last_24h in main.rs).
+            movement_count_today: 0, // Re-seeded from today's log file in main.rs after load (see init_movement_counter_from_log).
+            movement_log_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
             world_time: crate::world_data::time_system::WorldTime::new(),
             active_events: Vec::new(), // Legacy - active_events not in old saves
         };
@@ -472,7 +512,12 @@ impl BinaryPersistence {
     }
 
     /// Read entity from binary
-    /// entity_version: the entity format version (1 = current, 2+ = future with additional fields)
+    /// entity_version: the entity format version
+    ///   1 = original layout (no new top-level fields, marker in
+    ///       `properties_int["last_processed_other_tick"]`)
+    ///   2+ = adds seven top-level fields at the end of the entity
+    ///       record (see the v2 block in `write_entity` for the
+    ///       exact byte order).
     fn read_entity(data: &[u8], pos: &mut usize, id: uuid::Uuid, entity_version: u32) -> Result<WorldEntity, String> {
         use chrono::Utc;
 
@@ -502,6 +547,19 @@ impl BinaryPersistence {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             time_preferences: crate::world_data::time_system::EntityTimePreferences::new(),
+            // v2 fields: default to None / 0 here. The actual
+            // values are filled in below, after we've finished
+            // reading the rest of the entity, so the field order
+            // in this struct literal doesn't need to mirror the
+            // file layout byte-for-byte (only the read order in
+            // the v2 block below does).
+            faction_id: None,
+            faction_secret_loyal_id: None,
+            home_location_id: None,
+            birth_location_id: None,
+            leader_id: None,
+            region_id: None,
+            last_processed_other_tick: 0,
         };
 
         // Properties int
@@ -567,6 +625,42 @@ impl BinaryPersistence {
         // Timestamps
         entity.created_at = Self::read_datetime(data, pos);
         entity.updated_at = Self::read_datetime(data, pos);
+
+        // --- v2 (2026-06-15): seven new top-level fields ---
+        // Read order MUST match `write_entity` exactly. v1
+        // saves (entity_version == 1) do NOT have these
+        // bytes, so we skip the reads and use the migration
+        // path to fill the field from the legacy
+        // `properties_int["last_processed_other_tick"]` key.
+        if entity_version >= 2 {
+            entity.faction_id = Self::read_option_uuid(data, pos);
+            entity.faction_secret_loyal_id = Self::read_option_uuid(data, pos);
+            entity.home_location_id = Self::read_option_uuid(data, pos);
+            entity.birth_location_id = Self::read_option_uuid(data, pos);
+            entity.leader_id = Self::read_option_uuid(data, pos);
+            entity.region_id = Self::read_option_uuid(data, pos);
+            entity.last_processed_other_tick = Self::read_i64(data, pos);
+        } else {
+            // v1 → v2 migration: seed the marker field from
+            // the legacy `properties_int` key.  The six
+            // relationship fields (faction / secret_loyal /
+            // home / birth / leader / region) default to
+            // None; the operator populates them via the API
+            // after the migration runs (or via a one-time
+            // `apply_mapping` script in this commit).
+            //
+            // IMPORTANT: we do NOT remove the old key from
+            // `properties_int` here — per Arcurus 2026-06-15
+            // ("let the old ... field in for now just update
+            // the code to use the new one. once all works
+            // we can delet it"), the old key stays on disk
+            // for now.  A future cleanup pass will remove it.
+            entity.last_processed_other_tick = entity
+                .properties_int
+                .get("last_processed_other_tick")
+                .copied()
+                .unwrap_or(0);
+        }
 
         Ok(entity)
     }
@@ -1078,6 +1172,223 @@ mod tests {
         assert_eq!(loaded.action_count, 0);
         assert!(loaded.last_world_action.is_none());
         let path = PathBuf::from(&path_str);
+        cleanup(&path);
+    }
+
+    // -------------------------------------------------------------------
+    // v1→v2 migration + v2 round-trip tests (2026-06-15).
+    // The entity format version was bumped from 1 to 2 to carry
+    // the seven new top-level fields (six relationship fields +
+    // the marker that moved out of `properties_int`).  These
+    // tests pin the migration contract and the v2 round-trip.
+    // -------------------------------------------------------------------
+
+    /// Hand-build a v1-shaped binary save file (entity_version
+    /// implicit at 1 — no `entity_version` byte in the world
+    /// header) with a single entity whose
+    /// `properties_int["last_processed_other_tick"]` is set to
+    /// a known value.  Loading it must:
+    ///   1. Read the entity (entity_version defaults to 1 in
+    ///      `deserialize_world` for legacy saves).
+    ///   2. Migrate the marker from `properties_int` into the
+    ///      new `last_processed_other_tick` field.
+    ///   3. KEEP the old `properties_int` key (per Arcurus
+    ///      2026-06-15: "let the old ... field in for now
+    ///      just update the code to use the new one. once
+    ///      all works we can delet it").
+    ///   4. Default the six new relationship fields to None.
+    fn write_v1_save_with_marker(path: &Path, marker_value: i64) {
+        use std::io::Write;
+        // World header
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"OWBL");
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // world VERSION = 3 (max)
+        // class name "World"
+        let class = b"World";
+        bytes.extend_from_slice(&(class.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(class);
+
+        // We'll need a stable test UUID.
+        let entity_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+
+        // Build the entity blob via the live v1 layout: this is
+        // what an old save looks like on disk.  We mirror the v1
+        // byte order from `serialize_world` exactly, with the
+        // marker in `properties_int` (NOT in the new field —
+        // there is no new field in v1).
+        let mut entity = Vec::new();
+        // entity_type
+        let t = b"character";
+        entity.extend_from_slice(&(t.len() as u32).to_le_bytes());
+        entity.extend_from_slice(t);
+        // name
+        let n = b"Migrated Hero";
+        entity.extend_from_slice(&(n.len() as u32).to_le_bytes());
+        entity.extend_from_slice(n);
+        // description
+        let d = b"A hero from a v1 save";
+        entity.extend_from_slice(&(d.len() as u32).to_le_bytes());
+        entity.extend_from_slice(d);
+        // x, y
+        entity.extend_from_slice(&1.0f64.to_le_bytes());
+        entity.extend_from_slice(&2.0f64.to_le_bytes());
+        // properties_int: 1 entry, "last_processed_other_tick" -> marker_value
+        entity.extend_from_slice(&1u32.to_le_bytes());
+        let k = b"last_processed_other_tick";
+        entity.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        entity.extend_from_slice(k);
+        entity.extend_from_slice(&marker_value.to_le_bytes());
+        // properties_float: 0
+        entity.extend_from_slice(&0u32.to_le_bytes());
+        // properties_string: 0
+        entity.extend_from_slice(&0u32.to_le_bytes());
+        // tags: 0
+        entity.extend_from_slice(&0u32.to_le_bytes());
+        // owner: None
+        entity.push(0);
+        // owned_entities: 0
+        entity.extend_from_slice(&0u32.to_le_bytes());
+        // history: 0
+        entity.extend_from_slice(&0u32.to_le_bytes());
+        // history_summary: None
+        entity.push(0);
+        // last_action_at: None
+        entity.push(0);
+        // created_at, updated_at
+        entity.extend_from_slice(&0i64.to_le_bytes()); // ts seconds
+        entity.extend_from_slice(&0u32.to_le_bytes()); // ts nanos
+        entity.extend_from_slice(&0i64.to_le_bytes());
+        entity.extend_from_slice(&0u32.to_le_bytes());
+
+        // World body
+        let mut body = Vec::new();
+        // world name
+        let wn = b"V1 World";
+        body.extend_from_slice(&(wn.len() as u32).to_le_bytes());
+        body.extend_from_slice(wn);
+        // entity count
+        body.extend_from_slice(&1u32.to_le_bytes());
+        // entity version field: ALWAYS written by the live
+        // serializer (line `Self::write_u32(ENTITY_VERSION, &mut
+        // data);` in `serialize_world`).  The current constant
+        // is 2, but a v1 save was written when the constant
+        // was 1, so the field on disk is `1`.  The deserialize
+        // code reads this field unconditionally for any world
+        // version >= 2; the WORLD version (not the entity
+        // version) is what gates the read.  We write `1` here
+        // to simulate a v1-era save.
+        body.extend_from_slice(&1u32.to_le_bytes());
+        // per-entity: id + entity blob
+        body.extend_from_slice(entity_id.as_bytes());
+        body.extend_from_slice(&entity);
+        // path count
+        body.extend_from_slice(&0u32.to_le_bytes());
+        // settings (10 f64 / u64 / bool fields, in the v3 layout)
+        body.extend_from_slice(&3.0f64.to_le_bytes());     // actions_per_year
+        body.push(0);                                       // tick_action_enabled
+        body.extend_from_slice(&1.0f64.to_le_bytes());     // time_weight_factor
+        body.extend_from_slice(&1.0f64.to_le_bytes());     // proximity_weight_factor
+        body.extend_from_slice(&1.0f64.to_le_bytes());     // power_weight_factor
+        body.extend_from_slice(&1.0f64.to_le_bytes());     // resource_weight_factor
+        body.extend_from_slice(&300u64.to_le_bytes());     // auto_save_interval_secs
+        body.extend_from_slice(&10.0f64.to_le_bytes());    // history_entries_fully_displayed
+        body.extend_from_slice(&10.0f64.to_le_bytes());    // history_entries_shortened
+        body.extend_from_slice(&0u64.to_le_bytes());       // max_history_summary_chars
+        // last_world_action: None
+        body.push(0);
+        // action_count
+        body.extend_from_slice(&0u64.to_le_bytes());
+        // world properties: all empty
+        body.extend_from_slice(&0u32.to_le_bytes()); // int
+        body.extend_from_slice(&0u32.to_le_bytes()); // float
+        body.extend_from_slice(&0u32.to_le_bytes()); // string
+
+        // World header trailer: data length + data
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+
+        let mut f = std::fs::File::create(path).expect("create");
+        f.write_all(&bytes).expect("write");
+    }
+
+    #[test]
+    fn v1_to_v2_migration_seeds_marker_from_properties_int() {
+        // The classic v1 save: marker lives in
+        // `properties_int["last_processed_other_tick"]`.  On
+        // load via the v2 code, the marker must be migrated
+        // into the new field.  The old key in `properties_int`
+        // is KEPT (per Arcurus 2026-06-15).
+        let path = tmp_path("v1_migration");
+        let path_str = path.to_string_lossy().to_string();
+        write_v1_save_with_marker(&path, 4242);
+
+        let loaded = BinaryPersistence::load_world(&path_str)
+            .expect("v1 save must load under the v2 reader");
+        assert_eq!(loaded.entities.len(), 1);
+        let e = loaded.entities.values().next().unwrap();
+        // The marker must have been migrated to the new field.
+        assert_eq!(e.last_processed_other_tick, 4242);
+        // The old key in `properties_int` is still present
+        // (per Arcurus 2026-06-15: "let the old ... field in
+        // for now just update the code to use the new one.
+        // once all works we can delet it").
+        assert_eq!(
+            e.properties_int.get("last_processed_other_tick").copied(),
+            Some(4242),
+            "old key in properties_int must be preserved on v1→v2 migration"
+        );
+        // The six relationship fields default to None.
+        assert!(e.faction_id.is_none());
+        assert!(e.faction_secret_loyal_id.is_none());
+        assert!(e.home_location_id.is_none());
+        assert!(e.birth_location_id.is_none());
+        assert!(e.leader_id.is_none());
+        assert!(e.region_id.is_none());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn v2_save_load_roundtrips_all_relationship_fields() {
+        // Build a v2 entity directly (we use the live save
+        // path, which writes v2 because ENTITY_VERSION is 2),
+        // set every relationship field, and confirm the
+        // round-trip preserves all of them.
+        let mut world = World::new("v2 roundtrip");
+        let hero_id = uuid::Uuid::new_v4();
+        let faction_id = uuid::Uuid::new_v4();
+        let region_id = uuid::Uuid::new_v4();
+        let home_id = uuid::Uuid::new_v4();
+        let birth_id = uuid::Uuid::new_v4();
+        let leader_id = uuid::Uuid::new_v4();
+        let secret_id = uuid::Uuid::new_v4();
+
+        let mut hero = WorldEntity::new("character", "Kira", 0.0, 0.0);
+        hero.id = hero_id;
+        hero.faction_id = Some(faction_id);
+        hero.faction_secret_loyal_id = Some(secret_id);
+        hero.home_location_id = Some(home_id);
+        hero.birth_location_id = Some(birth_id);
+        hero.leader_id = Some(leader_id);
+        hero.region_id = Some(region_id);
+        hero.last_processed_other_tick = 7777;
+        world.add_entity(hero);
+
+        let path = tmp_path("v2_roundtrip");
+        let path_str = path.to_string_lossy().to_string();
+        BinaryPersistence::save_world(&world, &path_str).expect("save v2 ok");
+        let loaded = BinaryPersistence::load_world(&path_str).expect("load v2 ok");
+        let h = loaded
+            .entities
+            .get(&hero_id)
+            .expect("hero must survive v2 round-trip");
+        assert_eq!(h.faction_id, Some(faction_id));
+        assert_eq!(h.faction_secret_loyal_id, Some(secret_id));
+        assert_eq!(h.home_location_id, Some(home_id));
+        assert_eq!(h.birth_location_id, Some(birth_id));
+        assert_eq!(h.leader_id, Some(leader_id));
+        assert_eq!(h.region_id, Some(region_id));
+        assert_eq!(h.last_processed_other_tick, 7777);
         cleanup(&path);
     }
 }

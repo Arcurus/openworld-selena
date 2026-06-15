@@ -124,30 +124,37 @@ pub fn format_histories_for_entities(
 
 /// Add an action result to an entity's history.
 ///
-/// Also advances the entity's
-/// `properties_int["last_processed_other_tick"]` marker to
-/// `next_marker_tick` — because by the time this function
-/// runs, the LLM has been shown the "unprocessed world
-/// actions from other entities" list, so those actions
-/// are now considered processed for this entity's history
-/// summary purposes.  Per Arcurus 2026-06-07 (#openworld):
-/// "we can reconstruct which world actions are not yet
-/// processed for a given entity" and "it needs to be set
-/// to the creating tick time of the other history message
-/// last included in the llm to process."
+/// Also advances the entity's `last_processed_other_tick` marker to
+/// `next_marker_tick` — because by the time this function runs, the
+/// LLM has been shown the "unprocessed world actions from other
+/// entities" list, so those actions are now considered processed for
+/// this entity's history summary purposes.  Per Arcurus 2026-06-07
+/// (#openworld): "we can reconstruct which world actions are not yet
+/// processed for a given entity" and "it needs to be set to the
+/// creating tick time of the other history message last included in
+/// the llm to process."
 ///
-/// `next_marker_tick` is the max tick among the entries
-/// that were rendered in the unprocessed-other-actions
-/// block during this LLM call.  The caller computes it
-/// via `context_builder::compute_max_unprocessed_tick`.
-/// If 0, the marker does NOT advance (no entries were
-/// rendered — either the filter was empty or the cap was
-/// too tight; the caller is expected to log a warning in
-/// the latter case).
+/// **2026-06-15 change:** the marker moved from
+/// `properties_int["last_processed_other_tick"]` to a first-class
+/// `WorldEntity::last_processed_other_tick` field (per Arcurus
+/// #openworld: "we dont mix anymore programatical stuff with game
+/// based values").  This function now writes the new field.  The
+/// old `properties_int` key is no longer touched by this code path;
+/// it is kept on disk (in the entity map) for now pending a future
+/// cleanup pass.  See `WorldEntity` struct doc for the full migration
+/// history.
 ///
-/// The marker is set to `max(current, next_marker_tick)`
-/// so it never regresses (defensive — in practice
-/// next_marker_tick > current, but the guard is cheap).
+/// `next_marker_tick` is the max tick among the entries that were
+/// rendered in the unprocessed-other-actions block during this LLM
+/// call.  The caller computes it via
+/// `context_builder::compute_max_unprocessed_tick`.  If 0, the marker
+/// does NOT advance (no entries were rendered — either the filter was
+/// empty or the cap was too tight; the caller is expected to log a
+/// warning in the latter case).
+///
+/// The marker is set to `max(current, next_marker_tick)` so it never
+/// regresses (defensive — in practice next_marker_tick > current, but
+/// the guard is cheap).
 pub fn add_to_history(
     entity: &mut WorldEntity,
     action: &str,
@@ -165,15 +172,9 @@ pub fn add_to_history(
         // into it later").
         return;
     }
-    let current = entity
-        .properties_int
-        .get("last_processed_other_tick")
-        .copied()
-        .unwrap_or(0);
+    let current = entity.last_processed_other_tick;
     if next_marker_tick > current {
-        entity
-            .properties_int
-            .insert("last_processed_other_tick".to_string(), next_marker_tick);
+        entity.last_processed_other_tick = next_marker_tick;
     }
 }
 

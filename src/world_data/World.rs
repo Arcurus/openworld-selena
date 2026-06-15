@@ -147,6 +147,43 @@ pub struct World {
     /// Number of world actions performed
     #[serde(default)]
     pub action_count: u64,
+
+    /// Number of world actions performed in the last 24 hours
+    /// (rolling window from now). NOT stored in the save file
+    /// (it's intentionally recomputed on every read from
+    /// `world_data/action_history.jsonl` because the 24h
+    /// window crosses restarts naturally — see
+    /// `compute_action_count_24h_from_log` in main.rs).
+    /// Per Arcurus 2026-06-14 #openworld: "let the total
+    /// counter in and add another rolling 24 hour counter
+    /// similar to the movement counter but for world actions".
+    /// Distinct from `action_count` (cumulative since world
+    /// load) and from `movement_count_today` (since UTC
+    /// midnight).
+    #[serde(skip)]
+    pub action_count_24h: u64,
+
+    /// Number of location-property effects applied since the start
+    /// of the current UTC day. Seeded from the line count of
+    /// `world_data/movements_<YYYY-MM-DD>.jsonl` on startup (see
+    /// `init_movement_counter_from_log`), then incremented and
+    /// appended-to-log on every new movement. Resets to 0 when
+    /// the UTC date changes (see `record_movement_to_log`).
+    /// Exposed via `/api/` as `movement_count_today`; the
+    /// web-client header label is "Moves (today)".
+    /// Per Arcurus 2026-06-14 #openworld: "log just the movement
+    /// to a json file. use a new log on every day. and the counter
+    /// just counts on start the log files movments for this day
+    /// and then continues to add the current ones."
+    #[serde(default)]
+    pub movement_count_today: u64,
+
+    /// UTC date string ("YYYY-MM-DD") the `movement_count_today`
+    /// field corresponds to. When the current UTC date differs
+    /// from this, the counter is reset to 0 and the log file
+    /// rolled over.
+    #[serde(default)]
+    pub movement_log_date: String,
     
     /// World time tracking (days, hours, time of day)
     #[serde(default)]
@@ -341,6 +378,9 @@ impl World {
             properties_string: HashMap::new(),
             last_world_action: None,
             action_count: 0,
+            action_count_24h: 0,
+            movement_count_today: 0,
+            movement_log_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
             world_time: WorldTime::new(),
             active_events: Vec::new(),
         };

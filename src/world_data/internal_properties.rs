@@ -64,15 +64,14 @@
 ///
 /// Operator can still write via the per-property PUT endpoint (the
 /// documented escape hatch).
-pub const LLM_INTERNAL_INT_PROPERTIES: &[&str] = &[
-    // Per Arcurus 2026-06-07 (#openworld): the "processed up to"
-    // marker for the unprocessed-other-actions LLM block.  The LLM
-    // never sees this name; the orchestrator advances it via
-    // `entity_history::add_to_history` after every LLM call; the
-    // operator can override it via the per-property PUT (e.g. set
-    // to 0 to force reprocessing of all unprocessed actions).
-    "last_processed_other_tick",
-];
+///
+/// 2026-06-15 update (#openworld): `last_processed_other_tick` was
+/// moved to a first-class field on `WorldEntity` and is no longer
+/// stored in `properties_int`.  The list is empty for now; if/when
+/// a new bookkeeping int property is added, the workflow is to add
+/// the name here AND a doc-comment explaining who writes it (see
+/// the module-level docs for the full convention).
+pub const LLM_INTERNAL_INT_PROPERTIES: &[&str] = &[];
 
 /// Float properties that are operator-only.  Currently empty;
 /// add new entries here as we introduce new bookkeeping floats.
@@ -98,11 +97,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn last_processed_other_tick_is_internal() {
-        assert!(is_internal_property("last_processed_other_tick"));
-    }
-
-    #[test]
     fn regular_props_are_not_internal() {
         // Sanity: the LLM-meaningful properties that show up in the
         // entity context block must NOT be flagged as internal.
@@ -121,5 +115,25 @@ mod tests {
                 prop
             );
         }
+    }
+
+    #[test]
+    fn all_internal_lists_are_empty_for_now() {
+        // 2026-06-15: last_processed_other_tick moved to a
+        // first-class field on WorldEntity, so all three internal-
+        // property lists are now empty.  When the next bookkeeping
+        // int/float/string is added, this test will need to be
+        // updated — but for now, emptiness is the invariant.
+        assert!(
+            LLM_INTERNAL_INT_PROPERTIES.is_empty(),
+            "LLM_INTERNAL_INT_PROPERTIES should be empty; entries: {:?}",
+            LLM_INTERNAL_INT_PROPERTIES
+        );
+        assert!(LLM_INTERNAL_FLOAT_PROPERTIES.is_empty());
+        assert!(LLM_INTERNAL_STRING_PROPERTIES.is_empty());
+        // And is_internal_property should return false for ANY name.
+        assert!(!is_internal_property("last_processed_other_tick"));
+        assert!(!is_internal_property(""));
+        assert!(!is_internal_property("power"));
     }
 }
