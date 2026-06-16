@@ -6,7 +6,7 @@ This document is **auto-generated** from each entity's `properties_string.lore_*
 
 **Entity counts:**
 - **Factions**: 13 total, 13 with lore
-- **Locations**: 26 total, 5 with lore
+- **Locations**: 26 total, 26 with lore
 - **Characters**: 7 total, 7 with lore
 - **The Dragon**: 1 total, 1 with lore
 - **Artifacts**: 1 total, 1 with lore
@@ -326,6 +326,363 @@ The Stones are not, by the latest Bridge Guild survey, *natural*. They are place
 
 **Dangers:** The Stones *move*. Not in any way that can be observed — the locals will tell you they have always been exactly where they are. But the Bridge Guild's measurements, taken in the years 814, 821, 828, and 835, show a drift of one to three inches per year, always in the same direction, always toward the easternmost stone. The Court knows. The Court has, on three occasions, issued judgments about the drift — judgments the Court's own archivists will not read aloud. The Hollow Hand's deepest ledger contains a single entry for the Stones, dated to the realm's founding: *they were here before us; they will be here after; the only question is whether we will be.*
 
+### The Stonebridge
+
+**Type:** Location
+ | **Location:** (380, 230)
+
+*A two-mile span of fitted stone over the Silverstream — older than the Kingdom that used to be here, kept whole by the Bridge Guild, and *the only bridge the Black Sail Reavers have ever failed to burn*.*
+
+The Stonebridge is a two-mile span of fitted stone over the Silverstream River, linking the northern and southern halves of the realm at the narrowest point of the river's bend. The bridge is, by the Bridge Guild's last survey, *older than the Kingdom that used to be here* — a phrase the Guild uses for exactly three things, of which the Stonebridge is the second. The bridge's stones are grey, fitted without mortar, and *not, by the Guild's measurement, moved by the river's current*. The river, by the same measurement, *tries*.
+
+The bridge is the Bridge Guild's masterwork and the Guild's seat. The Guild's Hall stands on the bridge's southern abutment, half a building over the water and half a building over the stone. The Guild's chief surveyor, Hallan Drift, lives in the Hall, and the Hall, by every account, *is older than the Guild*. The Guild has, by the Wandering Bard's count, *always* been the bridge's keeper. The bridge has, by the same count, *always* been *a bridge*. The bridge has, by the Hollow Hand's account, *never been a bridge*.
+
+The Black Sail Reavers have, by their own record, *tried three times* to burn the bridge — in the years 791, 803, and 819. The Reavers failed, on each occasion, *without the Guild saying how*. The Reavers have not tried again. The Guild, asked, will not, by the Wandering Bard's account, *say what the bridge is not*.
+
+**Relationships:** Masterwork and seat of The Bridge Guild. Crosses the Silverstream River at the narrowest point of the river's bend. Two miles long, fitted without mortar. Linked, by the Bridge Guild's roads, to Silverstream Keep, Crossroads Market, and Hollowmere Village. Tied, by the Silverstream Keep's garrison's oath, to free passage for the realm's knights. The Black Sail Reavers have tried, three times in living memory, to burn it — and failed, on each occasion, *without the Guild saying how*.
+
+**Dangers:** The bridge is, by the Bridge Guild's deepest ledger, *not a bridge*. The Guild's record reads: *the bridge is older than the Kingdom; the Kingdom grew up around the bridge; the bridge is still holding.* The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the bridge: *the bridge is older than the realm; the realm does not know it has a bridge; the bridge has been holding, in silence, since before the realm had a name.* The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the stone, which was not stone, kept the road that was not a road*. The Black Sail Reavers, asked, will not, by the Bard's account, *admit to having heard the verse*.
+
+### Saltcliff Cove
+
+**Type:** Location
+ | **Location:** (730, 350)
+
+*A small cove where salt is harvested from tidal pools, where the only enemies the harvesters will name are the weather and the prices — and where the Black Sail Reavers, by their own account, *were born*.*
+
+Saltcliff Cove is a small, sheltered cove on the western coast, three miles south of the Dawnwatch Lighthouse and a hard day's ride north of the Wreck of the Black Sails. The cove is, by the salt-harvesters' own account, *where the salt is taken from the sea* — the harvesters work the tidal pools at low tide, scrape the salt from the rocks, and load it onto the Free Caravan's midwinter wagons. The harvest is, by the same account, *never enough and never less*. The weather and the prices, by the same account, *are the only enemies*.
+
+The cove is, by the Black Sail Reavers' own account, *where the first Reavers were born*. The first Reaver-Captain, Mara Blacktide, came ashore at the cove, declared the western waters hers, and refused, by every account, to explain where she had been before. The cove's salt-harvesters are, by the Reavers' own account, *not Reavers* — a fact the harvesters will not, by the Wandering Bard's account, *say they are not*. The Reavers, asked, will not, by the same account, *say they are*.
+
+The cove is, by the Wandering Bard's account, *the second tavern the Bard visits on the longest night*. The Bard arrives at the cove's western pier, plays one song, and is gone before the tide turns. The salt-harvesters, by the Bard's account, *do not wake*. The salt-harvesters' children, by the same account, *wake, and remember, and do not say*.
+
+**Relationships:** On the western coast, three miles south of the Dawnwatch Lighthouse, a hard day's ride north of the Wreck of the Black Sails. The Black Sail Reavers' *birthplace*, by the Reavers' own account. The Free Caravan's midwinter salt-stop. The second tavern The Wandering Bard visits on the longest night. The Silverstream Keep's admiralty maintains a chart of the cove, on oath, *as if the cove were a separate ship*. The Ironforge Clan's smiths will not, by the Clan's own account, *use the cove's salt*.
+
+**Dangers:** The cove's salt is, by the salt-harvesters' own measurement, *one shade whiter than the sea's salt should be*. The harvesters will not, by the same account, *attempt to explain*. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the cove: *the cove is older than the Reavers; the Reavers are older than the sea; the sea does not know either is there.* The Wandering Bard, asked, has been heard to hum a verse whose last line, by the Bard's account, is: *and the salt, which was not salt, kept the tide that was not a tide*. The Ironforge Clan's Council, asked, has refused, in writing, to say *why* the Clan's smiths will not use the cove's salt.
+
+### The Old Battlefield
+
+**Type:** Location
+ | **Location:** (550, 150)
+
+*A field where a great battle was fought centuries ago, where no evil stirs — only history, weather, and the wind through the long grass — and where, by Vaelthrix the Endless's account, *the ground still hums*.*
+
+The Old Battlefield is a wide, flat field in the central lowlands, half a day's walk east of the Bleakmoor and a long day's walk south of Greenmark Farm. The field is, by the Bridge Guild's last survey, *where the last battle of the Demon Wars was fought* — the battle that, by the chronicle, *ended the Wars*. The field is, by the same survey, *where the ground is still humped in the shape of the armies that fell*. The humps are, by the same survey, *not graves*. The locals will not, by their own account, *say what the humps are*.
+
+The field is, by Vaelthrix the Endless's account, *where her sleep is closest to waking*. The dragon has, by the Whispering Roots' account, *dreamed the field three times* — the dragon's dreams, the Roots say, *leak into the world as weather*. The weather at the field, by the same account, *is the weather the dragon dreamed*. The field's weather is, by the locals' account, *wrong in a way the locals do not name*.
+
+The field is, by the Silverstream Keep's chronicle, *where Kira Dawnblade survived alone*. The chronicle reads, in a hand that is not the scribe's: *she said my name, and I did not know it was mine.* The chronicle has, by the same chronicle, *no other record of the battle*. The Wandering Bard, asked, has been heard to hum a verse whose last line, by the Bard's account, is: *and the field, which was not a field, kept the hum that was not a hum*.
+
+**Relationships:** In the central lowlands, half a day's walk east of the Bleakmoor, a long day's walk south of Greenmark Farm. Site of the last battle of the Demon Wars, by the Bridge Guild's last survey. Watched, in silence, by Vaelthrix the Endless — the dragon's dreams, by the Whispering Roots' account, *leak into the field as weather*. The Ironforge Clan's Council has, in writing, *forbidden* the Clan's miners from walking the field. The Silverstream Keep's garrison passes through, on oath, *without stopping* — the Keep does not say why. Kira Dawnblade is, by the Silver Order's chronicle, the only survivor of the battle whose name is on the field.
+
+**Dangers:** The field is, by Vaelthrix the Endless's account, *where her sleep is closest to waking*. The dragon's dreams, by the Whispering Roots' account, *leak into the field as weather* — and the field's weather is, by the locals' account, *wrong in a way the locals do not name*. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the field: *the field is older than the battle; the battle grew up around the field; the field is still listening.* The Silverstream Keep's chronicle has, on the final page, a single line in a hand that is not the scribe's: *she said my name, and I did not know it was mine.* The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the hum, which was not a hum, kept the name that was not a name*. The locals, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
+### Hollowmere Village
+
+**Type:** Location
+ | **Location:** (200, 380)
+
+*A fishing village on the shores of a quiet lake, where the folk are ordinary, the troubles are ordinary, and the only thing the villagers will not name is the lake's name.*
+
+Hollowmere Village is a small settlement of perhaps two hundred souls on the western shore of a quiet lake, two days west of Silverstream Keep and a long day's walk north of Greenmark Farm. The village lives on the lake's fish, on the Free Caravan's midwinter passage, and on the Circle of the Green's tending — the Circle's healers visit, by the village's own account, *more often than the village deserves*. The village's troubles are, by the same account, *ordinary* — the fish are fewer this year, the weather is colder this year, the children will not wake this year, *less often than the village would expect*.
+
+The village is, by the Wandering Bard's account, *the fourth tavern the Bard visits on the longest night*. The Bard arrives at the lake's western dock, plays one song, and is gone before the fishers wake. The fishers, by the Bard's account, *do not remember the song in the morning*. The fishers' children, by the same account, *wake, and remember, and do not say*.
+
+The village is, by the Bridge Guild's last survey, *older than the lake*. The Guild's surveyors will not, by the same account, *say how a village is older than a lake*. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the village: *the village is older than the lake; the lake grew up around the village; the village is still listening.*
+
+**Relationships:** On the western shore of a quiet lake, two days west of Silverstream Keep, a long day's walk north of Greenmark Farm. Tended, more often than the village deserves, by The Circle of the Green. The fourth tavern The Wandering Bard visits on the longest night. The Free Caravan passes through on its midwinter circuit. The Silverstream Keep's garrison passes through, on oath, *without stopping* — the Keep does not say why. The Hollow Hand has, by the Hand's own account, *tried to buy the village* — once.
+
+**Dangers:** The village is, by the Bridge Guild's last survey, *older than the lake*. The Guild's surveyors will not, by the same account, *say how a village is older than a lake*. The village's children, by the Wandering Bard's account, *wake, and remember, and do not say*. The Circle of the Green has, on three occasions in the last year, *brought the child* — the same child the Wandering Bard sang into being — to the village's edge, on the longest night. The village's fishers, asked, will not, by the Wandering Bard's account, *say what the child does at the lake*. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the village: *the village is older than the lake; the lake grew up around the village; the village is still listening.* The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the lake, which was not a lake, kept the listening that was not listening*.
+
+### Brackenhold Mine
+
+**Type:** Location
+ | **Location:** (380, 420)
+
+*A working iron mine in the foothills, where the miners are too busy to bother with prophecies — and where the Crimson Vein, by every miner's account, *is the only faction the mine has ever heard of*.*
+
+Brackenhold Mine is a working iron mine in the southern foothills, half a day's walk south of the Bleakmoor and a long day's walk east of the Howling Ravine. The mine is, by the Ironforge Clan's last audit, *the Clan's third-largest iron source* — a fact the Clan's foremen cite, by every miner's account, *in exactly the way the foremen should not*. The mine's miners are, by the same account, *too busy to bother with prophecies* — a fact the Clan's Council has, in writing, *cited as the mine's chief virtue*.
+
+The mine is, by the Crimson Vein's own account, *where the Vein began*. The Vein's founder, Veska Redvein, was, by the same account, *a Brackenhold miner* — a miner who went too deep, came back changed, and refused, by the Vein's own account, *to leave the deep even when the rest of her crew begged her*. The Vein's records, by the Wandering Bard's account, *are kept in the mine's lowest level* — a level the Ironforge Clan has, in writing, *forbidden its miners from entering*.
+
+The mine is, by the Wandering Bard's account, *where the realm's iron is the same colour every year*. The miners, asked, will not, by the same account, *say what colour that is*. The Ironforge Clan's foremen, asked, will not, by the same account, *say what colour the iron should be*.
+
+**Relationships:** In the southern foothills, half a day's walk south of the Bleakmoor, a long day's walk east of the Howling Ravine. The Ironforge Clan's third-largest iron source. The Crimson Vein's *birthplace* — the Vein's founder was a Brackenhold miner, by the Vein's own account. The Ironforge Clan's Council has, in writing, *forbidden* its miners from entering the mine's lowest level. The Wandering Bard has been heard, in three taverns, to hum a verse about the mine. The tavern-keepers will not, by the same account, *repeat the verse*.
+
+**Dangers:** The mine's lowest level, by the Crimson Vein's own account, *is the Vein's archive*. The Vein's record reads: *the level is not the mine's; the level is the Vein's; the Vein is the deep's; the deep is not, on the longest night, the deep.* The Ironforge Clan's deepest ledger contains, by the Clan's own account, a single entry for the mine: *the mine is older than the foothills; the foothills grew up around the mine; the mine is still listening.* The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the iron, which was not iron, kept the deep that was not deep.* The Ironforge Clan's foremen, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
+### Shadow Ridge Camp
+
+**Type:** Location
+ | **Location:** (280, 320)
+
+*A hidden encampment in the hills north of the Whisperwood, where the Thornwatch Rangers hold their oaths — and where, by every Ranger's account, the camp is the *only* place the wood has agreed not to remember.*
+
+Shadow Ridge Camp is a small, hidden encampment of perhaps thirty Rangers in the hills north of the Whisperwood, three miles west of the Old Standing Stones and a long day's walk north of the Silverleaf Sanctuary. The camp is, by the Thornwatch Rangers' own account, *where the Rangers hold their oaths* — the place the oaths are sworn, the place the oaths are kept, the place the oaths are *renewed*. The camp is, by the same account, *the only place the wood has agreed not to remember*.
+
+The camp is, by the Wandering Bard's account, *the first tavern the Bard visits on the longest night*. The Bard arrives at the camp's easternmost fire, plays one song, and is gone before the Rangers wake. The Rangers, by the Bard's account, *do not remember the song in the morning*. The Rangers' children, by the same account, *wake, and remember, and do not say*.
+
+The camp is, by the Silverstream Keep's intelligence division, *the only Thornwatch base the Keep has been able to map*. The division's record reads: *the camp is the Rangers' first base; the Rangers' second base is, by the Rangers' own account, deeper in the wood than any map shows.* The Rangers' second base is, by the Wandering Bard's account, *where the Rangers take their dying, take their oaths, and take their most-wanted criminals*. The Rangers, asked, will not, by the same account, *say where the second base is*.
+
+**Relationships:** In the hills north of Whisperwood Forest, three miles west of the Old Standing Stones, a long day's walk north of the Silverleaf Sanctuary. The Thornwatch Rangers' *first* base, by the Rangers' own account. The first tavern The Wandering Bard visits on the longest night. The Silverstream Keep's intelligence division has, on three occasions, *tried to map* the Rangers' second base — and, on each occasion, *failed to find it*. The Hollow Hand has, on three occasions in the last year, *sent couriers into the hills* — and, on each occasion, *the couriers have not come back*.
+
+**Dangers:** The Rangers' second base is, by the Wandering Bard's account, *deeper in the wood than any map shows*. The Bard's record reads: *the second base is not on any map; the second base is on the wood's map; the wood's map is, by the wood's account, not a map.* The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the camp: *the camp is older than the hills; the hills grew up around the camp; the camp is still listening.* The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the ridge, which was not a ridge, kept the oath that was not an oath.* The Silverstream Keep's intelligence division, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
+### The Hollow Crypt
+
+**Type:** Location
+ | **Location:** (450, 540)
+
+*An ancient crypt beneath a forgotten chapel, where the doors were sealed two centuries ago and the seals are weakening — and where, by the Hollow Hand's account, the doors were never the point.*
+
+The Hollow Crypt is an ancient crypt beneath a forgotten chapel in the southern lowlands, half a day's walk east of the Bone Orchard and a long day's walk south of the Wanderer's Rest. The crypt is, by the Bridge Guild's last survey, *where the doors were sealed two centuries ago* — a sealing the Guild's surveyors will not, by the same account, *say who ordered*. The seals are, by the same account, *weakening*. The Hollow Hand, asked, has, by the Wandering Bard's account, *refused to say whether the Hand is the reason*.
+
+The crypt is, by the Hollow Hand's own account, *where the Hand meets when the Hand must meet* — the place the Hand's seven Fingers gather, the place the Hand's ledger is kept, the place the Hand's *standing* judgments are issued. The crypt is, by the same account, *older than the chapel* — a phrase the Hand uses for exactly three things, of which the crypt is the first. The Hand's ledger is, by the Wandering Bard's account, *not the crypt's only ledger* — a fact the Hand will not, by the same account, *confirm or deny*.
+
+The crypt is, by the Wandering Bard's account, *where the realm's debts are kept*. The Bard's record reads: *the crypt is not the Hand's; the crypt is the realm's; the realm does not know it has a crypt; the crypt has been keeping, in silence, since before the realm had a name.* The Ironforge Clan's Council, asked, has refused, in writing, to comment. The Silverstream Keep's intelligence division, asked, has refused, in writing, to comment. The Whispering Court, asked, has refused, in writing, to comment.
+
+**Relationships:** In the southern lowlands, half a day's walk east of the Bone Orchard, a long day's walk south of the Wanderer's Rest. Meeting-place of The Hollow Hand when the Hand must meet. The Hand's ledger is kept here, by the Hand's own account. The Silverstream Keep's intelligence division has, on three occasions, *tried to map* the crypt — and, on each occasion, *the maps have not matched the crypt*. The Bone Orchard's charms are, by the Hand's own account, *mostly the Hand's*. The Wandering Bard has been heard, in three taverns, to hum a verse about the crypt. The tavern-keepers will not, by the same account, *repeat the verse*.
+
+**Dangers:** The doors, by the Hollow Hand's deepest ledger, *were not the point*. The Hand's record reads: *the doors were sealed; the seals are weakening; the doors are not, on the longest night, the doors.* The crypt is, by the Bridge Guild's last survey, *older than the chapel* — and the chapel, by the same survey, *is older than the lowlands*. The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the door, which was not a door, kept the debt that was not a debt.* The Hollow Hand's First Finger, asked, has refused, in writing, to comment. The current First Finger has, by the Wandering Bard's account, *not slept in three months*.
+
+### Crossroads Market
+
+**Type:** Location
+ | **Location:** (450, 200)
+
+*A bustling trade crossroads where no weapons may be drawn within a mile of the central post, by ancient treaty — and where, by the Free Caravan's account, the treaty is *the only law the realm has ever got right*.*
+
+Crossroads Market is a wide, open-air market at the meeting of four roads, a half-day's walk south of Silverstream Keep and a long day's walk east of Hollowmere Village. The market is, by the Bridge Guild's last survey, *where four roads meet* — the northern road to the Keep, the southern road to the lowlands, the western road to Hollowmere, the eastern road to the Greenmark farms. The market is, by the Free Caravan's account, *the one place in the realm where every faction is welcome* — a fact the Caravan enforces, on the Caravan's standing oath, *with a single bell*.
+
+The bell is, by the Caravan's account, *the one bell in the realm that has never been wrong*. The bell hangs from the central post — a single oak, by the Bridge Guild's last survey, *older than the roads* — and rings, on the Caravan's standing order, *when a weapon is drawn within a mile of the post*. The bell has, by the same account, *never been wrong*. The bell has, by the same account, *never been tested in anger*.
+
+The market is, by the Wandering Bard's account, *the sixth tavern the Bard visits on the longest night*. The Bard arrives at the central post, plays one song, and is gone before the caravans wake. The caravans, by the Bard's account, *do not remember the song in the morning*. The caravans' children, by the same account, *wake, and remember, and do not say*.
+
+**Relationships:** At the meeting of four roads, a half-day's walk south of Silverstream Keep, a long day's walk east of Hollowmere Village. The Free Caravan's *year-round* stop, by the Caravan's own account. The sixth tavern The Wandering Bard visits on the longest night. Tied, by the Bridge Guild's roads, to Silverstream Keep, Hollowmere Village, Greenmark Farm, and the southern lowlands. The Hollow Hand has, by the Hand's own account, *a permanent delegate* in the market — a delegate the Hand will not, by the Wandering Bard's account, *say is a delegate*. The Silverstream Keep's garrison passes through, on oath, *unarmed*.
+
+**Dangers:** The central post is, by the Bridge Guild's last survey, *older than the roads* — a phrase the Guild uses for exactly three things, of which the post is the first. The post is, by the Wandering Bard's account, *where the realm's treaties are kept*. The Bard's record reads: *the post is not the market's; the post is the realm's; the realm does not know it has a post; the post has been keeping, in silence, since before the realm had a name.* The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the market: *the market is older than the roads; the roads grew up around the market; the market is still listening.* The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the road, which was not a road, kept the treaty that was not a treaty.* The Ironforge Clan's Council, asked, has refused, in writing, to comment.
+
+### Willowfen Marsh
+
+**Type:** Location
+ | **Location:** (250, 480)
+
+*A quiet marsh with abundant reeds and herons — unremarkable, by every traveler's account, except to those who love it — and where, by the same accounts, the herons have been the same herons for as long as the marsh has been the marsh.*
+
+Willowfen Marsh is a wide, slow marsh in the southern lowlands, a half-day's walk north of the Bone Orchard and a long day's walk south of Greenmark Farm. The marsh is, by every traveler's account, *quiet* — the water is brown, the reeds are tall, the herons are abundant, the sky is the same colour as the water. The marsh is, by the same account, *unremarkable* — a fact the travelers cite, by the Wandering Bard's account, *in exactly the way the travelers should not*.
+
+The marsh is, by the Whispering Roots' account, *where the Roots' youngest are sent to listen*. The listening is, by the same account, *a practice the Roots do not explain*. The Roots' youngest are, by the Wandering Bard's account, *sent to the marsh for a year and a day, and return, on the same day, with the same herons in their hair*. The Roots, asked, will not, by the same account, *say what the herons mean*.
+
+The marsh is, by the Wandering Bard's account, *where the Wandering Bard does not visit on the longest night*. The Bard has, on three occasions in the last century, *tried*. The Bard has, on each occasion, *found the marsh quiet, and the herons watching, and the sky the same colour as the water*. The Bard has, on each occasion, *turned back*.
+
+**Relationships:** In the southern lowlands, a half-day's walk north of the Bone Orchard, a long day's walk south of Greenmark Farm. The Whispering Roots' *youngest-listening* place, by the Roots' own account. The Wandering Bard has, on three occasions in the last century, *tried to visit* — and turned back, each time, at the marsh's edge. The Silverstream Keep's garrison passes through, on oath, *without stopping*. The Bridge Guild's surveyors will not, by the Guild's own account, *enter the marsh*.
+
+**Dangers:** The herons are, by the Whispering Roots' own account, *the same herons* — the same herons, the Roots say, *who watched the marsh before the marsh was the marsh*. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the marsh: *the marsh is older than the lowlands; the lowlands grew up around the marsh; the marsh is still listening.* The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the reed, which was not a reed, kept the quiet that was not quiet.* The Roots' youngest, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
+### Greenmark Farm
+
+**Type:** Location
+ | **Location:** (500, 280)
+
+*The breadbasket of the southern plains — a working farm where the harvest, by every account, never fails and the grain, by the same account, is always the same colour.*
+
+Greenmark Farm is a large, working estate of two thousand acres on the southern plains, two days' ride east of Hollowmere Village and a hard day's walk north of the Old Battlefield. The farm is, by the Silverstream Keep's quartermaster's count, *the source of a third of the Keep's winter grain*. The farm is, by the Wandering Bard's account, *the source of a third of the realm's patience*.
+
+The farm is tended by the Circle of the Green — the smallest of the realm's three druidic orders, the one that stays closest to mortal life. The Circle's healers come to the farm at sowing and at harvest. The Circle's *child* — the same child the Wandering Bard sang into being — comes, by the Circle's account, *more often than that*. The harvest has not, by the farm's own record, *failed in seven generations*. The grain, by the same record, has not, in those seven generations, *changed colour*.
+
+The Free Caravan passes through, on its midwinter circuit, in a week the farm is, by the Caravan reckoning, *not open*. The farm is open, the rest of the year, to anyone who can work. The farm is, by the Hollow Hand's deepest ledger, *the one place the Hand has not tried to buy*. The farm is, by the same ledger, *the one place the Hand has, on three occasions, tried to be forgiven in*.
+
+**Relationships:** Two days' ride east of Hollowmere Village, a hard day's walk north of the Old Battlefield. Tended by The Circle of the Green, in cooperation with the farm's own household. The Free Caravan passes through on its midwinter circuit, in a week the farm is *not open*. The Silverstream Keep's quartermaster maintains a permanent grain-contract. The Hollow Hand has, by the Hand's own account, *tried to be forgiven here, three times*. The Wandering Bard has been heard, in three taverns, to hum a verse about the farm. The tavern-keepers will not, by the same account, *repeat the verse*.
+
+**Dangers:** The grain's colour, by the farm's own record, *has not changed in seven generations*. The colour is, by the Circle of the Green's measurement, *one shade lighter than the grain the soil should produce*. The Circle will not, by the same account, *say what the shade means*. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the farm: *the farm is older than the plains; the plains grew up around the farm; the farm is still feeding.* The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the grain, which was not grain, kept the patience that was not patience.* The farm's household, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
+### The Wanderer's Rest
+
+**Type:** Location
+ | **Location:** (450, 450)
+
+*A roadside inn at a lonely crossroads, where the ale is good, the beds are decent, and the innkeeper, by the Wandering Bard's account, has never asked a question.*
+
+The Wanderer's Rest is a two-storey timber inn at the crossroads where the southern road meets the marsh-road, half a day's ride south of Hollowmere Village and a long day's walk from the Old Battlefield. The inn has, by its own sign, *good ale, decent beds, no questions asked*. The sign has hung, by the innkeeper's account, *for as long as the inn has stood*. The sign has, by the same account, *never been taken down*.
+
+The inn is the Free Caravan's midwinter stop — the place the Caravan unloads one wagon's worth of salt, and the place the innkeeper unloads one wagon's worth of *whatever the Caravan will not say it is carrying*. The inn is, by the Wandering Bard's account, *the third tavern the Bard visits on the longest night*. The Bard arrives at dusk. The Bard plays one song. The Bard leaves. The innkeeper, by every other account, *knows which song*.
+
+The innkeeper is, by the Hollow Hand's deepest ledger, *a Hand-keeper of a kind the Hand does not advertise*. The innkeeper's ledger — a small leather book, kept under the bar, opened only at year's end — is, by the same ledger, *a copy of a copy of a copy*. The Wandering Bard, asked whether the innkeeper is *with* the Hand, has been heard to sing a verse whose last line, by the Bard's account, is: *the keeper keeps; the kept are not the keeper*.
+
+**Relationships:** At the crossroads where the southern road meets the marsh-road, half a day's ride south of Hollowmere Village, a long day's walk from the Old Battlefield. On The Free Caravan's midwinter route. The third tavern The Wandering Bard visits on the longest night. Watched, in mutual silence, by the Hollow Hand — whose deepest ledger calls the innkeeper *a Hand-keeper of a kind the Hand does not advertise*. The Silverstream Keep's garrison passes through, on oath, *without stopping* — the Keep does not say why.
+
+**Dangers:** The innkeeper's ledger, kept under the bar, is, by the Hollow Hand's deepest ledger, *the only ledger the Hand has ever duplicated*. The Hand's record reads: *the ledger is not ours; the keeper is not ours; the keeping is the keeper's; we are kept by the keeping.* The innkeeper has, by the Wandering Bard's account, *served the same three songs in the same order on the longest night for forty years*. The innkeeper will not, by the same account, *say which song is third*. The Wandering Bard will not, by the Bard's own account, *say which song is third either*.
+
+### The Silverleaf Sanctuary
+
+**Type:** Location
+ | **Location:** (250, 100)
+
+*A monastery and infirmary in a quiet glade at the edge of the Whisperwood, where wounded from any faction are tended and where the *child* of the Circle of the Green has been waiting, by the Circle's account, since before the realm had a name.*
+
+The Silverleaf Sanctuary is a small monastery of stone and thatch, hidden in a glade at the eastern edge of the Whisperwood, a hard day's walk from any village and a half-day's walk from the Sanctuary's nearest well. The Sanctuary is, by the Bridge Guild's last survey, *older than the wood that surrounds it* — a phrase the Guild uses for exactly three things, of which the Sanctuary is the third.
+
+The Sanctuary is the Circle of the Green's seat — the place the Circle's healers are trained, the place the Circle's oaths are sworn, the place the Circle's *child* lives. The child is, by the Wandering Bard's account, *the same child the Bard sang into being in the year of the Demon Wars' end*. The child has not, by the Circle's account, *aged*. The child grows new leaves every spring. The child has been, by the Circle's account, *waiting for someone to come home, and will not say who*.
+
+The Sanctuary tends wounded from any faction, on the Circle's standing oath — an oath that has, by the Ironforge Clan's count, *held even for the Crimson Vein*. The Sanctuary has, by the same count, *refused to turn anyone away, in living memory, twice*. The Sanctuary has not, by anyone's account, *recorded who those two were*.
+
+**Relationships:** At the eastern edge of Whisperwood Forest, a hard day's walk from any village. Seat of The Circle of the Green. Tends wounded from any faction, including the Crimson Vein. The Wandering Bard's *second* tavern, on the longest night — the Bard arrives by starlight, plays one song in the courtyard, and is gone before the child wakes. Zephyrus the Oracle has been seen, three times this year, at the Sanctuary's gate.
+
+**Dangers:** The Sanctuary is, by the Bridge Guild's measurement, *older than the wood* — and the wood, by the Hollow Hand's scholarship, *is older than the realm*. The Sanctuary has, by the same scholarship, *a cellar the Guild will not survey*. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the Sanctuary: *the Sanctuary is older than the child; the child is older than the realm; the realm does not know either is there.* The child has been heard, in three different summers, humming a song whose last line, by the Wandering Bard's account, is: *and the home, which was not a home, kept the waiting that was not waiting.* The Wandering Court, asked, has refused, in writing, to comment.
+
+### The Sunken Temple
+
+**Type:** Location
+ | **Location:** (180, 450)
+
+*Half-submerged ruins at the meeting of the river and the marshes, where the bells, by the local fishermen's account, still ring on the longest night — and where, by the Hollow Hand's account, the ringing has never stopped.*
+
+The Sunken Temple is a roofless ruin at the southern edge of the realm, where the Silverstream River meets the Willowfen marshes. The temple is, by the Bridge Guild's last survey, *half-submerged at all times, fully submerged at the year's three highest tides, and never fully above water even at the lowest*. The temple's stones are grey, fitted without mortar in a way the modern Guild cannot reproduce, and the temple's bell-tower is, by the Guild's count, *the only part of the temple that is, at any hour, above the waterline*.
+
+The local fishermen say the bells still ring on the longest night. The fishermen are, by the Hollow Hand's own account, *correct*. The bells are heard, on the longest night, in *every* temple in the realm — by the Whispering Court's count, in temples the Court has surveyed, in temples the Court has not, and in *one temple the Court has refused, in writing, to name*. The bells are heard, by the Wandering Bard's account, *in the same three tones, in the same three orders, every year*. The Bard will not, by the same account, *say what the three tones mean*.
+
+The temple is, by the Hollow Hand's deepest ledger, *a Hand-port the Hand does not advertise*. The Hand maintains, by the same ledger, a permanent delegation at the temple — a delegation that has not, by any outside measurement, *been seen to leave*.
+
+**Relationships:** At the meeting of the Silverstream River and Willowfen Marsh. A day's walk from the Sunken Temple's nearest village. The Hollow Hand maintains, by the Hand's own claim, a permanent delegation here. The bells, on the longest night, are heard in *every* temple in the realm. The local fishermen leave offerings, in three tones, on the temple's lowest stone. The Silverstream Keep's admiral has tried, three times, to send a longboat to chart the temple. None of the three have come back with a chart.
+
+**Dangers:** The bells are, by the Hollow Hand's deepest ledger, *the same bells the Hand rings in the Hollow Crypt*. The Hand's record reads: *the bells are not ours; the bells are the realm's; the realm does not know it has the bells; the realm has been ringing them, in three tones, since before the realm had a name.* The Wandering Bard, asked, has been heard to hum a verse whose last line, by the Bard's account, is: *and the bell, which was not a bell, kept the tone that was not a tone.* The temple's deepest stone is, by the Bridge Guild's last survey, *older than the temple*. The Guild has refused, in writing, to publish the survey.
+
+### The Dawnwatch Lighthouse
+
+**Type:** Location
+ | **Location:** (700, 100)
+
+*A coastal lighthouse tended by an order of beacon-keepers, whose light has guided ships safely for two centuries — and which the Black Sail Reavers, by their own account, *man in winter, when no one else will*.*
+
+The Dawnwatch Lighthouse is a tall stone tower on the western coast, three miles north of Saltcliff Cove, on a headland the Bridge Guild's charts mark as *the highest point of the western shore*. The lighthouse has, by the Guild's count, *two centuries* of unbroken service. The lighthouse has, by the Black Sail Reavers' own count, *two centuries of unbroken service, including the winters* — the winters being, by the Reavers' reckoning, *the seasons the beacon-keepers do not man the light*.
+
+The beacon-keepers are an order of fourteen, who take their oaths at the lighthouse and tend the light from spring to autumn. The order has, by the Reavers' account, *always* been fourteen. The Reavers, by the same account, have *always* been the ones who man the light in winter — a fact the Reavers do not, by the Wandering Bard's account, *advertise*. The Reavers' light, by the Bard's account, *is not the same colour as the beacon-keepers'* — a fact the Bard does not, by the same account, *say he has measured*.
+
+The lighthouse's light has, by the Silverstream Keep's admiralty, *been seen from inland* — on three occasions in the last century, on nights when the lighthouse was, by the admiralty's own account, *manned and unlit*. The Wandering Bard, asked, has been heard to sing a verse whose last line, by the Bard's account, is: *and the light, which was not a light, kept the watch that was not a watch*.
+
+**Relationships:** Three miles north of Saltcliff Cove, on the highest point of the western shore. Tended, in summer, by the beacon-keepers. Manned, in winter, by the Black Sail Reavers — a fact the Reavers do not advertise. The Silverstream Keep's admiralty maintains a chart of the lighthouse's light, on oath, *as if the light were a separate ship*. The Wreck of the Black Sails is visible from the lighthouse's top window, on clear nights.
+
+**Dangers:** The lighthouse's light has, by the Silverstream Keep's admiralty, *been seen from inland* on three occasions in the last century — on nights when the lighthouse was, by the admiralty's own account, *manned and unlit*. The admiralty's record reads: *the light was not the lighthouse's; the light was the lighthouse's keeper's; the keeper was not, on those three nights, the order's.* The Wandering Bard, asked at a tavern whether the Reavers' winter-light is *the same light*, has been heard to hum: *the keeper keeps; the kept are not the keeper.* The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the lighthouse: *the lighthouse is older than the order; the order is older than the coast; the coast does not know either is there*.
+
+### The Wreck of the Black Sails
+
+**Type:** Location
+ | **Location:** (750, 470)
+
+*A pirate ship that came in with the tide and never left, whose crew are, by the Black Sail Reavers' own account, *still aboard, mostly* — and whose flag, by the Hollow Hand's account, has been raised in three ports that the ship has not visited.*
+
+The Wreck of the Black Sails is a three-masted galleon on a black-sand beach at the western edge of Saltcliff Cove, half a mile from the cove's working harbour. The wreck is, by the Bridge Guild's last survey, *intact* — masts standing, sails furled, hull above the waterline — a fact the Guild's surveyors have, on three occasions, attempted to verify and, on three occasions, *returned to find unchanged*. The wreck's crew are, by the Black Sail Reavers' own account, *still aboard, mostly* — a phrase the Reavers will not, by the Wandering Bard's account, *refine*.
+
+The wreck is, by the Reavers' reckoning, the *first* Reaver-flagged ship — the ship Mara Blacktide came ashore in, the ship the first Reaver-Captain sailed under, the ship the *second* Reaver-Captain refused to sail again. The wreck is, by the Hollow Hand's deepest ledger, *the Hand's only permanent sea-delegation* — a delegation that has not, by any outside measurement, *been seen to leave the wreck*.
+
+The wreck's flag has, by the Wandering Bard's account, *been raised in three ports the ship has not visited* — on the longest night of the last three years, in three ports on three different coasts. The Bard will not, by the same account, *say which ports*. The Reavers, asked, will not, by the Bard's account, *admit to having raised the flag*. The Bard, asked, has been heard to hum a verse whose last line, by the Bard's account, is: *and the flag, which was not a flag, kept the crew that was not a crew*.
+
+**Relationships:** On the western edge of Saltcliff Cove, half a mile from the cove's working harbour. The Black Sail Reavers' *first* ship, by the Reavers' own reckoning. The Hollow Hand maintains, by the Hand's own claim, a permanent delegation aboard. The Dawnwatch Lighthouse can see the wreck's topmost mast, on clear nights. The Silverstream Keep's admiralty has, on three occasions, sent ships to *salvage* the wreck. None of the three have come back with salvage.
+
+**Dangers:** The crew are, by the Black Sail Reavers' own count, *still aboard, mostly*. The Reavers' record reads: *the crew are not ours; the crew are the wreck's; the wreck is the sea's; the sea is not, on the longest night, the sea.* The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the wreck: *the wreck is older than the Reavers; the Reavers are older than the sea; the sea does not know either is there*. The Wandering Bard, asked at a tavern, has been heard to sing a verse whose last line, by the Bard's account, is: *and the sea, which was not a sea, kept the ship that was not a ship*. The Silverstream Keep's admiral, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
+### The Howling Ravine
+
+**Type:** Location
+ | **Location:** (570, 60)
+
+*A narrow gorge where the wind speaks in voices that are not the wind — and where the things the wind carries out, by the Crimson Vein's account, are not the things the wind carries in.*
+
+The Howling Ravine is a narrow, half-mile-long gorge in the northern foothills, where the wind from the Frostpeak passes funnels through a stone throat and emerges, by the Ironforge Clan's account, *changed*. The wind enters the ravine from the north. The wind leaves the ravine from the south. The wind in between, by the Crimson Vein's account, *speaks*. The Vein's walkers, who are the only faction that goes into the ravine by choice, say the wind says their own names, in voices the Vein will not, by the Wandering Bard's account, *name*.
+
+The ravine is the Crimson Vein's northern outpost — the place the Vein's deepest shafts reach, the place the Vein's oldest Vein-walkers go to *listen*. The listening is, by the Vein's own account, *a practice the Vein does not teach*. The Ironforge Clan's foremen, asked about the ravine, have said only: *we do not go into the ravine; we did, and we do not go into the ravine*. The Ironforge Council has, in writing, *forbidden* the Clan's miners from entering the ravine.
+
+The ravine is, by the Wandering Bard's account, *the place the wind keeps the things it has carried out*. The things are, by the same account, *not the things the wind carried in*. The Bard will not, by the Bard's own account, *say what the things are*. The Vein's walkers, asked, will not, by the Wandering Bard's account, *answer in their own voices*.
+
+**Relationships:** In the northern foothills, downstream of the Frostpeak passes. Northern outpost of The Crimson Vein. Forbidden, in writing, to the Ironforge Clan's miners. A half-day's walk from Brackenhold Mine. The Vein's walkers, who are the only faction that goes into the ravine by choice, say the wind speaks in voices the Vein will not name. The Wandering Bard has been heard, in three taverns, to hum a verse about the ravine. The bartenders will not, by the same account, *repeat the verse*.
+
+**Dangers:** The wind's voices, by the Crimson Vein's deepest records, *are the voices of Vein-walkers who went into the ravine and did not come out*. The Vein's record reads: *the voices are not ours; the voices are the ravine's; the ravine is the wind's; the wind is not, on the longest night, the wind.* The Ironforge Clan's deepest ledger contains, by the Clan's own account, a single entry for the ravine: *the ravine is older than the passes; the passes grew up around the ravine; the ravine is still listening.* The Wandering Bard, asked, has been heard to hum: *and the wind, which was not a wind, kept the voice that was not a voice.* The Vein's walkers, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
+### The Bone Orchard
+
+**Type:** Location
+ | **Location:** (400, 510)
+
+*A grove of dead trees hung with old charms, where something in there practices, by every neighbour's account, *a wrong kind of magic* — and where the trees, by the Hollow Hand's account, have not stopped growing.*
+
+The Bone Orchard is a small grove of dead trees on a low rise in the southern lowlands, half a day's walk from the Hollow Crypt and a long day's walk from any village. The trees are, by every visitor's account, dead — the bark is grey, the branches are bare, the leaves have not, by any visitor's memory, *been seen*. The trees are, by the same accounts, *hung with charms* — small leather pouches, knotted cords, bones carved into shapes the visitors will not, by their own account, *name*.
+
+The Orchard is, by the Hollow Hand's deepest ledger, *the Hand's southernmost port* — a port the Hand does not, by the same account, *advertise*. The charms are, by the Hand's account, *the Hand's, mostly*. The charms are, by the same account, *not the Hand's, all*. The Hand will not, by the Wandering Bard's account, *say whose charms the others are*.
+
+The trees, by the Hand's deepest ledger, *have not stopped growing*. The Hand's record reads: *the trees are not dead; the trees are the dead; the dead are the Orchard's; the Orchard is the Hand's; the Hand is not, on the longest night, the Hand.* The Wandering Bard, asked, has been heard to hum a verse whose last line, by the Bard's account, is: *and the tree, which was not a tree, kept the bone that was not a bone*.
+
+**Relationships:** Half a day's walk from the Hollow Crypt. A long day's walk from any village. The Hollow Hand maintains, by the Hand's own claim, charms on most of the trees. The neighbours — the Brackenhold miners, the Hollowmere villagers — leave offerings at the Orchard's edge, in writing, *once a year*. The Silverstream Keep's garrison passes through, on oath, *without stopping* — the Keep does not say why. The Wandering Bard has been heard, in three taverns, to hum a song the tavern-keepers will not, by the same account, *repeat*.
+
+**Dangers:** The trees, by the Hollow Hand's deepest ledger, *grow downward*. The Hand's record reads: *the trees are not dead; the trees are growing into the ground; the ground is not, on the longest night, the ground.* The Ironforge Clan's deepest ledger contains, by the Clan's own account, a single entry for the Orchard: *the Orchard is older than the lowlands; the lowlands grew up around the Orchard; the Orchard is still listening.* The Wandering Bard, asked, has been heard to sing a verse whose last line, by the Bard's account, is: *and the bone, which was not a bone, kept the root that was not a root*. The Bard's tavern-keepers, asked about the verse, will not, by the Bard's own account, *admit to having heard it*.
+
+### Oak Valley Village
+
+**Type:** Location
+ | **Location:** (150, 250)
+
+*A peaceful farming village at the western edge of the Whisperwood, where the only thing the locals will say about the village's single oak is that it has never, by their account, lost a leaf.*
+
+Oak Valley Village is a small settlement of perhaps a hundred souls in a sheltered valley at the western edge of the Whisperwood, three miles east of Pinegrove Logging Camp and a half-day's walk from Hollowmere Village. The village lives on the farm's grain, on the wood's edge-game, and on the Circle of the Green's tending — the Circle visits, by the village's own account, *more often than the village deserves*.
+
+The village has a single oak at its centre, on a rise the village is named for. The oak is, by every visitor's account, *older than the village*. The oak has, by the village's own record, *never lost a leaf*. The oak is, by the Circle of the Green's measurement, *the same temperature as the wood's edge, year-round* — a fact the Circle does not, by its own account, *attempt to explain*.
+
+The village is, by the Wandering Bard's account, *the fifth tavern the Bard visits on the longest night*. The Bard arrives at the oak at midnight. The Bard plays one song. The villagers, by the Bard's account, *do not wake*. The villagers, by the village's own account, *do not remember the song in the morning*. The village's children, by the Wandering Bard's account, *wake, and remember, and do not say*.
+
+**Relationships:** On the western edge of Whisperwood Forest, three miles east of Pinegrove Logging Camp, a half-day's walk from Hollowmere Village. Tended, more often than the village deserves, by The Circle of the Green. The fifth tavern The Wandering Bard visits on the longest night. The Silverstream Keep's garrison passes through, on oath, *without stopping* — the Keep does not say why. The Ironforge Clan's smiths will not, by the Clan's own account, *enter the village*. The Clan's reason, the Council has said in writing, is *the oak*.
+
+**Dangers:** The oak has, by the Circle of the Green's measurement, *the same temperature as the wood's edge, year-round* — a fact the Circle does not, by the Circle's own account, *attempt to explain*. The Ironforge Clan's deepest ledger contains, by the Clan's own account, a single entry for the village: *the village is older than the valley; the valley grew up around the village; the village is still listening*. The Wandering Bard, asked, has been heard to hum a verse whose last line, by the Bard's account, is: *and the leaf, which was not a leaf, kept the green that was not green*. The village's children, asked, will not, by the Wandering Bard's account, *say what they remember*.
+
+### The Witchfen
+
+**Type:** Location
+ | **Location:** (70, 420)
+
+*A peat-bog at the western edge of the realm where something wrong lives in the water — and where, by every traveler's account, the water has the traveler's own voice.*
+
+The Witchfen is a wide, slow peat-bog at the western edge of the realm, a long day's walk west of Pinegrove Logging Camp and a half-day's walk north of the Bone Orchard. The bog is, by every traveler's account, *wrong* — the water is brown, the reeds are tall, the peat sucks at boots. The bog is, by the same accounts, *where the traveler's own voice comes from* — the bog's reeds carry, on still nights, voices the travelers recognise, voices the travelers will not, by their own account, *name*.
+
+The bog is, by the Pinegrove woodcutters' account, *where the wood's attention ends*. The woodcutters will not, by the same account, *enter the bog*. The woodcutters will, in writing, *say only that the bog listens*. The Whispering Roots, asked, have said only that the bog is *a place the wood has agreed not to remember*.
+
+The bog is, by the Wandering Bard's account, *the place the Wandering Bard does not visit on the longest night*. The Bard has, on three occasions in the last century, *tried*. The Bard has, on each occasion, *turned back at the bog's edge*. The Wandering Court, asked, has refused, in writing, to comment. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the bog: *the bog is older than the wood; the wood grew up around the bog; the bog is still listening*.
+
+**Relationships:** At the western edge of the realm. A long day's walk west of Pinegrove Logging Camp, a half-day's walk north of the Bone Orchard. The Pinegrove woodcutters will not, by their own account, *enter the bog*. The Whispering Roots, asked, have said only that the bog is *a place the wood has agreed not to remember*. The Wandering Bard has, on three occasions in the last century, *tried to visit* — and turned back, each time, at the bog's edge. The Wandering Court, asked, has refused to comment.
+
+**Dangers:** The voices in the reeds are, by the Hollow Hand's deepest ledger, *the voices of people who went into the bog and did not come out*. The Hand's record reads: *the voices are not ours; the voices are the bog's; the bog is the water's; the water is not, on the longest night, the water.* The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the voice, which was not a voice, kept the name that was not a name*. The woodcutters, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
+### Pinegrove Logging Camp
+
+**Type:** Location
+ | **Location:** (90, 280)
+
+*A woodcutter camp at the western edge of the Whisperwood, where the loggers respect the forest's edge — because, by the camp's own account, they have seen what happens when they don't.*
+
+Pinegrove Logging Camp is a working camp of perhaps thirty loggers on the western edge of the Whisperwood, three miles west of Oak Valley Village and a long day's walk north of the Witchfen. The camp lives on the wood's edge-pine — a slow-growing, dense-grained pine the camp has, by the Bridge Guild's count, *harvested for two centuries without diminishing*. The Guild's surveyors will not, by the same count, *say why the pine has not diminished*.
+
+The camp is, by the Whispering Roots' account, *the place the wood has agreed to tolerate*. The Roots do not, by the same account, *say what they tolerate*. The camp's loggers, by the Wandering Bard's account, *respect the forest's edge*. The loggers will not, by the same account, *say what they have seen*. The loggers will, in writing, *say only that the wood's edge is not the wood's edge*.
+
+The camp is, by the Thornwatch Rangers' account, *the only camp the Rangers will guide*. The Rangers have, on three occasions in the last year, *left silver-tipped arrows* at the camp's easternmost tree. The camp's loggers have, on three occasions, *returned the arrows to the tree, with a single iron coin*. The exchange is, by the Wandering Bard's account, *older than the camp*.
+
+**Relationships:** On the western edge of Whisperwood Forest, three miles west of Oak Valley Village, a long day's walk north of the Witchfen. Tolerated, by the Whispering Roots, in a way the Roots will not specify. Guided, on three occasions in the last year, by The Thornwatch Rangers — the exchange of silver-tipped arrows and iron coins is, by the Wandering Bard's account, *older than the camp*. The Silverstream Keep's garrison passes through, on oath, *without stopping*. The Bridge Guild's surveyors will not, by the Guild's own account, *enter the camp*.
+
+**Dangers:** The camp's loggers, by the Wandering Bard's account, *have seen what happens when the wood's edge is not respected*. The loggers will not, by the same account, *say what they have seen*. The loggers will, in writing, *say only that the wood's edge is not the wood's edge*. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the camp: *the camp is older than the wood; the wood grew up around the camp; the camp is still listening*. The Wandering Bard, asked, has been heard to hum: *and the edge, which was not an edge, kept the wood that was not a wood*. The Rangers, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
+### The Bleakmoor
+
+**Type:** Location
+ | **Location:** (520, 380)
+
+*A fog-shrouded moor where travelers lose their way, where the locals leave milk on the stones so whatever lives there won't follow them home — and where, by the locals' account, the moor has its own calendar.*
+
+The Bleakmoor is a wide, fog-shrouded moor in the central lowlands, half a day's walk north of Brackenhold Mine and a long day's walk east of the Old Battlefield. The moor is, by every traveler's account, *where the way is lost*. The fog is constant. The paths are, by the Bridge Guild's last survey, *not the paths the Guild's maps show*. The travelers leave, by their own account, *having walked a longer way than they walked in*.
+
+The moor is, by the locals' account, *where the milk is left*. The locals — the Brackenhold miners, the Hollowmere villagers, the Oak Valley farmers — leave a small bowl of milk on the westernmost stone, on the night of the new moon, in a practice the locals will not, by their own account, *say who taught them*. The milk is, by the locals' account, *for whatever lives there*. The whatever, by the same account, *does not follow the milkers home*.
+
+The moor is, by the Wandering Bard's account, *where the realm's calendar is wrong*. The Bard has, on three occasions in the last year, *tried to walk the moor at the new moon*. The Bard has, on each occasion, *come out at a different season*. The Bard will not, by the same account, *say which season*.
+
+**Relationships:** Half a day's walk north of Brackenhold Mine, a long day's walk east of the Old Battlefield. The locals — the Brackenhold miners, the Hollowmere villagers, the Oak Valley farmers — leave milk on the westernmost stone, on the night of the new moon. The Bridge Guild's surveyors will not, by the Guild's own account, *enter the moor*. The Wandering Bard has, on three occasions in the last year, *tried to walk the moor at the new moon* — and come out, each time, at a different season. The Silverstream Keep's garrison passes through, on oath, *without stopping* — the Keep does not say why.
+
+**Dangers:** The travelers leave the moor, by their own account, *having walked a longer way than they walked in*. The Hollow Hand's deepest ledger contains, by the Hand's own account, a single entry for the moor: *the moor is older than the lowlands; the lowlands grew up around the moor; the moor is still listening*. The Wandering Bard, asked at a tavern, has been heard to hum a verse whose last line, by the Bard's account, is: *and the mist, which was not a mist, kept the way that was not a way*. The locals, asked, will not, by the Wandering Bard's account, *admit to having heard the verse*.
+
 ## 👤 Characters
 
 ### Mira the Merchant
@@ -504,34 +861,6 @@ The Clock is the only entity in the realm that the Whispering Court has issued, 
 
 **Secrets:** The Clock's second tick, by the Hollow Hand's deepest ledger, *did not happen*. The Hand's record reads: *the second tick was stolen; the thief was the realm itself; the realm does not know it has the tick; the realm has been paying, in years, ever since.* The Whispering Court, asked, in private session, what was stolen, has not, by the Wandering Bard's account, said in writing. The Wandering Bard, asked at a tavern, has been heard to sing: *and the clock, who was not a clock, kept the time that was not time.*
 
-## TBD / no lore yet
-
-The following entities have no `lore_*` fields yet. Add lore to them by setting `properties_string.lore_*` and re-running `scripts/generate_lore_md.py`.
-
-### Locations (21)
-
-- The Stonebridge
-- The Bone Orchard
-- Willowfen Marsh
-- Hollowmere Village
-- The Sunken Temple
-- Brackenhold Mine
-- Shadow Ridge Camp
-- Crossroads Market
-- Oak Valley Village
-- The Wreck of the Black Sails
-- The Witchfen
-- The Wanderer's Rest
-- The Silverleaf Sanctuary
-- Greenmark Farm
-- Saltcliff Cove
-- The Hollow Crypt
-- Pinegrove Logging Camp
-- The Bleakmoor
-- The Howling Ravine
-- The Dawnwatch Lighthouse
-- The Old Battlefield
-
 ---
 
-*Last generated: 2026-06-16 13:19 CEST — by `scripts/generate_lore_md.py`. Source: 28/49 entities with lore.*
+*Last generated: 2026-06-16 17:28 CEST — by `scripts/generate_lore_md.py`. Source: 49/49 entities with lore.*

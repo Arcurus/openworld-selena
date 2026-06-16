@@ -99,11 +99,34 @@ CHARACTER_ORDER = [
 # in the first location pass. The remaining 21 locations stay in the
 # TBD section until a later pass.
 LOCATION_ORDER = [
+    # Batch 1 (2026-06-15) — 5 narrative-anchor locations
     "Silverstream Keep",
     "Whisperwood Forest",
     "The Ashen Spire",
     "The Drowned City",
     "The Old Standing Stones",
+    # Batch 2 (2026-06-16) — 21 remaining locations, in narrative importance order
+    "The Stonebridge",
+    "Saltcliff Cove",
+    "The Old Battlefield",
+    "Hollowmere Village",
+    "Brackenhold Mine",
+    "Shadow Ridge Camp",
+    "The Hollow Crypt",
+    "Crossroads Market",
+    "Willowfen Marsh",
+    "Greenmark Farm",
+    "The Wanderer's Rest",
+    "The Silverleaf Sanctuary",
+    "The Sunken Temple",
+    "The Dawnwatch Lighthouse",
+    "The Wreck of the Black Sails",
+    "The Howling Ravine",
+    "The Bone Orchard",
+    "Oak Valley Village",
+    "The Witchfen",
+    "Pinegrove Logging Camp",
+    "The Bleakmoor",
 ]
 DRAGON_ORDER = ["Vaelthrix the Endless"]
 ARTIFACT_ORDER = ["The Shadow Crown"]
