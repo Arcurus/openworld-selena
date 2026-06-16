@@ -54,11 +54,15 @@ from lore_data import (
     MIRA_THE_SCRIBE,
     ZEPHYRUS_THE_ORACLE,
     KIRA_DAWNBLADE,
+    THE_WANDERING_BARD,
+    VELORA_THE_UNDYING,
+    ELDER_MOONTHORN,
     SILVERSTREAM_KEEP,
     WHISPERWOOD_FOREST,
     THE_ASHEN_SPIRE,
     THE_DROWNED_CITY,
     THE_OLD_STANDING_STONES,
+    WORLD_CLOCK,
 )
 
 API = "http://localhost:8081/api"
@@ -85,11 +89,15 @@ LORE_TO_ENTITY_NAME = {
     "MIRA_THE_SCRIBE": "Mira the Scribe",
     "ZEPHYRUS_THE_ORACLE": "Zephyrus the Oracle",
     "KIRA_DAWNBLADE": "Kira Dawnblade",
+    "THE_WANDERING_BARD": "The Wandering Bard",
+    "VELORA_THE_UNDYING": "Velora the Undying",
+    "ELDER_MOONTHORN": "Elder Moonthorn",
     "SILVERSTREAM_KEEP": "Silverstream Keep",
     "WHISPERWOOD_FOREST": "Whisperwood Forest",
     "THE_ASHEN_SPIRE": "The Ashen Spire",
     "THE_DROWNED_CITY": "The Drowned City",
     "THE_OLD_STANDING_STONES": "The Old Standing Stones",
+    "WORLD_CLOCK": "World Clock",
 }
 
 LORE_DATA_BY_VAR = {
@@ -112,11 +120,15 @@ LORE_DATA_BY_VAR = {
     "MIRA_THE_SCRIBE": MIRA_THE_SCRIBE,
     "ZEPHYRUS_THE_ORACLE": ZEPHYRUS_THE_ORACLE,
     "KIRA_DAWNBLADE": KIRA_DAWNBLADE,
+    "THE_WANDERING_BARD": THE_WANDERING_BARD,
+    "VELORA_THE_UNDYING": VELORA_THE_UNDYING,
+    "ELDER_MOONTHORN": ELDER_MOONTHORN,
     "SILVERSTREAM_KEEP": SILVERSTREAM_KEEP,
     "WHISPERWOOD_FOREST": WHISPERWOOD_FOREST,
     "THE_ASHEN_SPIRE": THE_ASHEN_SPIRE,
     "THE_DROWNED_CITY": THE_DROWNED_CITY,
     "THE_OLD_STANDING_STONES": THE_OLD_STANDING_STONES,
+    "WORLD_CLOCK": WORLD_CLOCK,
 }
 
 LORE_FIELDS = ["lore_summary", "lore_description", "lore_relationships", "lore_secrets"]
