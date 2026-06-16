@@ -333,10 +333,10 @@ impl World {
         if max == min {
             return "medium";
         }
-        
+
         let range = max - min;
         let position = (value - min) / range;
-        
+
         if position < 0.2 {
             "very low"
         } else if position < 0.4 {
@@ -348,6 +348,43 @@ impl World {
         } else {
             "very high"
         }
+    }
+
+    /// Resolve a faction_id to its (name, power, relative_label) for
+    /// use in the LLM context builder. Returns None if the id is
+    /// unknown or does not point to a faction-typed entity.
+    ///
+    /// The relative_label is computed against the `power` distribution
+    /// of all entities with `entity_type == "faction"` in `stats`, so
+    /// it lines up with the other relative values the LLM sees (per
+    /// Arcurus 2026-06-16 #openworld: "calculate it where and when
+    /// the other relative powers are calculated in the world entity").
+    /// Returns "unknown" if the faction-typed stats are missing
+    /// (e.g. stats not yet calculated, or the only faction was
+    /// just created and the stats dict has no power entry).
+    ///
+    /// Per Arcurus 2026-06-16: the LLM context should expose a
+    /// faction's power + its position relative to other factions.
+    /// This is the single resolver used by both
+    /// `build_faction_str` (for the subject entity) and
+    /// `format_nearby_entry` (for nearby entities).
+    pub fn get_faction_info(
+        &self,
+        faction_id: Uuid,
+        stats: &WorldStats,
+    ) -> Option<(String, i64, &'static str)> {
+        let faction = self.entities.get(&faction_id)?;
+        if faction.entity_type != "faction" {
+            return None;
+        }
+        let power = faction.properties_int.get("power").copied().unwrap_or(0);
+        let relative = stats
+            .by_type
+            .get("faction")
+            .and_then(|ts| ts.properties_int.get("power"))
+            .map(|p| World::get_relative_value(power as f64, p.min, p.max, p.avg))
+            .unwrap_or("unknown");
+        Some((faction.name.clone(), power, relative))
     }
 }
 

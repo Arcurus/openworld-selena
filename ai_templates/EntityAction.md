@@ -10,7 +10,11 @@ Power Tier: {power_tier}
 Properties (relative to other {entity_type} entities in the world):
 {property_context}
 
+{faction_context}
+
 {property_docs}
+
+{secret_loyalty_explanation}
 
 {entity_history}
 

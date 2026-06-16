@@ -66,6 +66,24 @@ pub struct ActionContext {
     /// unprocessed world actions from other entities in
     /// as they fit in the 10k".
     pub unprocessed_other_actions_str: String,
+    /// Faction membership block for the subject entity, rendered as
+    /// a multi-line string with "Public faction" and (optionally)
+    /// "Secret loyal faction" lines. Empty if the entity belongs
+    /// to no faction. Per Arcurus 2026-06-16 #openworld: every
+    /// entity in the LLM context gets its faction shown, and the
+    /// LLM gets god view of secret loyalties. Goes into
+    /// `{faction_context}` in the prompt template.
+    pub faction_context_str: String,
+    /// Static mechanic explanation for "secret loyal faction",
+    /// shown when at least one entity in the LLM context (subject
+    /// or any nearby entity) has a non-None faction_secret_loyal_id.
+    /// Empty when no secret loyalties are present (so we don't
+    /// bloat the prompt with explanation text the LLM doesn't
+    /// need). Per Arcurus 2026-06-16 #openworld: the LLM must
+    /// understand that a secret loyal faction is a hidden loyalty
+    /// the entity pretends not to have. Goes into
+    /// `{secret_loyalty_explanation}` in the prompt template.
+    pub secret_loyalty_explanation_str: String,
 }
 
 /// Resolve the effective per-entity history-summary char cap.
@@ -157,6 +175,25 @@ pub fn build_action_context(
                 last_processed_tick,
             )
         },
+        faction_context_str: build_faction_str(entity, world, &stats),
+        // The mechanic explanation is shown when at least one entity
+        // in the LLM context (subject or any nearby entity) has a
+        // non-None faction_secret_loyal_id. The nearby list is the
+        // same one the LLM sees, so checking its source entities is
+        // a faithful "any entity in this prompt" test.
+        secret_loyalty_explanation_str: {
+            let needs_explanation = entity.faction_secret_loyal_id.is_some()
+                || world.entities.values().any(|e| {
+                    e.id != entity.id
+                        && !e.is_system_entity()
+                        && e.faction_secret_loyal_id.is_some()
+                });
+            if needs_explanation {
+                build_secret_loyalty_explanation()
+            } else {
+                String::new()
+            }
+        },
     }
 }
 
@@ -218,6 +255,8 @@ pub fn build_action_prompt(
         .replace("{history_summary_header}", &build_history_summary_header(ctx))
         .replace("{recent_world_actions}", &ctx.recent_world_actions_str)
         .replace("{unprocessed_other_actions}", &ctx.unprocessed_other_actions_str)
+        .replace("{faction_context}", &ctx.faction_context_str)
+        .replace("{secret_loyalty_explanation}", &ctx.secret_loyalty_explanation_str)
 }
 
 fn build_property_context(entity: &WorldEntity, type_stats: Option<&EntityTypeStats>) -> String {
@@ -256,7 +295,90 @@ fn build_property_context(entity: &WorldEntity, type_stats: Option<&EntityTypeSt
     prop_context
 }
 
+/// Render the faction membership block for an entity.
+///
+/// Returns a multi-line string of the shape:
+///
+/// ```text
+/// Faction Membership:
+///   - Public faction: <name> (power <N>, <relative label> vs other factions)
+///   - Secret loyal faction: <name> (power <N>, <relative label> vs other factions)
+/// ```
+///
+/// The two lines are independent: an entity with only a primary
+/// faction gets one line; an entity with only a secret loyal
+/// faction gets one line; an entity with both gets two lines.
+/// If the entity has neither, the function returns an empty string
+/// (the caller should treat that as "no faction block to render").
+///
+/// Per Arcurus 2026-06-16 #openworld:
+///   - Every entity in the LLM context gets its faction shown.
+///   - The LLM gets god view of secret loyalties (a faction member's
+///     secret loyalty is a spoiler for in-world actors but the
+///     simulator needs to know).
+///   - Faction power + relative position is part of the block
+///     (calculated against all other factions via the same
+///     `EntityTypeStats["faction"]` table that other relative
+///     values use — see `World::get_faction_info`).
+pub fn build_faction_str(
+    entity: &WorldEntity,
+    world: &World,
+    stats: &crate::world_data::WorldStats,
+) -> String {
+    let mut body = String::new();
+    let mut count = 0;
+    if let Some(fid) = entity.faction_id {
+        if let Some((name, power, rel)) = world.get_faction_info(fid, stats) {
+            body.push_str(&format!(
+                "  - Public faction: {} (power {}, {} vs other factions)\n",
+                name, power, rel
+            ));
+            count += 1;
+        }
+    }
+    if let Some(fid) = entity.faction_secret_loyal_id {
+        if let Some((name, power, rel)) = world.get_faction_info(fid, stats) {
+            body.push_str(&format!(
+                "  - Secret loyal faction: {} (power {}, {} vs other factions)\n",
+                name, power, rel
+            ));
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return String::new();
+    }
+    format!("Faction Membership:\n{}", body)
+}
+
+/// Static mechanic explanation for "secret loyal faction". Shown when
+/// at least one entity in the LLM context has a non-None
+/// faction_secret_loyal_id.
+///
+/// Per Arcurus 2026-06-16 #openworld: "if at least one secret loyal
+/// fraction is added, state what secret loyal fractions are:
+/// normally other entitiess dont know them. secretly the entity
+/// tires to help the secret loyal fraction while pretenting to
+/// belong to another fraction."
+///
+/// Returns the explanation as a single string (with a leading
+/// newline so the rendered prompt has a clean separator when
+/// dropped into a template line).
+pub fn build_secret_loyalty_explanation() -> String {
+    String::from(
+        "\nNote on secret loyal factions: An entity with a 'secret loyal faction' is publicly a member of one faction (its primary faction) but secretly loyal to another. Other entities in the world do not normally know about the secret loyalty. The entity tries to help the secret loyal faction while pretending to belong to its public faction. You (the simulator) can see both loyalties — this is a god view that the in-world narrative actors do not have.\n",
+    )
+}
+
 fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
+    // Compute stats once at the top so every format_nearby_entry
+    // call (and the secret_loyalty_explanation scan in
+    // build_action_context) can reuse the same relative-value math.
+    // The previous code path didn't need stats here; per Arcurus
+    // 2026-06-16 #openworld, every nearby entity now has its
+    // faction + power + relative shown, which requires the same
+    // EntityTypeStats["faction"] table the subject uses.
+    let stats = world.calculate_stats();
     // No distance cutoff: consider every entity in the world, then
     // let the per-section algorithm pick the top N.  Per Arcurus
     // 2026-06-07 #openworld: the previous 150-unit radius was a
@@ -354,21 +476,21 @@ fn build_nearby_entities_str(world: &World, entity: &WorldEntity) -> String {
     if !locations.is_empty() {
         s.push_str(&format!("### Nearby Locations (top {} by influence)\n", MAX_NEARBY_LOCATIONS));
         for (other, dist, score) in &locations {
-            s.push_str(&format_nearby_entry(other, *dist));
+            s.push_str(&format_nearby_entry(other, *dist, world, &stats));
         }
         s.push('\n');
     }
     if !characters.is_empty() {
         s.push_str(&format!("### Nearby Characters (top {} by influence)\n", MAX_NEARBY_CHARACTERS));
         for (other, dist, score) in &characters {
-            s.push_str(&format_nearby_entry(other, *dist));
+            s.push_str(&format_nearby_entry(other, *dist, world, &stats));
         }
         s.push('\n');
     }
     if !factions.is_empty() {
         s.push_str(&format!("### Nearby Factions ({} nearest)\n", MAX_NEARBY_FACTIONS));
         for (other, dist, score) in &factions {
-            s.push_str(&format_nearby_entry(other, *dist));
+            s.push_str(&format_nearby_entry(other, *dist, world, &stats));
         }
         s.push('\n');
     }
@@ -404,7 +526,12 @@ const MAX_NEARBY_FACTIONS: usize = 5;
 /// metadata field next to the name.  The `💤×0.01` marker is kept
 /// because the sleeping state is a real semantic signal the LLM
 /// should see.
-fn format_nearby_entry(other: &WorldEntity, dist: f64) -> String {
+fn format_nearby_entry(
+    other: &WorldEntity,
+    dist: f64,
+    world: &World,
+    stats: &crate::world_data::WorldStats,
+) -> String {
     let power = other.properties_int.get("power").copied().unwrap_or(0);
     let is_sleeping = other.tags.iter().any(|t| t == "sleeping");
     let mut s = format!(
@@ -417,6 +544,23 @@ fn format_nearby_entry(other: &WorldEntity, dist: f64) -> String {
     );
     if !other.description.is_empty() {
         s.push_str(&format!("  {}\n", other.description));
+    }
+    // Faction membership (primary + secret loyal) for nearby
+    // entities, per Arcurus 2026-06-16 #openworld: any entity in
+    // the LLM context gets its faction(s) shown, and the LLM gets
+    // god view of secret loyalties. The block uses the same
+    // `build_faction_str` helper as the subject, minus the
+    // "Faction Membership:" header (the entry already has its own
+    // prefix) and only includes the indented `- Public` / `- Secret`
+    // lines.
+    if other.faction_id.is_some() || other.faction_secret_loyal_id.is_some() {
+        let f = build_faction_str(other, world, stats);
+        for line in f.lines() {
+            if line.starts_with("Faction Membership:") {
+                continue;
+            }
+            s.push_str(&format!("  {}\n", line));
+        }
     }
     let key_props: Vec<String> = other
         .properties_int
@@ -1065,6 +1209,295 @@ mod tests {
         assert!(result.contains("speed: 1.50"));
     }
 
+    // ==================================================================
+    // Faction-context tests (added 2026-06-16 per Arcurus #openworld:
+    // "if an entity that is added to the llm context has a fraction,
+    // please state it in the llm context ... also state the power and
+    // relative power to other factions").
+    // ==================================================================
+
+    /// Build a minimal world with a handful of factions, characters,
+    /// and locations so the relative-power math has something to rank
+    /// against. Powers are spread so different factions land in
+    /// different buckets (very low / low / high / very high).
+    ///
+    /// Powers: 50 / 250 / 500 / 800. With `get_relative_value`'s
+    /// 5-bucket scale (cutoffs at 0.2 / 0.4 / 0.6 / 0.8 of the
+    /// [min, max] range), these land in:
+    ///   - 50  -> position 0.000 -> "very low"
+    ///   - 250 -> position 0.267 -> "low"
+    ///   - 500 -> position 0.600 -> "high"
+    ///   - 800 -> position 1.000 -> "very high"
+    /// The test cases below assert each of these.
+    fn make_world_with_factions() -> (World, uuid::Uuid, uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+        let mut world = make_world();
+        let mut f_low = make_entity("Faction Low", 0.0, 0.0);
+        f_low.entity_type = "faction".to_string();
+        f_low.properties_int.insert("power".to_string(), 50);
+        let f_low_id = f_low.id;
+        let mut f_mid = make_entity("Faction Mid", 100.0, 0.0);
+        f_mid.entity_type = "faction".to_string();
+        f_mid.properties_int.insert("power".to_string(), 250);
+        let f_mid_id = f_mid.id;
+        let mut f_high = make_entity("Faction High", 200.0, 0.0);
+        f_high.entity_type = "faction".to_string();
+        f_high.properties_int.insert("power".to_string(), 500);
+        let f_high_id = f_high.id;
+        let mut f_top = make_entity("Faction Top", 300.0, 0.0);
+        f_top.entity_type = "faction".to_string();
+        f_top.properties_int.insert("power".to_string(), 800);
+        let f_top_id = f_top.id;
+        world.entities.insert(f_low_id, f_low);
+        world.entities.insert(f_mid_id, f_mid);
+        world.entities.insert(f_high_id, f_high);
+        world.entities.insert(f_top_id, f_top);
+        (world, f_low_id, f_mid_id, f_high_id, f_top_id)
+    }
+
+    #[test]
+    fn world_get_faction_info_returns_none_for_unknown_id() {
+        let (world, _, _, _, _) = make_world_with_factions();
+        let stats = world.calculate_stats();
+        let bogus = uuid::Uuid::new_v4();
+        assert!(world.get_faction_info(bogus, &stats).is_none());
+    }
+
+    #[test]
+    fn world_get_faction_info_returns_none_for_non_faction_id() {
+        let (mut world, _, _, _, _) = make_world_with_factions();
+        let stats = world.calculate_stats();
+        let mut not_a_faction = make_entity("Not A Faction", 500.0, 500.0);
+        not_a_faction.entity_type = "character".to_string();
+        let naf_id = not_a_faction.id;
+        world.entities.insert(naf_id, not_a_faction);
+        assert!(world.get_faction_info(naf_id, &stats).is_none(),
+            "non-faction entity must not be resolvable as a faction");
+    }
+
+    #[test]
+    fn world_get_faction_info_relative_label_is_very_low_for_min_power() {
+        let (world, f_low_id, _, _, _) = make_world_with_factions();
+        let stats = world.calculate_stats();
+        let (name, power, rel) = world.get_faction_info(f_low_id, &stats).expect("low faction");
+        assert_eq!(name, "Faction Low");
+        assert_eq!(power, 50);
+        assert_eq!(rel, "very low");
+    }
+
+    #[test]
+    fn world_get_faction_info_relative_label_is_very_high_for_max_power() {
+        let (world, _, _, _, f_top_id) = make_world_with_factions();
+        let stats = world.calculate_stats();
+        let (name, power, rel) = world.get_faction_info(f_top_id, &stats).expect("top faction");
+        assert_eq!(name, "Faction Top");
+        assert_eq!(power, 800);
+        assert_eq!(rel, "very high");
+    }
+
+    #[test]
+    fn build_faction_str_empty_when_no_faction() {
+        let (world, _, _, _, _) = make_world_with_factions();
+        let stats = world.calculate_stats();
+        let entity = make_entity("Lone", 10000.0, 10000.0);
+        let result = build_faction_str(&entity, &world, &stats);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn build_faction_str_shows_public_only() {
+        let (world, f_low_id, _, _, _) = make_world_with_factions();
+        let stats = world.calculate_stats();
+        let mut entity = make_entity("Member", 10000.0, 10000.0);
+        entity.faction_id = Some(f_low_id);
+        let result = build_faction_str(&entity, &world, &stats);
+        assert!(result.starts_with("Faction Membership:\n"));
+        assert!(result.contains("Public faction: Faction Low (power 50, very low vs other factions)"));
+        assert!(!result.contains("Secret loyal"));
+    }
+
+    #[test]
+    fn build_faction_str_shows_both_public_and_secret() {
+        let (world, f_low_id, f_mid_id, _, _) = make_world_with_factions();
+        let stats = world.calculate_stats();
+        let mut entity = make_entity("Spy", 10000.0, 10000.0);
+        entity.faction_id = Some(f_low_id);
+        entity.faction_secret_loyal_id = Some(f_mid_id);
+        let result = build_faction_str(&entity, &world, &stats);
+        assert!(result.contains("Public faction: Faction Low (power 50, very low vs other factions)"));
+        assert!(result.contains("Secret loyal faction: Faction Mid (power 250, low vs other factions)"));
+    }
+
+    #[test]
+    fn build_faction_str_shows_secret_only_when_no_public() {
+        let (world, _, f_mid_id, _, _) = make_world_with_factions();
+        let stats = world.calculate_stats();
+        let mut entity = make_entity("Deep Cover", 10000.0, 10000.0);
+        entity.faction_secret_loyal_id = Some(f_mid_id);
+        let result = build_faction_str(&entity, &world, &stats);
+        assert!(!result.contains("Public faction"));
+        assert!(result.contains("Secret loyal faction: Faction Mid (power 250, low vs other factions)"));
+    }
+
+    #[test]
+    fn build_secret_loyalty_explanation_contains_required_phrases() {
+        let s = build_secret_loyalty_explanation();
+        assert!(s.contains("secret loyal faction"));
+        assert!(s.contains("do not normally know"));
+        assert!(s.contains("tries to help the secret loyal faction"));
+        assert!(s.contains("pretending to belong"));
+    }
+
+    #[test]
+    fn action_context_includes_faction_block_when_subject_has_faction() {
+        let (mut world, f_low_id, _, _, _) = make_world_with_factions();
+        let mut entity = make_entity("Member", 10000.0, 10000.0);
+        entity.faction_id = Some(f_low_id);
+        let id = entity.id;
+        world.entities.insert(id, entity);
+        let stats = world.calculate_stats();
+        let subject = world.entities.get(&id).unwrap();
+        let ctx = build_action_context(&world, subject, 0);
+        assert!(ctx.faction_context_str.contains("Faction Membership:"));
+        assert!(ctx.faction_context_str.contains("Faction Low"));
+        assert!(ctx.secret_loyalty_explanation_str.is_empty(),
+            "no secret loyal anywhere → explanation should be empty");
+    }
+
+    #[test]
+    fn action_context_includes_secret_loyalty_explanation_when_subject_has_secret() {
+        let (mut world, f_low_id, f_mid_id, _, _) = make_world_with_factions();
+        let mut entity = make_entity("Spy", 10000.0, 10000.0);
+        entity.faction_id = Some(f_low_id);
+        entity.faction_secret_loyal_id = Some(f_mid_id);
+        let id = entity.id;
+        world.entities.insert(id, entity);
+        let stats = world.calculate_stats();
+        let subject = world.entities.get(&id).unwrap();
+        let ctx = build_action_context(&world, subject, 0);
+        assert!(ctx.faction_context_str.contains("Secret loyal faction: Faction Mid"));
+        assert!(!ctx.secret_loyalty_explanation_str.is_empty(),
+            "subject has secret → explanation should be present");
+        assert!(ctx.secret_loyalty_explanation_str.contains("Note on secret loyal factions"));
+    }
+
+    #[test]
+    fn action_context_explanation_present_when_nearby_has_secret() {
+        // Subject has no secret loyal, but a nearby entity does.
+        let (mut world, f_low_id, f_mid_id, _, _) = make_world_with_factions();
+        // Place the subject and a "spy" character near each other.
+        let mut subject = make_entity("Subject", 0.0, 0.0);
+        let subject_id = subject.id;
+        let mut spy = make_entity("Spy Character", 10.0, 10.0);
+        spy.entity_type = "character".to_string();
+        spy.faction_id = Some(f_low_id);
+        spy.faction_secret_loyal_id = Some(f_mid_id);
+        let spy_id = spy.id;
+        world.entities.insert(subject_id, subject);
+        world.entities.insert(spy_id, spy);
+        let subject = world.entities.get(&subject_id).unwrap();
+        let ctx = build_action_context(&world, subject, 0);
+        assert!(ctx.faction_context_str.is_empty(),
+            "subject has no faction → no faction block");
+        assert!(!ctx.secret_loyalty_explanation_str.is_empty(),
+            "nearby entity has a secret loyal → explanation must appear in the LLM context");
+    }
+
+    #[test]
+    fn action_context_explanation_absent_when_no_secret_loyal_anywhere() {
+        let (mut world, f_low_id, _, _, _) = make_world_with_factions();
+        let mut subject = make_entity("Member", 0.0, 0.0);
+        subject.faction_id = Some(f_low_id);
+        let subject_id = subject.id;
+        let mut friend = make_entity("Friend", 10.0, 10.0);
+        friend.entity_type = "character".to_string();
+        friend.faction_id = Some(f_low_id);
+        let friend_id = friend.id;
+        world.entities.insert(subject_id, subject);
+        world.entities.insert(friend_id, friend);
+        let subject = world.entities.get(&subject_id).unwrap();
+        let ctx = build_action_context(&world, subject, 0);
+        assert!(ctx.faction_context_str.contains("Faction Low"));
+        assert!(ctx.secret_loyalty_explanation_str.is_empty(),
+            "no secret loyal anywhere → explanation should be empty");
+    }
+
+    #[test]
+    fn format_nearby_entry_includes_faction_block_for_nearby_entity() {
+        let (mut world, f_low_id, f_mid_id, _, _) = make_world_with_factions();
+        let mut subject = make_entity("Subject", 0.0, 0.0);
+        let subject_id = subject.id;
+        let mut nearby = make_entity("Near One", 50.0, 50.0);
+        nearby.entity_type = "character".to_string();
+        nearby.faction_id = Some(f_low_id);
+        nearby.faction_secret_loyal_id = Some(f_mid_id);
+        let nearby_id = nearby.id;
+        world.entities.insert(subject_id, subject);
+        world.entities.insert(nearby_id, nearby);
+        let stats = world.calculate_stats();
+        let subject = world.entities.get(&subject_id).unwrap();
+        let nearby = world.entities.get(&nearby_id).unwrap();
+        let s = format_nearby_entry(nearby, 50.0, &world, &stats);
+        assert!(s.contains("Near One"));
+        assert!(s.contains("Public faction: Faction Low"));
+        assert!(s.contains("Secret loyal faction: Faction Mid"));
+    }
+
+    // ------------------------------------------------------------------
+    // Live-save smoke test (added 2026-06-16 per Arcurus #openworld):
+    // load the actual save file the running service uses, pick an
+    // entity that has faction_id set (Kira Dawnblade), and confirm
+    // her rendered LLM prompt contains the new Faction Membership
+    // block. This catches integration regressions that the unit
+    // tests miss (template placeholders, stats wiring, etc.).
+    //
+    // The test is marked `#[ignore]` so it doesn't run by default
+    // (it requires the live save file at world_data/save.owbl which
+    // may not exist in a fresh clone). Run it explicitly with:
+    //   cargo test --bin open_world -- --ignored live_save_smoke
+    // ------------------------------------------------------------------
+    #[test]
+    #[ignore = "requires live world_data/save.owbl; run with --ignored"]
+    fn live_save_smoke_kira_prompt_has_faction_block() {
+        use crate::world_data::persistence::BinaryPersistence;
+        let path = std::path::Path::new("world_data/save.owbl");
+        if !path.exists() {
+            eprintln!("skipping: {} does not exist", path.display());
+            return;
+        }
+        let world = BinaryPersistence::load_world(path.to_str().unwrap())
+            .expect("load world");
+        let kira = world
+            .entities
+            .values()
+            .find(|e| e.name == "Kira Dawnblade")
+            .expect("Kira Dawnblade not in world");
+        assert!(kira.faction_id.is_some(), "Kira should have faction_id set");
+        let ctx = build_action_context(&world, kira, 0);
+        let template = std::fs::read_to_string("ai_templates/EntityAction.md")
+            .expect("read template");
+        let prompt = build_action_prompt(
+            "The Realm of Shadows",
+            kira,
+            &ctx,
+            &template,
+            "",
+        );
+        assert!(
+            prompt.contains("Faction Membership:"),
+            "rendered prompt should contain the Faction Membership block"
+        );
+        assert!(
+            prompt.contains("Public faction:"),
+            "rendered prompt should contain a Public faction line"
+        );
+        // No entity in the live world has faction_secret_loyal_id
+        // set yet, so the explanation should be absent.
+        assert!(
+            ctx.secret_loyalty_explanation_str.is_empty(),
+            "no secret loyal in live world yet → explanation should be empty"
+        );
+    }
+
     #[test]
     fn power_tier_legendary_above_1000() {
         let mut entity = make_entity("Test", 10000.0, 10000.0);
@@ -1586,6 +2019,8 @@ mod tests {
             history_summary_chars_used: 7,
             recent_world_actions_str: "recent".to_string(),
             unprocessed_other_actions_str: "unprocessed".to_string(),
+            faction_context_str: String::new(),
+            secret_loyalty_explanation_str: String::new(),
         };
         let template = "{world_name} {entity_name} {entity_type} {description} {tags} {x} {y} {property_context} {property_docs} {power_tier} {entity_history} {nearby_entities} {world_events} {history_summary} {max_history_summary_chars} {history_summary_header}";
         let result = build_action_prompt("Middle Earth", &entity, &ctx, template, "DOCS");
@@ -1653,6 +2088,8 @@ mod tests {
             history_summary_chars_used: 0,
             recent_world_actions_str: String::new(),
             unprocessed_other_actions_str: String::new(),
+            faction_context_str: String::new(),
+            secret_loyalty_explanation_str: String::new(),
         };
         let rendered = build_action_prompt("TestWorld", &entity, &ctx, &template, "");
 
@@ -2321,3 +2758,77 @@ mod tests {
         assert!(result.contains(&"b".repeat(1000)));
     }
 }
+
+    #[test]
+    #[ignore = "live save; run with --ignored live_save_smoke_print_kira_prompt"]
+    fn live_save_smoke_print_kira_prompt() {
+        use crate::world_data::persistence::BinaryPersistence;
+        let path = std::path::Path::new("world_data/save.owbl");
+        if !path.exists() {
+            eprintln!("skipping: {} does not exist", path.display());
+            return;
+        }
+        let world = BinaryPersistence::load_world(path.to_str().unwrap()).expect("load");
+        let kira = world.entities.values().find(|e| e.name == "Kira Dawnblade").expect("Kira");
+        let ctx = build_action_context(&world, kira, 0);
+        let template = std::fs::read_to_string("ai_templates/EntityAction.md").expect("template");
+        let prompt = build_action_prompt("The Realm of Shadows", kira, &ctx, &template, "");
+
+        eprintln!("\n========== FACTIONS BLOCK FOR {} ==========", kira.name);
+        eprintln!("{}", ctx.faction_context_str);
+        eprintln!("========== SECRET LOYALTY EXPLANATION (len={}) ==========", ctx.secret_loyalty_explanation_str.len());
+        if !ctx.secret_loyalty_explanation_str.is_empty() {
+            eprintln!("{}", ctx.secret_loyalty_explanation_str);
+        }
+        eprintln!("\n========== RENDERED PROMPT: Faction section ==========");
+        if let Some(idx) = prompt.find("Faction Membership") {
+            let end = prompt[idx..].find("\n\n").map(|o| idx + o).unwrap_or(prompt.len());
+            eprintln!("{}", &prompt[idx..end]);
+        } else {
+            eprintln!("(Faction Membership not in rendered prompt — bug?)");
+        }
+        eprintln!("\n========== RENDERED PROMPT: Nearby Factions section ==========");
+        if let Some(idx) = prompt.find("Nearby Factions") {
+            let end = prompt[idx..].find("\n\n").map(|o| idx + o).unwrap_or(prompt.len());
+            eprintln!("{}", &prompt[idx..end.min(idx+2500)]);
+        } else {
+            eprintln!("(no nearby factions in prompt)");
+        }
+    }
+
+    #[test]
+    #[ignore = "live save; run with --ignored live_save_smoke_print_with_synthetic_secret_loyal"]
+    fn live_save_smoke_print_with_synthetic_secret_loyal() {
+        use crate::world_data::persistence::BinaryPersistence;
+        let path = std::path::Path::new("world_data/save.owbl");
+        if !path.exists() {
+            eprintln!("skipping: {} does not exist", path.display());
+            return;
+        }
+        let mut world = BinaryPersistence::load_world(path.to_str().unwrap()).expect("load");
+        // Pick Kira and the Ironforge Clan faction, set Kira's
+        // secret_loyal to Ironforge. She publicly belongs to the
+        // Thornwatch Rangers — so this is a "double agent" scenario.
+        let kira_id = world.entities.values()
+            .find(|e| e.name == "Kira Dawnblade").expect("Kira").id;
+        let ironforge_id = world.entities.values()
+            .find(|e| e.name == "Ironforge Clan").expect("Ironforge").id;
+        {
+            let kira = world.entities.get_mut(&kira_id).unwrap();
+            kira.faction_secret_loyal_id = Some(ironforge_id);
+        }
+        let kira = world.entities.get(&kira_id).unwrap();
+        let ctx = build_action_context(&world, kira, 0);
+        let template = std::fs::read_to_string("ai_templates/EntityAction.md").expect("template");
+        let prompt = build_action_prompt("The Realm of Shadows", kira, &ctx, &template, "");
+
+        eprintln!("\n========== FACTIONS BLOCK FOR {} (with synthetic secret loyal) ==========", kira.name);
+        eprintln!("{}", ctx.faction_context_str);
+        eprintln!("========== SECRET LOYALTY EXPLANATION (len={}) ==========", ctx.secret_loyalty_explanation_str.len());
+        eprintln!("{}", ctx.secret_loyalty_explanation_str);
+        eprintln!("\n========== PROMPT (Faction section + secret loyalty tail) ==========");
+        if let Some(idx) = prompt.find("Faction Membership") {
+            // Take 1500 chars from Faction Membership to capture the explanation
+            eprintln!("{}", &prompt[idx..idx.min(prompt.len()).saturating_add(1500)]);
+        }
+    }
