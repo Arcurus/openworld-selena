@@ -724,7 +724,15 @@
                 </div>
                 <div class="header-stat">
                     <div class="header-stat-value" id="worldActions">0</div>
-                    <div class="header-stat-label">Actions</div>
+                    <div class="header-stat-label">Actions (total)</div>
+                </div>
+                <div class="header-stat">
+                    <div class="header-stat-value" id="worldActions24h">0</div>
+                    <div class="header-stat-label">Actions (24h)</div>
+                </div>
+                <div class="header-stat">
+                    <div class="header-stat-value" id="worldMovements">0</div>
+                    <div class="header-stat-label">Moves (today)</div>
                 </div>
                 <div class="save-indicator" id="saveIndicator" style="display:none;">
                     <span id="saveStatus">💾 Saved</span>
@@ -732,7 +740,8 @@
                 </div>
                 <button class="btn btn-primary" id="btnNewWorld" onclick="openNewWorldModal()">🆕 New World</button>
                 <button class="btn" id="btnSaveWorld" onclick="saveWorld()">💾 Save</button>
-                <button class="btn" onclick="loadWorld()">📥 Load</button>
+                <a href="movements.html" class="btn" style="background: linear-gradient(135deg, rgba(74,158,255,0.5) 0%, rgba(130,196,255,0.6) 100%); text-decoration: none;">🌊 Movements</a>
+                <button class="btn" onclick="loadWorldFromFile()">📥 Load</button>
                 <button class="btn" onclick="openDocsModal()">📖 Docs</button>
                 <button class="btn" onclick="openFilesModal()">📁 Files</button>
                 <button class="btn" onclick="openLogsModal()" style="background: linear-gradient(135deg, rgba(99,102,241,0.6) 0%, rgba(79,70,229,0.7) 100%);">📜 Logs</button>
@@ -1082,6 +1091,20 @@
         const API_BASE = 'api';
         let entities = [];
         let selectedEntity = null;
+        // Movement history for the world-map overlay (per
+        // Arcurus 2026-06-14 #openworld: "display the movements
+        // of last 4 days also in the main view where the
+        // entities are displayed. the older the more
+        // transparent with nice blue pulsating lines. display
+        // all the lines at the same time and still display the
+        // entities. so one can see at once what happened.").
+        // Populated by loadMovements(); consumed by renderMap().
+        let movementsData = [];
+        let movementsByEntity = new Map();
+        // Animation timestamp (ms) for the pulsating-line alpha
+        // modulation.  Updated by the map's rAF loop; used to
+        // sin-wave the line opacity from 0.4 → 1.0 at ~0.5 Hz.
+        let mapAnimT0 = 0;
         let currentEditEntityId = null;
         let worldStats = null; // Cache for world stats
         let isLoading = false;
@@ -1118,12 +1141,93 @@
         async function loadWorld() {
             try {
                 const data = await fetchAPI('/');
-                document.title = 'Open World - ' + (data.data?.name || 'Loading...');
+                const w = data.data;
+                document.title = 'Open World - ' + (w?.name || 'Loading...');
+                // Update header counters. action_count and
+                // movement_count come from the /api/ response;
+                // the HTML defaults were hardcoded "0" / "-" and
+                // nothing else in the file ever wrote to them, so
+                // the header stuck at 0 indefinitely. Bug fixed
+                // 2026-06-14 in #openworld.
+                if (w && typeof w.action_count === 'number') {
+                    const el = document.getElementById('worldActions');
+                    if (el) el.textContent = w.action_count;
+                }
+                if (w && typeof w.action_count_24h === 'number') {
+                    const el = document.getElementById('worldActions24h');
+                    if (el) el.textContent = w.action_count_24h;
+                }
+                if (w && typeof w.movement_count_today === 'number') {
+                    const el = document.getElementById('worldMovements');
+                    if (el) el.textContent = w.movement_count_today;
+                }
             } catch (e) {
                 console.error('Failed to load world:', e);
             }
         }
-        
+
+        // Fetch the last 14 days of movement history and group
+        // it by entity_id for the map overlay.  Called on init
+        // and from the same periodic refresh as the entities
+        // list, so the overlay stays current.  The endpoint is
+        // a relative URL so the page works under both direct
+        // access (http://localhost:8081) and the Caddy reverse
+        // proxy (https://selenaastra.com/open-world/) without
+        // a path-prefix mismatch (per AGENTS.md "fetch\(['\"]/"
+        // should return 0 matches).  14 days is the
+        // Movement Constellation page's default window, and
+        // it captures the current real movement data
+        // (Kira's journey_south_to_spring_festival from
+        // 2026-06-10).  The server already filters out
+        // test actions and entries without both x AND y in
+        // the world coordinate system, so the response is
+        // a clean list of real world movements (per Arcurus
+        // 2026-06-14 #openworld 23:25: "i want to see the
+        // real move").  Composite is no longer used as a
+        // coordinate fallback — it is a non-spatial attribute.
+        async function loadMovements() {
+            try {
+                const res = await fetch('api/movements?days=14&_t=' + Date.now(), { cache: 'no-store' });
+                const text = await res.text();
+                if (!text) return;  // server hiccup, keep prior data
+                const json = JSON.parse(text);
+                const list = json.movements || [];
+                movementsData = list;
+                movementsByEntity = new Map();
+                for (const m of list) {
+                    // Skip test actions (defence in depth — the
+                    // server already filters these, but a future
+                    // regression in the server should not poison
+                    // the visualization).  Test actions are the
+                    // small-arbitrary-number entries generated
+                    // during the movement-counter debug work.
+                    const a = m.action || '';
+                    if (a.startsWith('test_')) continue;
+                    // Skip entries that have no real world
+                    // coordinates.  The server already guarantees
+                    // both x and y are present, but if a future
+                    // change relaxes that, we'd rather show
+                    // nothing than project garbage.
+                    if (m.x == null || m.y == null) continue;
+                    const eid = m.entity_id || m.entity_name;
+                    if (!movementsByEntity.has(eid)) {
+                        movementsByEntity.set(eid, { name: m.entity_name, points: [] });
+                    }
+                    const x = m.x;
+                    const y = m.y;
+                    movementsByEntity.get(eid).points.push({
+                        ts: m.ts, x: x, y: y,
+                        success: m.success !== false,
+                    });
+                }
+                for (const p of movementsByEntity.values()) {
+                    p.points.sort((a, b) => a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0);
+                }
+            } catch (e) {
+                console.error('Failed to load movements:', e);
+            }
+        }
+
         // Notification system
         let notificationTimeout = null;
         function showNotification(message, type = 'info') {
@@ -1214,8 +1318,43 @@
             document.getElementById('totalAbstract').textContent = entities.filter(e => e.entity_type === 'abstract').length;
             document.getElementById('listCount').textContent = entities.length;
             document.getElementById('worldEntities').textContent = entities.length;
+            // Refresh world-level counters (actions, movements) in
+            // the same tick as the entity list. Cheap: small JSON.
+            // Without this, the header stuck on the hardcoded "0"
+            // placeholder even though the world has been running
+            // for thousands of actions. (Bug found 2026-06-14 in
+            // #openworld — the worldActions element was set to "0"
+            // in the HTML but no JS ever wrote the live value to
+            // it.) loadWorld() updates the title + header stats
+            // from the /api/ response.
+            loadWorld();
+            // Refresh the movement overlay data on the same
+            // cadence as the entity list (every 10s).  The map
+            // reads from the global movementsByEntity, so as long
+            // as this runs at least once before the first
+            // renderMap() call, the lines appear.
+            loadMovements();
+            // Kick the map's pulsation loop on the first call
+            // (subsequent calls are idempotent — the rAF is
+            // guarded by a flag).
+            startMapPulse();
         }
-        
+
+        // Pulsation loop for the movement overlay lines.  The
+        // sin-wave alpha is in renderMap() itself, so we just
+        // re-draw at ~30fps to keep the breath visible.  A
+        // simple guard prevents stacking multiple rAFs.
+        let _mapPulseRunning = false;
+        function startMapPulse() {
+            if (_mapPulseRunning) return;
+            _mapPulseRunning = true;
+            function pulse() {
+                try { renderMap(); } catch (e) { console.error('map pulse:', e); }
+                requestAnimationFrame(pulse);
+            }
+            requestAnimationFrame(pulse);
+        }
+
         function renderEntityList() {
             const listEl = document.getElementById('entityList');
             
@@ -1297,30 +1436,181 @@
                 return;
             }
             
-            // Calculate bounds
+            // Calculate bounds.  We include BOTH entity
+            // positions AND movement-track points so the lines
+            // don't get clipped when an entity walked beyond
+            // the cluster of current entity positions (per
+            // Arcurus 2026-06-14 #openworld: "display the
+            // movements of last 4 days also in the main view").
             const padding = 50;
-            let minX = Math.min(...entities.map(e => e.x));
-            let maxX = Math.max(...entities.map(e => e.x));
-            let minY = Math.min(...entities.map(e => e.y));
-            let maxY = Math.max(...entities.map(e => e.y));
-            
+            const allXs = entities.map(e => e.x);
+            const allYs = entities.map(e => e.y);
+            for (const p of movementsByEntity.values()) {
+                for (const pt of p.points) {
+                    allXs.push(pt.x);
+                    allYs.push(pt.y);
+                }
+            }
+            let minX = Math.min(...allXs);
+            let maxX = Math.max(...allXs);
+            let minY = Math.min(...allYs);
+            let maxY = Math.max(...allYs);
+
             minX -= padding; maxX += padding;
             minY -= padding; maxY += padding;
-            
+
             if (maxX - minX < 200) { minX -= 100; maxX += 100; }
             if (maxY - minY < 200) { minY -= 100; maxY += 100; }
-            
+
             const scaleX = canvas.width / (maxX - minX);
             const scaleY = canvas.height / (maxY - minY);
             const scale = Math.min(scaleX, scaleY);
-            
+
             function toCanvas(x, y) {
                 return {
                     x: (x - minX) * scale,
                     y: canvas.height - ((y - minY) * scale)
                 };
             }
-            
+
+            // Draw movement-overlay lines (14 days of history,
+            // blue, age-faded, pulsating) ON THE MAIN MAP
+            // alongside the entity dots, using the SAME world
+            // coordinate system as the entities.  Each
+            // movement point is projected through toCanvas(),
+            // the same projector used for entity dots, so a
+            // move at world (192, 200) lands at the same
+            // canvas position regardless of which visualization
+            // is reading it.  This means the movement lines
+            // are on the same display as the entities (per
+            // Arcurus 2026-06-14 #openworld 23:01: "please
+            // not a trail in the bottom right. i want it
+            // just displayed where the normal entities are
+            // displayed so you see the entities and the
+            // locations in the same display") AND on the
+            // same scale as the entities.
+            //
+            // For each entity with movement data, the trail is
+            // a polyline that:
+            //   1. starts at the entity's CURRENT position
+            //      (canvas-projected from its world coords)
+            //   2. passes through each movement point in
+            //      chronological order, projected with the
+            //      same toCanvas() used for the entity dots
+            //   3. ends at the most recent movement point,
+            //      marked with a glowing blue dot
+            //
+            // The age-fade floor is 20% alpha at the OLDEST
+            // end of the 14-day window (per Arcurus 2026-06-14
+            // #openworld 23:01: "make sure the older the
+            // movement is the more transparent to a minimum
+            // transparency of 20% (on the end of the selected
+            // time scale)"), so baseAlpha = 1.0 - 0.80 * fade
+            // (newest=1.0, oldest=0.20).  Pulsation: alpha
+            // multiplier modulated by sin(t * 0.0015) → 0.5 Hz
+            // "breath" so the lines feel alive without being
+            // distracting.  When the entity has no current
+            // world position (e.g. the entity is not in the
+            // current entity list), the trail starts at the
+            // first movement point instead of a current
+            // position, so we still render something useful.
+            if (movementsByEntity.size > 0) {
+                // Build entity-id → entity lookup for the
+                // current position.
+                const entityById = new Map();
+                for (const e of entities) entityById.set(e.id, e);
+                // Compute the newest timestamp across all
+                // movements once, for the age fade.
+                let newestTs = '';
+                for (const p of movementsByEntity.values()) {
+                    for (const pt of p.points) if (pt.ts > newestTs) newestTs = pt.ts;
+                }
+                const windowDays = 14;  // matches loadMovements() days=14
+                const pulse = 0.7 + 0.3 * Math.sin(performance.now() * 0.0015);
+                const blueShades = ['#82c4ff', '#4a9eff', '#5fb8ff', '#3a8be0', '#9ad4ff', '#1a4ea0'];
+                let lineIdx = 0;
+                for (const [eid, p] of movementsByEntity.entries()) {
+                    if (p.points.length < 1) { lineIdx++; continue; }
+                    const color = blueShades[lineIdx % blueShades.length];
+                    lineIdx++;
+                    // Build the trail's polyline: start at the
+                    // entity's current position (if we know it),
+                    // then each movement point in time order.
+                    const ent = entityById.get(eid);
+                    const trail = [];  // [{x, y, ts, ageRatio}]
+                    if (ent) {
+                        trail.push({ x: ent.x, y: ent.y, ts: p.points[p.points.length-1].ts, isCurrent: true });
+                    }
+                    for (const pt of p.points) {
+                        const ageDays = (Date.parse(newestTs) - Date.parse(pt.ts)) / (1000 * 60 * 60 * 24);
+                        const ageRatio = Math.max(0, Math.min(1, ageDays / windowDays));
+                        trail.push({ x: pt.x, y: pt.y, ts: pt.ts, ageRatio });
+                    }
+                    // Project to canvas
+                    const segs = trail.map(t => ({ ...t, c: toCanvas(t.x, t.y) }));
+                    // Draw the polyline as a series of
+                    // segments, each with its own alpha (the
+                    // most recent point in the pair wins for
+                    // the segment's age-fade, so the line
+                    // fades toward the OLD end).
+                    ctx.save();
+                    ctx.lineCap = 'round';
+                    ctx.lineJoin = 'round';
+                    for (let i = 1; i < segs.length; i++) {
+                        const a = segs[i-1];
+                        const b = segs[i];
+                        // The segment's age is the age of the
+                        // point we're drawing TOWARD (newer is
+                        // brighter).  For the segment FROM
+                        // the current entity position, use the
+                        // most recent movement's age.
+                        let segAge;
+                        if (a.isCurrent) {
+                            segAge = b.ageRatio || 0;
+                        } else {
+                            segAge = b.ageRatio || 0;
+                        }
+                        const baseAlpha = 1.0 - segAge * 0.80;  // 1.0 → 0.20
+                        const alpha = baseAlpha * pulse;
+                        // Outer glow
+                        ctx.globalAlpha = alpha * 0.5;
+                        ctx.strokeStyle = color;
+                        ctx.lineWidth = 5;
+                        ctx.beginPath();
+                        ctx.moveTo(a.c.x, a.c.y);
+                        ctx.lineTo(b.c.x, b.c.y);
+                        ctx.stroke();
+                        // Core line
+                        ctx.globalAlpha = alpha;
+                        ctx.lineWidth = 1.8;
+                        ctx.beginPath();
+                        ctx.moveTo(a.c.x, a.c.y);
+                        ctx.lineTo(b.c.x, b.c.y);
+                        ctx.stroke();
+                    }
+                    ctx.restore();
+                    // Mark each movement point with a small
+                    // glowing dot (skipped for the
+                    // current-position anchor, which is drawn
+                    // by the entity-dot block below).
+                    for (const s of segs) {
+                        if (s.isCurrent) continue;
+                        const alpha = (1.0 - (s.ageRatio || 0) * 0.80) * pulse;
+                        ctx.save();
+                        ctx.globalAlpha = alpha * 0.5;
+                        ctx.fillStyle = color;
+                        ctx.beginPath();
+                        ctx.arc(s.c.x, s.c.y, 6, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.globalAlpha = alpha;
+                        ctx.beginPath();
+                        ctx.arc(s.c.x, s.c.y, 2.5, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.restore();
+                    }
+                }
+            }
+
             // Draw entities
             entities.forEach(entity => {
                 const pos = toCanvas(entity.x, entity.y);
@@ -3187,35 +3477,35 @@
             }
         }
         
-        async function loadWorld() {
+        async function loadWorldFromFile() {
             // First check if there's a save file
             const statusRes = await fetch('api/world/status');
             const statusData = await statusRes.json();
-            
+
             if (!statusData.has_save) {
                 showNotification('No save file found to load', 'error');
                 return;
             }
-            
+
             // Show confirmation dialog
             const confirmed = confirm('⚠️ Load World from File?\n\nThis will DISCARD all current changes and reload the world from the save file.\n\nAre you sure?');
-            
+
             if (!confirmed) {
                 return;
             }
-            
+
             try {
                 const res = await fetch('api/world/load', { method: 'POST' });
-                
+
                 // Check for auth required
                 if (res.status === 401) {
                     showNotification('Authentication required to load', 'info');
-                    showPasswordUnlockDialog(() => loadWorld());
+                    showPasswordUnlockDialog(() => loadWorldFromFile());
                     return;
                 }
-                
+
                 const data = await res.json();
-                
+
                 if (data.success) {
                     refreshEntities();
                     loadWorldStatus();

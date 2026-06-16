@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Open World — Movement Constellation</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  :root {
+    --bg-0: #050816;
+    --bg-1: #0a1228;
+    --bg-2: #0f1a3a;
+    --fg-0: #e0e8ff;
+    --fg-1: #8aa0d4;
+    --fg-2: #5a6b9c;
+    --accent: #4a9eff;
+    --accent-2: #82c4ff;
+    --error: #ff6b6b;
+    --success: #5be584;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg-0);
+    color: var(--fg-0);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+    height: 100%;
+  }
+  body {
+    background: radial-gradient(ellipse at center, var(--bg-2) 0%, var(--bg-0) 75%);
+  }
+  #stars {
+    position: fixed; inset: 0;
+    background:
+      radial-gradient(1px 1px at 12% 18%, rgba(255,255,255,0.6), transparent 50%),
+      radial-gradient(1px 1px at 38% 72%, rgba(255,255,255,0.5), transparent 50%),
+      radial-gradient(1px 1px at 64% 28%, rgba(255,255,255,0.4), transparent 50%),
+      radial-gradient(1px 1px at 82% 88%, rgba(255,255,255,0.5), transparent 50%),
+      radial-gradient(1px 1px at 25% 92%, rgba(255,255,255,0.3), transparent 50%),
+      radial-gradient(1px 1px at 91% 12%, rgba(255,255,255,0.4), transparent 50%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  header {
+    position: fixed; top: 0; left: 0; right: 0;
+    padding: 14px 22px;
+    background: linear-gradient(180deg, rgba(5,8,22,0.92) 0%, rgba(5,8,22,0.6) 80%, transparent 100%);
+    z-index: 10;
+    display: flex; align-items: center; gap: 24px;
+    backdrop-filter: blur(6px);
+  }
+  h1 {
+    margin: 0; font-size: 18px; font-weight: 600;
+    letter-spacing: 0.5px;
+    background: linear-gradient(90deg, var(--accent) 0%, var(--accent-2) 100%);
+    -webkit-background-clip: text; background-clip: text;
+    color: transparent;
+  }
+  .subtitle { color: var(--fg-1); font-size: 12px; }
+  .controls { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .controls label { color: var(--fg-1); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .controls select, .controls button {
+    background: rgba(74, 158, 255, 0.12);
+    color: var(--fg-0);
+    border: 1px solid rgba(74, 158, 255, 0.3);
+    padding: 5px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .controls select:hover, .controls button:hover {
+    background: rgba(74, 158, 255, 0.22);
+    border-color: var(--accent);
+  }
+  .controls button.active {
+    background: rgba(74, 158, 255, 0.35);
+    border-color: var(--accent-2);
+  }
+  #info {
+    position: fixed; bottom: 16px; left: 16px;
+    background: rgba(10, 18, 40, 0.85);
+    border: 1px solid rgba(74, 158, 255, 0.2);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 12px;
+    color: var(--fg-1);
+    z-index: 10;
+    backdrop-filter: blur(6px);
+    max-width: 360px;
+    line-height: 1.5;
+  }
+  #info strong { color: var(--fg-0); }
+  #legend {
+    position: fixed; bottom: 16px; right: 16px;
+    background: rgba(10, 18, 40, 0.85);
+    border: 1px solid rgba(74, 158, 255, 0.2);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 11px;
+    color: var(--fg-1);
+    z-index: 10;
+    backdrop-filter: blur(6px);
+    line-height: 1.6;
+  }
+  #legend .swatch {
+    display: inline-block;
+    width: 24px; height: 2px;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  canvas#sky {
+    position: fixed; inset: 0;
+    z-index: 1;
+    display: block;
+    cursor: crosshair;
+  }
+  .empty {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: var(--fg-2);
+    text-align: center;
+    font-size: 14px;
+    z-index: 5;
+  }
+  .empty h2 { color: var(--fg-1); margin-bottom: 8px; }
+  a.back {
+    color: var(--accent); text-decoration: none;
+    font-size: 11px;
+  }
+  a.back:hover { text-decoration: underline; }
+  #progress {
+    position: fixed; top: 0; left: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent), var(--accent-2), transparent);
+    z-index: 11;
+    width: 0%;
+    transition: width 0.05s linear;
+    box-shadow: 0 0 12px var(--accent);
+  }
+</style>
+</head>
+<body>
+<div id="stars"></div>
+<canvas id="sky"></canvas>
+
+<header>
+  <h1>🌊 Movement Constellation</h1>
+  <span class="subtitle" id="subtitle">loading…</span>
+  <div class="controls">
+    <label>window
+      <select id="days">
+        <option value="2">2 days</option>
+        <option value="4">4 days</option>
+        <option value="7">7 days</option>
+        <option value="14" selected>14 days</option>
+        <option value="30">30 days</option>
+      </select>
+    </label>
+    <label>speed
+      <select id="speed">
+        <option value="3000">slow</option>
+        <option value="1500" selected>normal</option>
+        <option value="700">fast</option>
+        <option value="200">turbo</option>
+      </select>
+    </label>
+    <button id="replay" class="active">↻ replay</button>
+  </div>
+</header>
+
+<div id="progress"></div>
+
+<div id="info">
+  <strong>open world</strong> — entity paths over time
+  <br><a class="back" href="index.html">← back to dashboard</a>
+</div>
+
+<div id="legend">
+  <div><span class="swatch" style="background:#82c4ff; opacity:1"></span>most recent (full opacity)</div>
+  <div><span class="swatch" style="background:#4a9eff; opacity:0.5"></span>~half-window</div>
+  <div><span class="swatch" style="background:#2a5fb0; opacity:0.15"></span>oldest (faded)</div>
+  <div style="margin-top:6px"><span style="color:#ff6b6b">✗</span> failed · <span style="color:#5be584">✓</span> applied</div>
+</div>
+
+<script>
+// ---------- bootstrap ----------
+const canvas = document.getElementById('sky');
+const ctx = canvas.getContext('2d');
+const subtitle = document.getElementById('subtitle');
+const progress = document.getElementById('progress');
+const daysSelect = document.getElementById('days');
+const speedSelect = document.getElementById('speed');
+const replayBtn = document.getElementById('replay');
+
+let W = 0, H = 0, DPR = window.devicePixelRatio || 1;
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', () => { resize(); });
+resize();
+
+// ---------- data ----------
+let rawMovements = [];
+let paths = [];  // grouped by entity_id, sorted by ts
+let bounds = null;
+let animStart = 0;
+let animDuration = 1500;  // ms, total draw time
+let animRaf = null;
+let isAnimating = false;
+
+async function loadMovements() {
+  const days = parseInt(daysSelect.value, 10);
+  subtitle.textContent = `loading last ${days} days…`;
+  try {
+    // Cache-bust: append a timestamp so the browser never serves
+    // a stale response (the OW server has no Cache-Control
+    // headers on web-client files, so the browser may cache the
+    // page body and the response can race in some edge cases).
+    //
+    // USE RELATIVE URL: when served via Caddy at
+    // selenaastra.com/open-world/movements.html, an absolute
+    // `/api/movements` would resolve to selenaastra.com/api/movements
+    // (not /open-world/api/movements), which Caddy has no route for
+    // and 308s. Relative URL "api/movements" resolves relative to
+    // the current page URL, so it works on both:
+    //   - http://localhost:8081/movements.html        (local)
+    //   - https://selenaastra.com/open-world/movements.html (via Caddy)
+    // This is the exact bug AGENTS.md warns about:
+    // "fetch\(['\"]/" web/index.html should return 0 matches".
+    const url = `api/movements?days=${days}&_t=${Date.now()}`;
+    const res = await fetch(url, { cache: 'no-store' });
+    const text = await res.text();
+    if (!text) {
+      throw new Error('empty response from /api/movements (likely cached)');
+    }
+    const json = JSON.parse(text);
+    rawMovements = json.movements || [];
+    const filesRead = json.files_read || 0;
+    const total = json.entries_total || 0;
+    subtitle.textContent = `${rawMovements.length} moves from the last ${days} days · ${filesRead} per-day log files · ${total} entries scanned`;
+    if (rawMovements.length === 0) {
+      showEmpty();
+      return;
+    }
+    preparePaths();
+    computeBounds();
+    // Render the static final state immediately so the user
+    // sees the lines even if the animation hasn't started yet
+    // (or virtual-time is paused in headless). Then start the
+    // animation on top.
+    draw(1);
+    scheduleAnim(true);
+  } catch (e) {
+    subtitle.textContent = 'error: ' + e.message;
+    console.error(e);
+  }
+}
+
+function showEmpty() {
+  // Draw a soft starfield message
+  ctx.fillStyle = 'rgba(5, 8, 22, 0.4)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(138, 160, 212, 0.7)';
+  ctx.font = '16px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('No movement data in the last ' + daysSelect.value + ' days.', W/2, H/2);
+  ctx.font = '12px sans-serif';
+  ctx.fillText('Try expanding the window. Entity movements are logged when location effects are applied.', W/2, H/2 + 24);
+}
+
+function preparePaths() {
+  // Group by entity_id, sort each group by ts
+  const groups = new Map();
+  for (const m of rawMovements) {
+    const id = m.entity_id || m.entity_name || 'unknown';
+    if (!groups.has(id)) groups.set(id, { entity_id: id, entity_name: m.entity_name || id, points: [] });
+    const ts = m.ts;
+    // Skip entries without both x and y
+    if (m.x == null && m.y == null && m.composite != null) {
+      // Composite-only: use it as x, y = 0
+      groups.get(id).points.push({ ts, x: m.composite, y: 0, action: m.action, success: m.success, source: m.source });
+    } else if (m.x != null || m.y != null) {
+      groups.get(id).points.push({ ts, x: m.x ?? 0, y: m.y ?? 0, action: m.action, success: m.success, source: m.source });
+    }
+  }
+  // Sort points by ts
+  for (const p of groups.values()) {
+    p.points.sort((a, b) => a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0);
+  }
+  paths = Array.from(groups.values());
+}
+
+function computeBounds() {
+  if (paths.length === 0) { bounds = null; return; }
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of paths) {
+    for (const pt of p.points) {
+      if (pt.x < minX) minX = pt.x;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.y < minY) minY = pt.y;
+      if (pt.y > maxY) maxY = pt.y;
+    }
+  }
+  // Pad bounds and ensure non-degenerate
+  const rangeX = Math.max(maxX - minX, 0.001);
+  const rangeY = Math.max(maxY - minY, 0.001);
+  const pad = 0.15;
+  minX -= rangeX * pad; maxX += rangeX * pad;
+  minY -= rangeY * pad; maxY += rangeY * pad;
+  bounds = { minX, maxX, minY, maxY };
+}
+
+// Map world (x, y) to screen (px, py)
+function project(x, y) {
+  if (!bounds) return [W/2, H/2];
+  const margin = 80;
+  const sx = margin + (x - bounds.minX) / (bounds.maxX - bounds.minX) * (W - 2*margin);
+  // Y is flipped (world Y up = screen Y up) — invert for the visual
+  const sy = margin + (1 - (y - bounds.minY) / (bounds.maxY - bounds.minY)) * (H - 2*margin);
+  return [sx, sy];
+}
+
+// Age-based opacity: 1.0 for most recent, fades to 0.20 for oldest
+// (per Arcurus 2026-06-14 #openworld 23:01: "make sure the
+// older the movement is the more transparent to a minimum
+// transparency of 20% (on the end of the selected time
+// scale)").  Linear fade clamped to the selected time scale.
+function ageOpacity(ts, nowIso, windowDays) {
+  const tNow = Date.parse(nowIso);
+  const tThen = Date.parse(ts);
+  const ageDays = (tNow - tThen) / (1000 * 60 * 60 * 24);
+  const ratio = Math.max(0, Math.min(1, ageDays / windowDays));
+  // linear fade from 1.0 (newest) to 0.20 (oldest)
+  return 1.0 - ratio * 0.80;
+}
+
+// Shades of blue, indexed by entity index
+const BLUE_PALETTE = [
+  '#82c4ff', '#4a9eff', '#2a6fd6', '#5fb8ff', '#1a4ea0',
+  '#9ad4ff', '#3a8be0', '#6abfff', '#2050a0', '#a8e0ff',
+];
+
+// ---------- animation ----------
+function scheduleAnim(restart) {
+  if (animRaf) cancelAnimationFrame(animRaf);
+  if (restart) {
+    animStart = performance.now();
+    animDuration = parseInt(speedSelect.value, 10);
+    isAnimating = true;
+  }
+  loop();
+}
+
+function loop() {
+  const now = performance.now();
+  const t = (now - animStart) / animDuration;  // 0..1
+  if (t > 1) {
+    draw(1);
+    isAnimating = false;
+    return;
+  }
+  draw(t);
+  animRaf = requestAnimationFrame(loop);
+}
+
+function draw(progressT) {
+  // Hard clear each frame. The animation's progressive reveal
+  // is the visual effect; we don't layer fades (which caused
+  // the static final state to fade out before screenshotting).
+  ctx.fillStyle = '#050816';
+  ctx.fillRect(0, 0, W, H);
+
+  if (paths.length === 0 || !bounds) return;
+
+  const windowDays = parseInt(daysSelect.value, 10);
+  const newestTs = paths.reduce((acc, p) => {
+    const last = p.points[p.points.length-1];
+    return last && last.ts > acc ? last.ts : acc;
+  }, '');
+  progress.style.width = (progressT * 100).toFixed(1) + '%';
+
+  // For each path, draw the line segments up to the interpolated cut-off
+  for (let pi = 0; pi < paths.length; pi++) {
+    const path = paths[pi];
+    if (path.points.length < 1) continue;
+    const color = BLUE_PALETTE[pi % BLUE_PALETTE.length];
+
+    // Compute the "global progress cutoff": how far through the timeline are we?
+    // We need the global time range to interpolate per-point.
+    const allTs = path.points.map(p => Date.parse(p.ts));
+    const minTs = Math.min(...allTs);
+    const maxTs = Math.max(...allTs);
+    const range = Math.max(maxTs - minTs, 1);
+    const cutoff = minTs + range * progressT;
+
+    // For each consecutive pair, if cutoff is between their timestamps, draw partial
+    for (let i = 0; i < path.points.length; i++) {
+      const pt = path.points[i];
+      const ptMs = Date.parse(pt.ts);
+      if (ptMs > cutoff) {
+        // future point — not yet drawn
+        // but draw a tiny target marker at the projection (very faint)
+        if (i > 0) {
+          const [tx, ty] = project(path.points[i-1].x, path.points[i-1].y);
+          const [fx, fy] = project(pt.x, pt.y);
+          const [cx, cy] = project(
+            path.points[i-1].x + (pt.x - path.points[i-1].x) * 0,
+            path.points[i-1].y + (pt.y - path.points[i-1].y) * 0
+          );
+          ctx.save();
+          ctx.globalAlpha = 0.12;
+          ctx.strokeStyle = color;
+          ctx.setLineDash([2, 4]);
+          ctx.beginPath();
+          ctx.moveTo(tx, ty);
+          ctx.lineTo(fx, fy);
+          ctx.stroke();
+          ctx.restore();
+        }
+        break;
+      }
+      // This point is in the past
+      const opacity = ageOpacity(pt.ts, newestTs, windowDays);
+      const [px, py] = project(pt.x, pt.y);
+
+      // Draw the dot
+      const radius = pt.success ? 4 : 3;
+      ctx.save();
+      ctx.globalAlpha = opacity;
+      if (pt.success) {
+        // Glow
+        const grad = ctx.createRadialGradient(px, py, 0, px, py, radius * 4);
+        grad.addColorStop(0, color);
+        grad.addColorStop(0.3, color + '88');
+        grad.addColorStop(1, 'transparent');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(px, py, radius * 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(px, py, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      } else {
+        // Failed: red X
+        ctx.strokeStyle = '#ff6b6b';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(px - radius, py - radius);
+        ctx.lineTo(px + radius, py + radius);
+        ctx.moveTo(px + radius, py - radius);
+        ctx.lineTo(px - radius, py + radius);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      // Draw segment to the previous point
+      if (i > 0) {
+        const prev = path.points[i-1];
+        const [ppx, ppy] = project(prev.x, prev.y);
+        const segOpacity = (ageOpacity(pt.ts, newestTs, windowDays) + ageOpacity(prev.ts, newestTs, windowDays)) / 2;
+        ctx.save();
+        ctx.globalAlpha = segOpacity;
+        // If we're mid-segment (cutoff between prev and this), only draw partial
+        const prevMs = Date.parse(prev.ts);
+        let endX = px, endY = py;
+        if (prevMs < cutoff && ptMs > cutoff) {
+          // shouldn't happen since we break on future, but be safe
+          const f = (cutoff - prevMs) / (ptMs - prevMs);
+          endX = ppx + (px - ppx) * f;
+          endY = ppy + (py - ppy) * f;
+        }
+        // Animate the leading edge with a brighter glow
+        const isLeadingEdge = (i === path.points.length - 1) || (Date.parse(path.points[i+1]?.ts || '') > cutoff);
+        if (isLeadingEdge && progressT < 1) {
+          // Bright leading edge
+          ctx.shadowBlur = 14;
+          ctx.shadowColor = color;
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.6;
+          ctx.beginPath();
+          ctx.moveTo(ppx, ppy);
+          ctx.lineTo(endX, endY);
+          ctx.stroke();
+          ctx.shadowBlur = 0;
+        }
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.moveTo(ppx, ppy);
+        ctx.lineTo(endX, endY);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+
+  // Draw entity labels at the last drawn point
+  for (let pi = 0; pi < paths.length; pi++) {
+    const path = paths[pi];
+    if (path.points.length < 1) continue;
+    const lastDrawn = [...path.points].reverse().find(pt => Date.parse(pt.ts) <= (Math.min(...path.points.map(p => Date.parse(p.ts))) + (Math.max(...path.points.map(p => Date.parse(p.ts))) - Math.min(...path.points.map(p => Date.parse(p.ts)))) * progressT));
+    if (!lastDrawn) continue;
+    const [lx, ly] = project(lastDrawn.x, lastDrawn.y);
+    const color = BLUE_PALETTE[pi % BLUE_PALETTE.length];
+    ctx.save();
+    ctx.font = '11px sans-serif';
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.95;
+    ctx.fillText(path.entity_name, lx + 8, ly - 8);
+    ctx.font = '9px monospace';
+    ctx.fillStyle = 'rgba(138, 160, 212, 0.7)';
+    ctx.fillText(`(${lastDrawn.x.toFixed(1)}, ${lastDrawn.y.toFixed(1)})`, lx + 8, ly + 4);
+    ctx.restore();
+  }
+}
+
+// ---------- controls ----------
+daysSelect.addEventListener('change', loadMovements);
+speedSelect.addEventListener('change', () => scheduleAnim(true));
+replayBtn.addEventListener('click', () => scheduleAnim(true));
+
+// Auto-loop: when animation finishes, wait 2s, then replay
+function autoLoop() {
+  if (!isAnimating && paths.length > 0) {
+    setTimeout(() => scheduleAnim(true), 2000);
+  }
+  requestAnimationFrame(autoLoop);
+}
+requestAnimationFrame(autoLoop);
+
+// Initial load
+loadMovements();
+</script>
+</body>
+</html>
