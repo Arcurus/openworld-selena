@@ -27,3 +27,10 @@ __pycache__/
 *.pyo
 
 # Rust
+
+# Secrets, backup copies, tool state (added 2026-10-07 maint by Yue, approved by Arcurus)
+.env.*
+.api_token
+.api_token_*
+*.bak*
+.brv/
