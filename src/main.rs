@@ -2939,16 +2939,253 @@ pub struct HistorySummaryReplace {
 pub enum HistorySummaryReplaceOneOrMany {
     Single(HistorySummaryReplace),
     Many(Vec<HistorySummaryReplace>),
+    /// The LLM emitted the replacement text as a bare JSON string
+    /// instead of the `{old_part, new_part}` object (observed ~90
+    /// times between 2026-06 and 2026-10 — by far the most common
+    /// *field-level* malformation). Kept as its own variant because
+    /// the intent is ambiguous: the text may be a full rewrite of
+    /// the summary or an append to it. The ambiguity is resolved at
+    /// apply time against the length of the stored summary — see
+    /// `into_vec_with_current`.
+    BareText(String),
 }
 
 impl HistorySummaryReplaceOneOrMany {
     /// Flatten to a `Vec<HistorySummaryReplace>` regardless of the
     /// original shape. Single becomes a vec of one; Many is cloned.
+    ///
+    /// A `BareText` payload flattens to an *append* replace (empty
+    /// `old_part`). That is the conservative default: it never
+    /// discards the stored summary. Callers that know the current
+    /// summary text should prefer `into_vec_with_current`, which can
+    /// tell a rewrite from an append.
     pub fn into_vec(self) -> Vec<HistorySummaryReplace> {
         match self {
             HistorySummaryReplaceOneOrMany::Single(r) => vec![r],
             HistorySummaryReplaceOneOrMany::Many(rs) => rs,
+            HistorySummaryReplaceOneOrMany::BareText(text) => vec![HistorySummaryReplace {
+                old_part: String::new(),
+                new_part: text,
+            }],
         }
+    }
+
+    /// Flatten to a replace chain, using the *current* summary text to
+    /// disambiguate a bare-string payload.
+    ///
+    /// The LLM emits `"history_summary_replace": "<text>"` when it
+    /// cannot keep the `{old_part, new_part}` shape. The intent is
+    /// ambiguous — `<text>` may be the whole new summary or a new
+    /// sentence to append — so we compare its length against the
+    /// stored summary:
+    ///
+    ///   - `text` at least half as long as the current summary
+    ///     → treated as a full rewrite (`!ALL!`), because a short
+    ///       append would not be half the size of the summary it
+    ///       appends to.
+    ///   - `text` much shorter than the current summary → treated
+    ///     as an append (empty `old_part`).
+    ///
+    /// With no stored summary yet, any text becomes the initial
+    /// content (the append path already handles an empty target).
+    pub fn into_vec_with_current(self, current: &str) -> Vec<HistorySummaryReplace> {
+        match self {
+            HistorySummaryReplaceOneOrMany::BareText(text) => {
+                let cur_len = current.chars().count();
+                let txt_len = text.chars().count();
+                if cur_len == 0 || txt_len.saturating_mul(2) >= cur_len {
+                    vec![HistorySummaryReplace {
+                        old_part: "!ALL!".to_string(),
+                        new_part: text,
+                    }]
+                } else {
+                    vec![HistorySummaryReplace {
+                        old_part: String::new(),
+                        new_part: text,
+                    }]
+                }
+            }
+            other => other.into_vec(),
+        }
+    }
+}
+
+/// Normalise a `history_summary_replace` object key into
+/// `Some(("old" | "new", suffix))`.
+///
+/// The LLM does not reliably spell the two fields `old_part` /
+/// `new_part`. Observed in production llm-logs between 2026-06 and
+/// 2026-10:
+///   - `old_point` / `new_point` — "point" instead of "part"
+///   - `old` / `new`             — the suffix dropped entirely
+///   - `old_part` / `new_port`   — "port" instead of "part"
+///   - `old_part` / `.new_part`  — stray leading dot on one key
+///
+/// A leading '.' is stripped, the key is lowercased, and the "old" /
+/// "new" prefix is removed; what remains is the *suffix* used to
+/// pair an old-value with its new-value. Keys that are neither
+/// "old*" nor "new*" are ignored.
+fn normalise_hsr_key(key: &str) -> Option<(&'static str, String)> {
+    let k = key.trim().trim_start_matches('.').trim().to_ascii_lowercase();
+    if let Some(rest) = k.strip_prefix("old") {
+        return Some(("old", rest.trim_start_matches(|c| c == '_' || c == '-').to_string()));
+    }
+    if let Some(rest) = k.strip_prefix("new") {
+        return Some(("new", rest.trim_start_matches(|c| c == '_' || c == '-').to_string()));
+    }
+    None
+}
+
+/// Pair `old`/`new` entries collected from a replace object into
+/// `HistorySummaryReplace` operations.
+///
+/// Pass 1 pairs entries whose suffixes are equal (`old_part` with
+/// `new_part`). Pass 2 pairs whatever is left over positionally,
+/// which is what rescues the `old_part` / `new_port` typo (equal
+/// lengths, different suffixes).
+fn pair_hsr_entries(
+    olds: &[(String, String)],
+    news: &[(String, String)],
+) -> Vec<HistorySummaryReplace> {
+    let mut out: Vec<HistorySummaryReplace> = Vec::new();
+    let mut old_used = vec![false; olds.len()];
+    let mut new_used = vec![false; news.len()];
+
+    // Pass 1 — suffix match.
+    for (i, (old_suffix, old_value)) in olds.iter().enumerate() {
+        if let Some(j) = news
+            .iter()
+            .enumerate()
+            .find(|(j, (new_suffix, _))| !new_used[*j] && new_suffix == old_suffix)
+            .map(|(j, _)| j)
+        {
+            old_used[i] = true;
+            new_used[j] = true;
+            out.push(HistorySummaryReplace {
+                old_part: old_value.clone(),
+                new_part: news[j].1.clone(),
+            });
+        }
+    }
+
+    // Pass 2 — positional pairing of the leftovers (typo tolerance).
+    let mut leftovers: Vec<usize> = (0..news.len()).filter(|j| !new_used[*j]).collect();
+    for (i, (_, old_value)) in olds.iter().enumerate() {
+        if old_used[i] {
+            continue;
+        }
+        if let Some(j) = leftovers.first().copied() {
+            leftovers.remove(0);
+            old_used[i] = true;
+            new_used[j] = true;
+            out.push(HistorySummaryReplace {
+                old_part: old_value.clone(),
+                new_part: news[j].1.clone(),
+            });
+        }
+    }
+
+    out
+}
+
+/// Parse a `history_summary_replace` object tolerantly.
+///
+/// Accepts:
+///   - the canonical `{old_part, new_part}`
+///   - alias spellings (`old_point`/`new_point`, `old`/`new`,
+///     `old_part`/`new_port`, `.new_part`, …) — see
+///     `normalise_hsr_key`
+///   - the `!ALL!` full-rewrite convention expressed as a KEY
+///     (`{"!ALL!": "<the whole new summary>"}`) rather than as the
+///     value of `old_part`
+///
+/// Returns `None` when nothing usable can be extracted.
+fn parse_hsr_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<HistorySummaryReplaceOneOrMany> {
+    // The `!ALL!` convention as a key. `apply_history_summary_replaces`
+    // already understands `old_part == "!ALL!"` as "rewrite the whole
+    // summary from new_part", so we map the key form onto exactly
+    // that.
+    for (key, value) in map {
+        if key.trim().eq_ignore_ascii_case("!ALL!") {
+            if let Some(text) = value.as_str() {
+                return Some(HistorySummaryReplaceOneOrMany::Single(HistorySummaryReplace {
+                    old_part: "!ALL!".to_string(),
+                    new_part: text.to_string(),
+                }));
+            }
+        }
+    }
+
+    let mut olds: Vec<(String, String)> = Vec::new();
+    let mut news: Vec<(String, String)> = Vec::new();
+    for (key, value) in map {
+        let Some((kind, suffix)) = normalise_hsr_key(key) else {
+            continue;
+        };
+        // Only string values are usable — `old_part`/`new_part` are
+        // strings. A non-string value is ignored rather than
+        // stringified (a number where a sentence belongs is a sign
+        // the LLM meant something else entirely).
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        match kind {
+            "old" => olds.push((suffix, text.to_string())),
+            "new" => news.push((suffix, text.to_string())),
+            _ => {}
+        }
+    }
+
+    let pairs = pair_hsr_entries(&olds, &news);
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(HistorySummaryReplaceOneOrMany::Many(pairs))
+    }
+}
+
+/// Parse any `history_summary_replace` payload tolerantly.
+///
+/// This is the safety net that keeps a malformed *field* from
+/// destroying the whole LLM action. See the `Deserialize` impl below
+/// for the rationale and the production numbers.
+fn parse_hsr_value(value: &serde_json::Value) -> Option<HistorySummaryReplaceOneOrMany> {
+    match value {
+        // A bare string: the LLM wrote the replacement text directly.
+        serde_json::Value::String(text) => {
+            Some(HistorySummaryReplaceOneOrMany::BareText(text.clone()))
+        }
+        serde_json::Value::Object(map) => parse_hsr_object(map),
+        serde_json::Value::Array(items) => {
+            let mut out: Vec<HistorySummaryReplace> = Vec::new();
+            let mut skipped = 0usize;
+            for item in items {
+                match parse_hsr_value(item) {
+                    Some(HistorySummaryReplaceOneOrMany::Single(r)) => out.push(r),
+                    Some(HistorySummaryReplaceOneOrMany::Many(rs)) => out.extend(rs),
+                    Some(HistorySummaryReplaceOneOrMany::BareText(text)) => {
+                        // A bare string inside an array: an append.
+                        out.push(HistorySummaryReplace {
+                            old_part: String::new(),
+                            new_part: text,
+                        });
+                    }
+                    None => skipped += 1,
+                }
+            }
+            if skipped > 0 {
+                eprintln!(
+                    "[hsr-repair] history_summary_replace: skipped {} unusable array item(s); \
+                     applied the remaining {} replace(s)",
+                    skipped,
+                    out.len()
+                );
+            }
+            Some(HistorySummaryReplaceOneOrMany::Many(out))
+        }
+        _ => None,
     }
 }
 
@@ -2975,18 +3212,68 @@ impl<'de> Deserialize<'de> for HistorySummaryReplaceOneOrMany {
                     Single(HistorySummaryReplace),
                     Many(Vec<HistorySummaryReplace>),
                 }
-                let raw = Raw::deserialize(other).map_err(|e| {
-                    D::Error::custom(format!(
-                        "history_summary_replace: expected \
-                         {{old_part, new_part}} or array, or empty \
-                         {{}}/[]; got: {}",
-                        e
-                    ))
-                })?;
-                Ok(match raw {
-                    Raw::Single(s) => HistorySummaryReplaceOneOrMany::Single(s),
-                    Raw::Many(v) => HistorySummaryReplaceOneOrMany::Many(v),
-                })
+                match Raw::deserialize(other.clone()) {
+                    Ok(Raw::Single(s)) => Ok(HistorySummaryReplaceOneOrMany::Single(s)),
+                    Ok(Raw::Many(v)) => Ok(HistorySummaryReplaceOneOrMany::Many(v)),
+                    Err(strict_err) => {
+                        // The strict shape did not match. Before this
+                        // fallback existed, the error propagated all
+                        // the way out of `LlmActionResponse` and the
+                        // **entire LLM action was dropped** — the
+                        // `action` name, the `outcome`, the `effects`
+                        // and the `narrative` all lost, because one
+                        // optional summary-edit field had the wrong
+                        // shape.
+                        //
+                        // Production impact (open-world-selena
+                        // error-logs, 2026-06 → 2026-10): 1,809
+                        // dropped LLM actions in total, of which the
+                        // ones where the *outer JSON was valid* and
+                        // only this field was malformed were the
+                        // single largest recoverable group — 16 of
+                        // the 29 failures in the last 7 days
+                        // (2026-10-18 → 2026-10-24), i.e. 55%.
+                        //
+                        // The tolerant path below recovers the shapes
+                        // we actually observed in the logs:
+                        //   - a bare JSON string instead of the
+                        //     `{old_part, new_part}` object (~90
+                        //     occurrences; the most common one)
+                        //   - the `!ALL!` full-rewrite convention
+                        //     expressed as a key (10 occurrences)
+                        //   - alias / typo spellings of the two
+                        //     field names (6 occurrences)
+                        //
+                        // If even the tolerant path finds nothing
+                        // usable, we degrade to an EMPTY replace
+                        // chain instead of failing. An empty chain
+                        // leaves the summary untouched and lets the
+                        // rest of the action land — which is
+                        // strictly better than dropping the action.
+                        // The same reasoning already applied to the
+                        // `{}` / `[]` case above.
+                        match parse_hsr_value(&other) {
+                            Some(parsed) => {
+                                eprintln!(
+                                    "[hsr-repair] history_summary_replace had an unexpected \
+                                     shape ({}); recovered it instead of dropping the whole \
+                                     LLM action",
+                                    strict_err
+                                );
+                                Ok(parsed)
+                            }
+                            None => {
+                                eprintln!(
+                                    "[hsr-repair] history_summary_replace was unusable ({}); \
+                                     ignoring the summary edit and keeping the rest of the \
+                                     LLM action",
+                                    strict_err
+                                );
+                                Ok(HistorySummaryReplaceOneOrMany::Many(Vec::new()))
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -5059,6 +5346,40 @@ fn parse_llm_action_response(raw: &str) -> Result<(LlmActionResponse, Option<Str
                 }
             }
 
+            // **Fixup #4 — parse the FIRST complete JSON value and
+            // ignore trailing content** (per selena-open-world-worker
+            // 2026-10-25 #openworld): the LLM sometimes emits the
+            // JSON object followed by extra prose (or a second
+            // object). The `raw[start..=end]` extraction above uses
+            // `rfind('}')`, which happily slices that trailing prose
+            // into the JSON string; serde then reports "trailing
+            // characters at line N column M" and the whole action is
+            // dropped.
+            //
+            // `serde_json::Deserializer::into_iter` yields the first
+            // complete value in the stream and ignores whatever
+            // follows — exactly the recovery we want. We only accept
+            // it when the first value is an object (an action
+            // response); a stray scalar or array is not something we
+            // can salvage into an action.
+            //
+            // Production impact: 22 "Extra data" + 10 "trailing
+            // characters" failures in the 2026-10 error-logs.
+            let mut first_value_stream =
+                serde_json::Deserializer::from_str(json_str).into_iter::<serde_json::Value>();
+            if let Some(Ok(first_value)) = first_value_stream.next() {
+                if first_value.is_object() {
+                    if let Ok(parsed) = serde_json::from_value::<LlmActionResponse>(first_value) {
+                        return Ok((parsed, Some(
+                            "parse_llm_action_response: LLM response contained trailing content \
+                             after the JSON object; parsed the first complete JSON value and \
+                             ignored the rest."
+                                .to_string(),
+                        )));
+                    }
+                }
+            }
+
             // No fixup produced a parseable string. Surface the
             // most useful error.
             if repaired3 != candidate2 {
@@ -5526,10 +5847,20 @@ async fn process_action_handler(
                         }
                         // Borrow current state immutably, then release
                         // the borrow before assigning to the entity.
-                        let replaces_vec: Vec<HistorySummaryReplace> =
-                            replaces_one_or_many.into_vec();
+                        //
+                        // `into_vec_with_current` (not `into_vec`) so that
+                        // a bare-string replace payload — the LLM
+                        // writing the replacement text directly instead
+                        // of the `{old_part, new_part}` object — can be
+                        // resolved against the stored summary. A bare
+                        // string is either a full rewrite or an append,
+                        // and only the length of the current summary
+                        // tells us which.
                         let result = {
                             let current = entity.history_summary.as_deref();
+                            let replaces_vec: Vec<HistorySummaryReplace> =
+                                replaces_one_or_many
+                                    .into_vec_with_current(current.unwrap_or(""));
                             apply_history_summary_replaces(
                                 current,
                                 &replaces_vec,
@@ -10175,15 +10506,170 @@ mod history_summary_replace_tests {
         assert_eq!(v[1].old_part, "c");
     }
 
-    // -- edge: a non-empty object missing `new_part` still errors
-    //    (regression guard: we only relaxed the EMPTY case, real
-    //    malformed payloads should still be rejected so the operator
-    //    notices).
+    // -- edge: a non-empty object missing `new_part` no longer
+    //    errors. It used to, and that error propagated out of
+    //    `LlmActionResponse` and dropped the ENTIRE LLM action
+    //    (action name, outcome, effects, narrative) because one
+    //    optional summary-edit field had the wrong shape. It now
+    //    degrades to an empty replace chain: the summary is left
+    //    untouched and the rest of the action still lands.
+    //    (Changed by selena-open-world-worker 2026-10-25 #openworld.)
     #[test]
-    fn one_or_many_rejects_partial_object() {
-        let result: Result<HistorySummaryReplaceOneOrMany, _> =
-            serde_json::from_str(r#"{"old_part":"a"}"#);
-        assert!(result.is_err(), "missing new_part must still fail");
+    fn one_or_many_partial_object_degrades_to_noop() {
+        let parsed: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str(r#"{"old_part":"a"}"#)
+                .expect("partial object must not fail the whole action");
+        assert_eq!(parsed.into_vec().len(), 0);
+    }
+
+    // -- the LLM emitting the replacement text as a bare JSON string
+    //    (the single most common field-level malformation: ~90
+    //    occurrences in the 2026-06 → 2026-10 error-logs).
+    #[test]
+    fn one_or_many_deserializes_bare_string_as_bare_text() {
+        let parsed: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str(r#""the whole new summary""#)
+                .expect("bare string should parse");
+        match parsed {
+            HistorySummaryReplaceOneOrMany::BareText(text) => {
+                assert_eq!(text, "the whole new summary");
+            }
+            other => panic!("expected BareText, got {:?}", other),
+        }
+    }
+
+    // -- a bare string at least half as long as the stored summary is
+    //    a full rewrite (`!ALL!`); a much shorter one is an append.
+    #[test]
+    fn bare_text_resolution_uses_current_length() {
+        let long_current = "x".repeat(1000);
+
+        let rewrite =
+            HistorySummaryReplaceOneOrMany::BareText("y".repeat(600)).into_vec_with_current(&long_current);
+        assert_eq!(rewrite.len(), 1);
+        assert_eq!(rewrite[0].old_part, "!ALL!", "a long bare text is a rewrite");
+
+        let short = HistorySummaryReplaceOneOrMany::BareText("a short addition".to_string())
+            .into_vec_with_current(&long_current);
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].old_part, "", "a short bare text is an append");
+
+        // With no stored summary yet, both paths land on the same
+        // outcome: the text becomes the initial content.
+        let no_current =
+            HistorySummaryReplaceOneOrMany::BareText("first ever summary".to_string())
+                .into_vec_with_current("");
+        let applied = apply_history_summary_replaces(None, &no_current, 10_000);
+        assert_eq!(applied.new_summary.as_deref(), Some("first ever summary"));
+    }
+
+    // -- the `!ALL!` full-rewrite convention expressed as a KEY
+    //    instead of as the value of `old_part` (10 occurrences in the
+    //    2026-06 → 2026-10 error-logs).
+    #[test]
+    fn one_or_many_deserializes_all_bang_key_as_rewrite() {
+        let parsed: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str(r#"{"!ALL!":"the brand new summary"}"#)
+                .expect("!ALL! key should parse");
+        let v = parsed.into_vec();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].old_part, "!ALL!");
+        assert_eq!(v[0].new_part, "the brand new summary");
+    }
+
+    // -- alias / typo spellings of the two field names, all observed
+    //    in production logs.
+    #[test]
+    fn one_or_many_tolerates_alias_spellings() {
+        // old_point / new_point
+        let p: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str(r#"{"old_point":"a","new_point":"b"}"#).unwrap();
+        let v = p.into_vec();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].old_part, "a");
+        assert_eq!(v[0].new_part, "b");
+
+        // old / new (suffix dropped entirely)
+        let p: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str(r#"{"old":"a","new":"b"}"#).unwrap();
+        let v = p.into_vec();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].old_part, "a");
+        assert_eq!(v[0].new_part, "b");
+
+        // old_part / new_port (typo in the "new" key only)
+        let p: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str(r#"{"old_part":"a","new_port":"b"}"#).unwrap();
+        let v = p.into_vec();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].old_part, "a");
+        assert_eq!(v[0].new_part, "b");
+
+        // old_part / .new_part (stray leading dot)
+        let p: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str(r#"{"old_part":"a",".new_part":"b"}"#).unwrap();
+        let v = p.into_vec();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].old_part, "a");
+        assert_eq!(v[0].new_part, "b");
+    }
+
+    // -- an array where ONE item is malformed keeps the good items
+    //    instead of failing the whole chain (and the whole action).
+    #[test]
+    fn one_or_many_array_skips_only_the_unusable_item() {
+        let parsed: HistorySummaryReplaceOneOrMany = serde_json::from_str(
+            r#"[{"old_part":"a","new_part":"b"},{"totally":"wrong"},{"old_part":"c","new_part":"d"}]"#,
+        )
+        .expect("array with one bad item must still parse");
+        let v = parsed.into_vec();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].old_part, "a");
+        assert_eq!(v[1].old_part, "c");
+    }
+
+    // -- a payload with nothing usable in it degrades to an empty
+    //    chain rather than failing the action.
+    #[test]
+    fn one_or_many_unusable_payload_degrades_to_noop() {
+        let parsed: HistorySummaryReplaceOneOrMany =
+            serde_json::from_str(r#"{"totally":"wrong"}"#)
+                .expect("unusable payload must not fail the whole action");
+        assert_eq!(parsed.into_vec().len(), 0);
+    }
+
+    // -- fixup #4: trailing content after the JSON object is ignored
+    //    and the first complete value is used.
+    //
+    //    Note the trailing content has to contain a `}`: the
+    //    `raw[start..=end]` extraction in `parse_llm_action_response`
+    //    slices from the first `{` to the LAST `}`, so trailing prose
+    //    *without* a brace is already handled by the strict parse.
+    //    Trailing prose *with* a brace (or a second JSON object) is
+    //    what produced the production "trailing characters" failures.
+    #[test]
+    fn parse_llm_action_response_ignores_trailing_content() {
+        let raw = r#"{"action":"do_a_thing","outcome":"fine","effects":{},"narrative":"narr"}"#;
+
+        // Trailing prose that contains a closing brace.
+        let with_trailer = format!("{}\n\nNote: the model also wrote {{this}}.", raw);
+        let (parsed, warning) = parse_llm_action_response(&with_trailer)
+            .expect("trailing content must not drop the action");
+        assert_eq!(parsed.action, "do_a_thing");
+        assert!(
+            warning.is_some(),
+            "the repair must be reported to the operator"
+        );
+
+        // A second JSON object appended to the first.
+        let two_objects = format!("{}{}", raw, raw);
+        let (parsed, warning) = parse_llm_action_response(&two_objects)
+            .expect("trailing content must not drop the action");
+        assert_eq!(parsed.action, "do_a_thing");
+        assert!(
+            warning.is_some(),
+            "the repair must be reported to the operator"
+        );
     }
 
     // -- find_replace_range: strict matches --
