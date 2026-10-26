@@ -10638,6 +10638,47 @@ mod history_summary_replace_tests {
         assert_eq!(parsed.into_vec().len(), 0);
     }
 
+    // -- Regression test against REAL production failures.
+    //
+    //    `tests/fixtures/llm_parse_regression.json` holds LLM
+    //    responses taken verbatim from the open-world-selena
+    //    error-logs — responses that were DROPPED in production
+    //    because of the malformation they contain. Every one of them
+    //    must parse now.
+    //
+    //    This is the real proof of the fix: the synthetic tests above
+    //    pin the behaviour, these pin the actual data.
+    #[test]
+    fn real_production_failures_now_parse() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/llm_parse_regression.json");
+        let text = std::fs::read_to_string(&path).expect("fixture file must exist");
+        let cases: Vec<String> =
+            serde_json::from_str(&text).expect("fixture must be a JSON array of strings");
+        assert!(!cases.is_empty(), "fixture must not be empty");
+
+        let mut failures: Vec<String> = Vec::new();
+        for raw in &cases {
+            match parse_llm_action_response(raw) {
+                Ok((parsed, _warning)) => {
+                    assert!(
+                        !parsed.action.is_empty(),
+                        "a recovered response must still carry its action name"
+                    );
+                }
+                Err(e) => {
+                    let head: String = raw.chars().take(120).collect();
+                    failures.push(format!("{:?} — input starts: {}", e, head));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "these real production payloads still fail to parse:\n{}",
+            failures.join("\n")
+        );
+    }
+
     // -- fixup #4: trailing content after the JSON object is ignored
     //    and the first complete value is used.
     //
