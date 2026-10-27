@@ -5380,6 +5380,77 @@ fn parse_llm_action_response(raw: &str) -> Result<(LlmActionResponse, Option<Str
                 }
             }
 
+            // **Fixup #5 — structural JSON repair** (per
+            // selena-open-world-worker 2026-10-27 #openworld): the
+            // four fixups above each target ONE known shape. A probe
+            // over every distinct failing response in the
+            // open-world-selena llm-logs (2026-06 → 2026-10, 1,809
+            // distinct responses) showed that the failures that
+            // survived them were dominated by *structural* damage:
+            // the JSON itself is broken, not just one field of it
+            // (a stray closing quote after a number, a dangling
+            // empty key, raw control characters in a string, an
+            // invalid escape, a truncated response).
+            //
+            // `repair_broken_json` fixes those shapes in one
+            // string-aware pass — it never invents content, it only
+            // drops what cannot be part of valid JSON and closes
+            // what was left open.
+            let repaired5 = repair_broken_json(json_str);
+            if repaired5 != json_str {
+                if let Ok(parsed) = serde_json::from_str::<LlmActionResponse>(&repaired5) {
+                    return Ok((parsed, Some(format!(
+                        "parse_llm_action_response: LLM response had broken JSON structure \
+                         and was repaired (dropped the characters that cannot be part of \
+                         valid JSON and closed the structures that were left open)."
+                    ))));
+                }
+            }
+
+            // **Fixup #6 — alternative response FORMATS** (per
+            // selena-open-world-worker 2026-10-27 #openworld): the
+            // LLM does not always answer with a JSON *object*. It
+            // sometimes answers with a JSON array of `[key, value]`
+            // pairs, or with markdown sections. Both carry every
+            // field — they were being dropped whole because the
+            // shape did not match `LlmActionResponse`.
+            if let Some(parsed) = parse_pair_array_response(raw) {
+                return Ok((parsed, Some(format!(
+                    "parse_llm_action_response: LLM answered with a JSON array of \
+                     [key, value] pairs instead of a JSON object; it was converted \
+                     and the action was applied."
+                ))));
+            }
+            if let Some(parsed) = parse_markdown_response(raw) {
+                return Ok((parsed, Some(format!(
+                    "parse_llm_action_response: LLM answered with markdown sections \
+                     instead of JSON; the action, outcome, effects and narrative were \
+                     read out of it and the action was applied."
+                ))));
+            }
+
+            // **Fixup #7 — field-level salvage** (per
+            // selena-open-world-worker 2026-10-27 #openworld): some
+            // responses are not "almost right", they are degenerate
+            // — the model fell into a repetition loop, or the text
+            // was cut and then continued with garbage. No amount of
+            // bracket-balancing makes those parse, but their LEADING
+            // fields are usually intact: the action name, the
+            // outcome, the narrative. 935 of the 1,141 responses
+            // that still failed after fixups #1–#5 carried a usable
+            // action name and were being dropped whole.
+            //
+            // This is the last resort: it reads the fields it can
+            // read with confidence and leaves the rest empty. The
+            // summary edit is skipped unless its own blob parses.
+            if let Some(salvaged) = salvage_llm_fields(json_str) {
+                return Ok((salvaged, Some(format!(
+                    "parse_llm_action_response: LLM response was structurally broken and \
+                     its fields were salvaged individually (the action name, outcome, \
+                     narrative and effects were recovered; the response was degraded)."
+                ))));
+            }
+
             // No fixup produced a parseable string. Surface the
             // most useful error.
             if repaired3 != candidate2 {
@@ -5584,6 +5655,730 @@ fn strip_plus_signs_from_numbers_outside_strings(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Fixup #5 — structural JSON repair
+// ---------------------------------------------------------------------------
+
+/// Repair the *structural* malformations the LLM produces, so that a
+/// response it "almost" got right still lands instead of being dropped
+/// whole.
+///
+/// **Why this exists.** The four earlier fixups (#1 empty-key bug,
+/// #2 double-brace wrappers, #3 signed numbers, #4 trailing content)
+/// each target ONE known shape. A probe over every distinct failing
+/// response in the open-world-selena llm-logs (2026-06 → 2026-10,
+/// 1,809 distinct responses, 668 of which already parsed) showed
+/// that the remaining 1,141 failures were dominated by *structural*
+/// damage — the JSON itself is broken, not just one field of it:
+///
+///   - a stray closing quote right after a number
+///     (`"self.wealth": -8", "self.knowledge": +12"`) — 174
+///   - a dangling empty key with no value (`{"old_part":"...",""]}`) — 2
+///   - raw control characters inside a string literal (a literal
+///     newline in a narrative, or a run of NUL bytes) — 84
+///   - an invalid escape sequence (`\'`) — 14
+///   - a leading `+` on a number (`+12`) — 349
+///   - a response that stops mid-object (truncated) — 190
+///
+/// **How.** A single string-aware pass. String literals are tracked
+/// (with their escapes) so a brace, quote or comma inside a
+/// narrative is never mistaken for JSON structure. The pass never
+/// invents content: it only drops the characters that cannot be part
+/// of valid JSON, re-escapes the control characters that can, and
+/// closes the structures that were left open.
+///
+/// This is a REPAIR, not a guess: if the response is structurally
+/// broken in a way this pass cannot fix (e.g. the model degenerated
+/// into a repetition loop), the pass leaves it broken and the caller
+/// falls through to the field-level salvage.
+fn repair_broken_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    // Stack of expected closing brackets ('}' for objects, ']' for arrays).
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    // The last non-whitespace character emitted OUTSIDE a string.
+    // Used to recognise the shapes that are only malformed in
+    // context: a quote right after a number, a dangling empty key.
+    let mut last_sig: Option<char> = None;
+    // Position in `out` where the last `,` was written (used to
+    // remove a dangling empty-key member together with its comma).
+    let mut last_comma_pos: Option<usize> = None;
+    // Position in `out` where the last object KEY string started
+    // (used to drop a key that never got a value when the response
+    // is truncated).
+    let mut last_key_start: Option<usize> = None;
+    // Position in `out` of the comma in front of that key.
+    let mut last_key_comma: Option<usize> = None;
+
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_string {
+            if escape {
+                escape = false;
+                match c {
+                    // The escapes JSON actually allows.
+                    '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    'u' => {
+                        // `\uXXXX` — keep it only when the four hex
+                        // digits are really there.
+                        let mut hex = String::new();
+                        for _ in 0..4 {
+                            match chars.peek().copied() {
+                                Some(h) if h.is_ascii_hexdigit() => {
+                                    hex.push(h);
+                                    chars.next();
+                                }
+                                _ => break,
+                            }
+                        }
+                        if hex.len() == 4 {
+                            out.push_str("\\u");
+                            out.push_str(&hex);
+                        } else {
+                            // Not a valid \uXXXX after all — keep the
+                            // `u` as plain text.
+                            out.push('u');
+                        }
+                    }
+                    // An INVALID escape (`\'` and friends): drop the
+                    // backslash, keep the character verbatim.
+                    other => out.push(other),
+                }
+                continue;
+            }
+            if c == '\\' {
+                // The backslash itself is written in the escape
+                // branch below, so that an INVALID escape can drop
+                // it while a valid one keeps it.
+                escape = true;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+                out.push(c);
+                // A completed string is a completed VALUE — record
+                // it, so that a response that was cut off inside a
+                // string is closed rather than mistaken for a key
+                // that never got a value.
+                last_sig = Some('"');
+                continue;
+            }
+            // A raw control character inside a string literal. JSON
+            // forbids it; a literal newline is by far the most
+            // common (the model writes multi-line narratives), NUL
+            // runs are the other one we saw.
+            if (c as u32) < 0x20 {
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    _ => {}
+                }
+                continue;
+            }
+            out.push(c);
+            continue;
+        }
+
+        // ---- outside a string literal ----
+        match c {
+            '"' => {
+                // (a) A dangling empty key with no value:
+                //     `{"old_part":"...",""]}` — the member is
+                //     `""` followed by the end of the object.
+                if last_sig == Some(',') {
+                    let mut lookahead = chars.clone();
+                    if lookahead.next() == Some('"') {
+                        // The current `"` plus this one form the
+                        // empty key `""`.
+                        let mut next = lookahead.next();
+                        while let Some(ch) = next {
+                            if ch.is_whitespace() {
+                                next = lookahead.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        if matches!(next, Some('}') | Some(']')) {
+                            // Drop the member AND the comma in front
+                            // of it.
+                            if let Some(pos) = last_comma_pos {
+                                out.truncate(pos);
+                            }
+                            // Consume the second quote of the empty
+                            // key — it is part of the member that is
+                            // being dropped.
+                            chars.next();
+                            last_sig = None;
+                            last_comma_pos = None;
+                            last_key_start = None;
+                            last_key_comma = None;
+                            continue;
+                        }
+                    }
+                }
+                // (b) A stray closing quote right after a number:
+                //     `"self.wealth": -8", "self.knowledge": +12"`.
+                //     In valid JSON a quote can only START a string,
+                //     and a string can never directly follow a
+                //     number — so a quote right after a digit is
+                //     always this bug.
+                if let Some(prev) = last_sig {
+                    if prev.is_ascii_digit() {
+                        // Drop the stray quote.
+                        continue;
+                    }
+                }
+                // (c) Otherwise it opens a string. Remember where it
+                //     starts when it is in key position, so a
+                //     truncated response can drop the orphan key.
+                if matches!(last_sig, Some('{') | Some(',')) {
+                    last_key_start = Some(out.len());
+                    // Remember the comma in front of the key, so an
+                    // orphan key can be removed together with it.
+                    last_key_comma = if last_sig == Some(',') { last_comma_pos } else { None };
+                }
+                in_string = true;
+                out.push(c);
+            }
+            '+' => {
+                // A leading `+` on a number (`+12`) — the same bug
+                // fixup #3 handles, applied here so this pass is
+                // self-contained.
+                let next_is_digit = matches!(chars.peek().copied(), Some(d) if d.is_ascii_digit());
+                let next_is_dot_then_digit = chars.peek() == Some(&'.')
+                    && chars.clone().nth(1).map_or(false, |d| d.is_ascii_digit());
+                if next_is_digit || next_is_dot_then_digit {
+                    continue;
+                }
+                out.push(c);
+                last_sig = Some(c);
+            }
+            '{' | '[' => {
+                stack.push(if c == '{' { '}' } else { ']' });
+                out.push(c);
+                last_sig = Some(c);
+                last_key_start = None;
+            }
+            '}' | ']' => {
+                if stack.last() == Some(&c) {
+                    stack.pop();
+                    out.push(c);
+                    last_sig = Some(c);
+                }
+                // A closing bracket that does not match anything
+                // open is dropped.
+            }
+            ',' => {
+                last_comma_pos = Some(out.len());
+                out.push(c);
+                last_sig = Some(c);
+            }
+            ':' => {
+                out.push(c);
+                last_sig = Some(c);
+            }
+            c if c.is_whitespace() => out.push(c),
+            c if c.is_ascii_digit() || c == '-' || c == '.' || c == 'e' || c == 'E' => {
+                out.push(c);
+                last_sig = Some(c);
+            }
+            c if "truefalsn".contains(c) => {
+                // Letters of the `true` / `false` / `null` literals.
+                out.push(c);
+                last_sig = Some(c);
+            }
+            // Anything else outside a string cannot be part of valid
+            // JSON — drop it.
+            _ => {}
+        }
+    }
+
+    // ---- end of input ----
+    if in_string {
+        // The response was cut off inside a string literal — close it.
+        in_string = false;
+        out.push('"');
+    }
+    // Drop an orphan key that never got a value (`"narrative":` at the
+    // very end) and/or a trailing comma.
+    match last_sig {
+        Some(':') => {
+            // The response ended on a key that never got a value —
+            // drop the key (and the comma in front of it).
+            if let Some(pos) = last_key_comma.or(last_key_start) {
+                out.truncate(pos);
+            }
+        }
+        Some(',') => {
+            if let Some(pos) = last_comma_pos {
+                out.truncate(pos);
+            }
+        }
+        _ => {}
+    }
+    // Close the structures that were left open.
+    while let Some(closer) = stack.pop() {
+        out.push(closer);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Fixup #6 — field-level salvage
+// ---------------------------------------------------------------------------
+
+/// Decode the body of a JSON string literal (the text BETWEEN the
+/// quotes) into its value.
+///
+/// Tolerant on purpose: `\'` and other invalid escapes are kept as
+/// the plain character instead of failing the whole decode, because
+/// the LLM writes `\'` (a Windows-ish habit) inside narratives.
+fn decode_json_string_body(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('u') => {
+                let mut hex = String::new();
+                for _ in 0..4 {
+                    match chars.clone().next() {
+                        Some(h) if h.is_ascii_hexdigit() => {
+                            hex.push(h);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                if hex.len() == 4 {
+                    match u32::from_str_radix(&hex, 16) {
+                        Ok(code) => match char::from_u32(code) {
+                            Some(ch) => out.push(ch),
+                            None => out.push('\u{FFFD}'),
+                        },
+                        Err(_) => out.push('\u{FFFD}'),
+                    }
+                } else {
+                    out.push('u');
+                }
+            }
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Find the value of a top-level-ish string field (`"key": "..."`) in a
+/// broken response and return it decoded.
+///
+/// The key must be preceded by `{` or `,` (so a `"key"` mentioned
+/// inside a narrative is not mistaken for a field) and followed by a
+/// colon and an opening quote.
+fn salvage_string_field(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let mut search_from = 0usize;
+    while let Some(rel) = raw[search_from..].find(&needle) {
+        let start = search_from + rel;
+        let after_key = start + needle.len();
+        // The key must be at member position: preceded by `{` or `,`
+        // (ignoring whitespace).
+        let before = raw[..start].trim_end();
+        let at_member_pos = before.ends_with('{') || before.ends_with(',');
+        let rest = &raw[after_key..];
+        let trimmed = rest.trim_start();
+        if at_member_pos && trimmed.starts_with(':') {
+            let after_colon = trimmed[1..].trim_start();
+            if let Some(body) = after_colon.strip_prefix('"') {
+                // Find the closing quote, honouring escapes.
+                let mut escaped = false;
+                let mut end = None;
+                for (i, ch) in body.char_indices() {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        escaped = true;
+                        continue;
+                    }
+                    if ch == '"' {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                if let Some(end) = end {
+                    return Some(decode_json_string_body(&body[..end]));
+                }
+            }
+        }
+        search_from = after_key;
+    }
+    None
+}
+
+/// Find the balanced `{...}` (or `[...]`) blob that starts at
+/// `open_idx` in `raw`, ignoring braces inside string literals.
+/// Returns the blob text (without the outer brackets).
+fn scan_balanced_blob(raw: &str, open_idx: usize) -> Option<String> {
+    let bytes: Vec<char> = raw.chars().collect();
+    let open = bytes.get(open_idx)?;
+    let closer = match open {
+        '{' => '}',
+        '[' => ']',
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut start = open_idx + 1;
+    for (i, ch) in bytes.iter().enumerate().skip(open_idx) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if *ch == '\\' {
+                escape = true;
+            } else if *ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *ch {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = i;
+                    let text: String = bytes[start..end].iter().collect();
+                    return Some(text);
+                }
+                let _ = closer;
+            }
+            _ => {}
+        }
+    }
+    // Unbalanced (truncated) — return what we have.
+    let text: String = bytes[start..].iter().collect();
+    Some(text)
+}
+
+/// Split an effects blob into `key -> value` pairs, tolerantly.
+///
+/// First tries a strict JSON parse of the whole blob. If that fails
+/// (the common case: the model dropped a quote somewhere inside the
+/// effects object), the blob is split at its top-level commas and
+/// each piece is read as `"key": value` — which recovers the
+/// well-formed entries and skips only the broken ones.
+fn salvage_effects(raw: &str) -> std::collections::HashMap<String, serde_json::Value> {
+    let mut effects = std::collections::HashMap::new();
+    let needle = "\"effects\"";
+    let Some(rel) = raw.find(needle) else {
+        return effects;
+    };
+    let after = &raw[rel + needle.len()..];
+    let trimmed = after.trim_start();
+    let Some(stripped) = trimmed.strip_prefix(':') else {
+        return effects;
+    };
+    let trimmed = stripped.trim_start();
+    if !trimmed.starts_with('{') {
+        return effects;
+    }
+    let blob = scan_balanced_blob(trimmed, 0).unwrap_or_default();
+    // Strict parse first.
+    if let Ok(parsed) = serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(
+        &format!("{{{}}}", blob),
+    ) {
+        return parsed;
+    }
+    // Lenient pass: find every `"key": value` pair in the blob.
+    //
+    // A regex is used rather than a manual scan because the mangled
+    // blob breaks the string tracking: the missing quote makes the
+    // comma that really separates two members look like it is
+    // inside a string. Matching the members directly finds the
+    // well-formed ones regardless.
+    let pair_re = regex::Regex::new(
+        r#""([^"\\]{1,80})"\s*:\s*(-?\d+(?:\.\d+)?|true|false|null|"[^"\\]{0,400}")"#,
+    )
+    .expect("the effects pair pattern must compile");
+    for capture in pair_re.captures_iter(&blob) {
+        let key = capture.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        let value_text = capture.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+        if key.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(value_text) {
+            effects.insert(key.to_string(), value);
+        }
+    }
+    effects
+}
+
+/// Salvage the individual fields of a response whose JSON is broken
+/// beyond a structural repair.
+///
+/// **Why this exists.** Some responses are not "almost right" — they
+/// are degenerate: the model fell into a repetition loop, or the text
+/// was cut and then continued with garbage. No amount of
+/// bracket-balancing makes those parse. But their LEADING fields are
+/// usually intact: the action name, the outcome, the narrative. A
+/// probe over the 1,809 distinct failing responses in the
+/// open-world-selena llm-logs (2026-06 → 2026-10) showed that 935 of
+/// the 1,141 that survived the earlier fixups still carried a usable
+/// action name — all of which were being dropped whole.
+///
+/// **How.** Read the fields one by one out of the broken text. Only
+/// fields that can be read with confidence are taken; the rest are
+/// left empty (the summary edit is simply not applied). The caller
+/// surfaces a warning so the operator can see that the response was
+/// degraded rather than clean.
+fn salvage_llm_fields(raw: &str) -> Option<LlmActionResponse> {
+    let action = salvage_string_field(raw, "action")?;
+    if action.trim().is_empty() {
+        return None;
+    }
+    let outcome = salvage_string_field(raw, "outcome").unwrap_or_default();
+    let narrative = salvage_string_field(raw, "narrative").unwrap_or_default();
+    let history_summary = salvage_string_field(raw, "history_summary");
+    let effects = salvage_effects(raw);
+
+    // The summary edit is only applied when its own blob parses as
+    // JSON — a broken one is skipped (the summary simply stays as
+    // it is, which is the safe default).
+    let history_summary_replace = raw.find("\"history_summary_replace\"").and_then(|rel| {
+        let after = &raw[rel + "\"history_summary_replace\"".len()..];
+        let trimmed = after.trim_start();
+        let trimmed = trimmed.strip_prefix(':')?.trim_start();
+        let open = trimmed.chars().next()?;
+        if open != '{' && open != '[' {
+            return None;
+        }
+        let blob = scan_balanced_blob(trimmed, 0)?;
+        let value: serde_json::Value = serde_json::from_str(&format!("{}{}{}", open, blob, match open { '{' => '}', _ => ']' })).ok()?;
+        parse_hsr_value(&value)
+    });
+
+    Some(LlmActionResponse {
+        action,
+        outcome,
+        effects,
+        narrative,
+        history_summary,
+        history_summary_replace,
+    })
+}
+
+/// Strip a markdown code fence (```json ... ``` or ``` ... ```) from
+/// around a response, if there is one.
+fn strip_code_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return raw;
+    }
+    // Skip the opening fence line.
+    let after_open = match trimmed.find('\n') {
+        Some(pos) => &trimmed[pos + 1..],
+        None => return raw,
+    };
+    // Drop the closing fence, if there is one.
+    let end = after_open.rfind("```").unwrap_or(after_open.len());
+    &after_open[..end]
+}
+
+/// Parse a response that is a JSON ARRAY of `[key, value]` pairs.
+///
+/// The LLM sometimes answers with
+/// `[["action", "..."], ["outcome", "..."], ["effects", {...}], ...]`
+/// instead of a JSON object. That is valid JSON, but it does not
+/// match the `LlmActionResponse` shape, so the whole response was
+/// dropped even though every field was there.
+///
+/// The conversion is exact: the pair array is turned into an object
+/// with the same keys, and the usual deserialisation rules apply
+/// from there on.
+fn parse_pair_array_response(raw: &str) -> Option<LlmActionResponse> {
+    let text = strip_code_fence(raw).trim();
+    if !text.starts_with('[') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let items = value.as_array()?;
+    let mut map = serde_json::Map::new();
+    for item in items {
+        let pair = item.as_array()?;
+        if pair.len() != 2 {
+            continue;
+        }
+        let key = pair[0].as_str()?.to_string();
+        map.insert(key, pair[1].clone());
+    }
+    if !map.contains_key("action") {
+        return None;
+    }
+    serde_json::from_value::<LlmActionResponse>(serde_json::Value::Object(map)).ok()
+}
+
+/// Parse a response written as MARKDOWN sections instead of JSON.
+///
+/// The LLM sometimes answers with
+///
+/// ```text
+/// **Action:** some_action_name
+///
+/// **Outcome:** ...
+///
+/// **Effects:**
+/// ```json
+/// { "self.morale": 1 }
+/// ```
+///
+/// **Narrative:** ...
+/// ```
+///
+/// which is not JSON at all, so the whole response was dropped even
+/// though the action name was right there in the first line.
+///
+/// Only the four known sections are read; anything else is ignored.
+fn parse_markdown_response(raw: &str) -> Option<LlmActionResponse> {
+    let text = raw.trim();
+    if !text.contains("**Action:**") {
+        return None;
+    }
+    let section = |marker: &str| -> Option<(usize, usize)> {
+        text.find(marker).map(|pos| (pos + marker.len(), pos))
+    };
+
+    let mut action = String::new();
+    let mut outcome = String::new();
+    let mut narrative = String::new();
+    let mut effects = std::collections::HashMap::new();
+    let mut history_summary = None;
+
+    // The action name is on the same line as the marker, and may be
+    // wrapped in backticks.
+    if let Some((after, _)) = section("**Action:**") {
+        let line = text[after..].lines().next().unwrap_or("").trim();
+        let line = line.trim_matches('`').trim();
+        if !line.is_empty() {
+            action = line.to_string();
+        }
+    }
+
+    // The response often ALSO carries a ```json block. When that
+    // block is broken (which is why the response failed to parse in
+    // the first place) its fields are read out individually, so the
+    // outcome and the narrative are not lost with it.
+    let mut block_fields: Option<LlmActionResponse> = None;
+    if let Some(fence) = text.find("```") {
+        let after_fence = &text[fence + 3..];
+        let body_start = after_fence.find('\n').map(|p| p + 1).unwrap_or(0);
+        let body = &after_fence[body_start..];
+        let end = body.find("```").unwrap_or(body.len());
+        let block = &body[..end];
+        if let Some(parsed) = serde_json::from_str::<LlmActionResponse>(block.trim()).ok() {
+            block_fields = Some(parsed);
+        } else {
+            let repaired = repair_broken_json(block.trim());
+            if let Ok(parsed) = serde_json::from_str::<LlmActionResponse>(&repaired) {
+                block_fields = Some(parsed);
+            } else if let Some(salvaged) = salvage_llm_fields(block) {
+                block_fields = Some(salvaged);
+            }
+        }
+    }
+    if let Some(block) = &block_fields {
+        if action.is_empty() {
+            action = block.action.clone();
+        }
+        if !block.outcome.is_empty() {
+            outcome = block.outcome.clone();
+        }
+        if !block.narrative.is_empty() {
+            narrative = block.narrative.clone();
+        }
+        if !block.effects.is_empty() {
+            effects = block.effects.clone();
+        }
+        if block.history_summary.is_some() {
+            history_summary = block.history_summary.clone();
+        }
+    }
+
+    // The narrative / outcome are the text up to the next section
+    // marker.
+    let take_section_text = |marker: &str| -> String {
+        let Some((after, _)) = section(marker) else {
+            return String::new();
+        };
+        let rest = &text[after..];
+        let end = rest
+            .find("\n**")
+            .unwrap_or(rest.len());
+        rest[..end].trim().to_string()
+    };
+    if outcome.is_empty() {
+        outcome = take_section_text("**Outcome:**");
+    }
+    if narrative.is_empty() {
+        narrative = take_section_text("**Narrative:**");
+    }
+    if let Some(summary) = salvage_string_field(text, "history_summary") {
+        history_summary = Some(summary);
+    }
+
+    // The effects section is a JSON block, either fenced or bare.
+    if effects.is_empty() {
+        if let Some((after, _)) = section("**Effects:**") {
+            let rest = &text[after..];
+            let fenced = rest.find("```");
+            let blob = if let Some(pos) = fenced {
+                let after_fence = &rest[pos + 3..];
+                let body_start = after_fence.find('\n').map(|p| p + 1).unwrap_or(0);
+                let body = &after_fence[body_start..];
+                let end = body.find("```").unwrap_or(body.len());
+                &body[..end]
+            } else {
+                let end = rest.find("\n**").unwrap_or(rest.len());
+                &rest[..end]
+            };
+            if let Ok(parsed) =
+                serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(
+                    blob.trim(),
+                )
+            {
+                effects = parsed;
+            }
+        }
+    }
+
+    if action.trim().is_empty() {
+        return None;
+    }
+    Some(LlmActionResponse {
+        action,
+        outcome,
+        effects,
+        narrative,
+        history_summary,
+        history_summary_replace: None,
+    })
 }
 
 // Process LLM action response - apply effects from raw LLM response
@@ -11319,6 +12114,245 @@ mod strip_plus_signs_from_numbers_outside_strings_tests {
         let weird = r#"{"x": + "y", "z": +}"#;
         let repaired = strip_plus_signs_from_numbers_outside_strings(weird);
         assert_eq!(repaired, weird);
+    }
+}
+
+#[cfg(test)]
+mod broken_json_repair_tests {
+    //! Tests for fixup #5 (`repair_broken_json`) and fixup #7
+    //! (`salvage_llm_fields`) in `parse_llm_action_response`.
+    //!
+    //! Both were added per selena-open-world-worker 2026-10-27
+    //! #openworld, after a probe over every distinct failing response
+    //! in the open-world-selena llm-logs (2026-06 → 2026-10, 1,809
+    //! distinct responses) showed that the failures surviving the
+    //! earlier fixups were dominated by structural damage in the JSON
+    //! itself, not by one bad field.
+    use super::{
+        parse_llm_action_response, repair_broken_json, salvage_llm_fields,
+        salvage_string_field,
+    };
+
+    #[test]
+    fn repair_drops_stray_quote_after_a_number() {
+        // Production shape (2026-10-20 error log): the model closed
+        // a numeric effect value with a quote.
+        let raw = r#"{"action":"a","outcome":"o","effects":{"self.wealth": -8", "self.knowledge": +12"},"narrative":"n"}"#;
+        let repaired = repair_broken_json(raw);
+        assert!(
+            !repaired.contains("-8\""),
+            "the stray quote after the number must be dropped: {}",
+            repaired
+        );
+        assert!(
+            repaired.contains("12"),
+            "the number itself must survive: {}",
+            repaired
+        );
+        assert!(
+            !repaired.contains("+12"),
+            "the invalid leading `+` must be dropped: {}",
+            repaired
+        );
+        // And the repaired text must be valid JSON again.
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&repaired).is_ok(),
+            "the repaired text must parse: {}",
+            repaired
+        );
+    }
+
+    #[test]
+    fn repair_drops_dangling_empty_key() {
+        // Production shape (2026-08-15 error log): a member with an
+        // empty key and no value at the end of an object.
+        let raw = r#"{"action":"a","history_summary_replace":{"old_part":"x","new_part":"y",""}]}"#;
+        let repaired = repair_broken_json(raw);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&repaired).is_ok(),
+            "the repaired text must parse: {}",
+            repaired
+        );
+        assert!(!repaired.contains("\"\""), "the empty key must be gone: {}", repaired);
+    }
+
+    #[test]
+    fn repair_escapes_raw_control_characters_in_strings() {
+        // A literal newline inside a narrative, and a run of NULs.
+        let raw = "{\"action\":\"a\",\"outcome\":\"line one\nline two\",\"narrative\":\"nul\u{0}\u{0}here\"}";
+        let repaired = repair_broken_json(raw);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&repaired).is_ok(),
+            "the repaired text must parse: {}",
+            repaired
+        );
+        let value: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(value["outcome"], "line one\nline two");
+        assert_eq!(value["narrative"], "nulhere");
+    }
+
+    #[test]
+    fn repair_drops_invalid_escape_backslash() {
+        // Production shape: the model writes `\'` inside a narrative.
+        let raw = r#"{"action":"a","outcome":"the shadow's reach","narrative":"n"}"#;
+        let repaired = repair_broken_json(raw);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&repaired).is_ok(),
+            "the repaired text must parse: {}",
+            repaired
+        );
+        let value: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(value["outcome"], "the shadow's reach");
+    }
+
+    #[test]
+    fn repair_closes_a_truncated_response() {
+        // Production shape (2026-10-24 error log): the response stops
+        // mid-object.
+        let raw = r#"{"action":"a","outcome":"o","effects":{"self.morale":1},"narrative":"cut off here"#;
+        let repaired = repair_broken_json(raw);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&repaired).is_ok(),
+            "the repaired text must parse: {}",
+            repaired
+        );
+        let value: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(value["action"], "a");
+        assert_eq!(value["outcome"], "o");
+    }
+
+    #[test]
+    fn repair_leaves_valid_json_untouched() {
+        let raw = r#"{"action":"a","outcome":"o","effects":{"self.morale":1},"narrative":"n"}"#;
+        assert_eq!(repair_broken_json(raw), raw);
+    }
+
+    #[test]
+    fn repair_is_string_aware() {
+        // A brace, a quote and a comma inside a narrative must not be
+        // mistaken for JSON structure.
+        let raw = r#"{"action":"a","outcome":"he said {hi}, then \"bye\"","narrative":"n"}"#;
+        let repaired = repair_broken_json(raw);
+        assert_eq!(repaired, raw);
+    }
+
+    #[test]
+    fn salvage_reads_the_action_out_of_a_degenerate_response() {
+        // Production shape (2026-10-20 error log): the model fell
+        // into a repetition loop and the response degenerated into
+        // prose. The leading fields are still intact.
+        let raw = "{\"action\":\"count_toward_the_completest_ordinary_dance\", \
+                    \"outcome\":\"The ancient mechanism turns its counting toward dance itself.\", \
+                    \"effects\":{\"self.morale\": 1}, \
+                    \"narrative\":\"The completest ordinary movement \
+                    the completest ordinary movement the completest ordinary movement\"}";
+        let salvaged = salvage_llm_fields(raw).expect("the action must be recoverable");
+        assert_eq!(salvaged.action, "count_toward_the_completest_ordinary_dance");
+        assert_eq!(salvaged.outcome, "The ancient mechanism turns its counting toward dance itself.");
+        assert!(salvaged.narrative.contains("completest ordinary"));
+    }
+
+    #[test]
+    fn salvage_recovers_effects_from_a_mangled_effects_object() {
+        // The model dropped the closing quote of a key:
+        // `{"self.hour:23,"self.actions_today":1}`.
+        let raw = r#"{"action":"a","outcome":"o","effects":{"self.hour:23,"self.actions_today":1},"narrative":"n"#;
+        let salvaged = salvage_llm_fields(raw).expect("the action must be recoverable");
+        assert_eq!(salvaged.action, "a");
+        assert_eq!(
+            salvaged.effects.get("self.actions_today"),
+            Some(&serde_json::json!(1)),
+            "the well-formed effect must be recovered: {:?}",
+            salvaged.effects
+        );
+    }
+
+    #[test]
+    fn salvage_gives_up_without_an_action() {
+        assert!(salvage_llm_fields("{\"outcome\":\"o\"}").is_none());
+        assert!(salvage_llm_fields("this is intentionally malformed json garbage").is_none());
+    }
+
+    #[test]
+    fn salvage_string_field_ignores_a_key_mentioned_in_a_narrative() {
+        // The key must be at member position (preceded by `{` or `,`),
+        // otherwise a narrative that happens to contain `"action":`
+        // would be read as the field.
+        let raw = r#"{"action":"real_action","outcome":"the text says \"action\": \"fake\"","narrative":"n"}"#;
+        assert_eq!(
+            salvage_string_field(raw, "action"),
+            Some("real_action".to_string())
+        );
+    }
+
+    #[test]
+    fn a_broken_response_still_yields_its_action() {
+        // The end-to-end path: a response the model got structurally
+        // wrong must still land instead of being dropped whole.
+        let raw = r#"{"action":"do_a_thing","outcome":"fine","effects":{"self.wealth": -8"},"narrative":"n"#;
+        let (parsed, warning) = parse_llm_action_response(raw)
+            .expect("a structurally broken response must not drop the action");
+        assert_eq!(parsed.action, "do_a_thing");
+        assert!(
+            warning.is_some(),
+            "the repair must be reported to the operator"
+        );
+    }
+}
+
+#[cfg(test)]
+mod alternative_response_format_tests {
+    //! Tests for fixup #6 in `parse_llm_action_response`: the LLM does
+    //! not always answer with a JSON *object*. It sometimes answers
+    //! with a JSON array of `[key, value]` pairs, or with markdown
+    //! sections. Both carry every field — they used to be dropped
+    //! whole because the shape did not match `LlmActionResponse`.
+    use super::{parse_llm_action_response, parse_markdown_response, parse_pair_array_response};
+
+    #[test]
+    fn pair_array_response_is_converted() {
+        let raw = r#"[["action","speak_fellowship_recognition"],["outcome","It lands."],["effects",{"self.morale":1}],["narrative","A lighthouse burns."]]"#;
+        let parsed = parse_pair_array_response(raw).expect("the pair array must be converted");
+        assert_eq!(parsed.action, "speak_fellowship_recognition");
+        assert_eq!(parsed.outcome, "It lands.");
+        assert_eq!(parsed.narrative, "A lighthouse burns.");
+        assert_eq!(parsed.effects.get("self.morale"), Some(&serde_json::json!(1)));
+    }
+
+    #[test]
+    fn pair_array_needs_an_action() {
+        assert!(parse_pair_array_response(r#"[["outcome","It lands."]]"#).is_none());
+        assert!(parse_pair_array_response(r#"{"action":"a"}"#).is_none());
+    }
+
+    #[test]
+    fn markdown_response_is_read() {
+        let raw = "**Action:** `speak_final_fellowship_completion`\n\n\
+                   **Outcome:** The fellowship completes itself.\n\n\
+                   **Effects:**\n```json\n{\n  \"self.morale\": 1\n}\n```\n\n\
+                   **Narrative:** A lighthouse burns quietly.\n";
+        let parsed = parse_markdown_response(raw).expect("the markdown must be read");
+        assert_eq!(parsed.action, "speak_final_fellowship_completion");
+        assert_eq!(parsed.outcome, "The fellowship completes itself.");
+        assert_eq!(parsed.narrative, "A lighthouse burns quietly.");
+        assert_eq!(parsed.effects.get("self.morale"), Some(&serde_json::json!(1)));
+    }
+
+    #[test]
+    fn markdown_response_needs_an_action() {
+        assert!(parse_markdown_response("**Outcome:** no action here").is_none());
+    }
+
+    #[test]
+    fn a_markdown_response_still_yields_its_action() {
+        let raw = "**Action:** `do_a_thing`\n\n**Outcome:** fine\n";
+        let (parsed, warning) = parse_llm_action_response(raw)
+            .expect("a markdown response must not drop the action");
+        assert_eq!(parsed.action, "do_a_thing");
+        assert!(
+            warning.is_some(),
+            "the conversion must be reported to the operator"
+        );
     }
 }
 
