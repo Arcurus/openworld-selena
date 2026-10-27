@@ -28,6 +28,7 @@
   },
   "world": {
     "description": "A mysterious realm where shadows hold ancient secrets",
-    "name": "The Realm of Shadows"
+    "name": "The Realm of Shadows",
+    "max_entity_history": 100
   }
 }

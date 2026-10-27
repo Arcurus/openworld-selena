@@ -319,6 +319,20 @@ impl WorldEntity {
         self.last_action_at = Some(Utc::now());
         self.updated_at = Utc::now();
     }
+
+    /// Retain only the last `max` history entries (oldest dropped first).
+    /// `max == 0` means unlimited (no trim). Per Arcurus t199u: cap the
+    /// in-memory entity history Vec via settings.json `world.max_entity_history`
+    /// (default 100) to bound RSS growth on long-lived entities (e.g. World Clock).
+    pub fn trim_history(&mut self, max: usize) {
+        if max == 0 {
+            return;
+        }
+        if self.history.len() > max {
+            let excess = self.history.len() - max;
+            self.history.drain(0..excess);
+        }
+    }
     
     /// Calculate distance to another entity
     pub fn distance_to(&self, other: &WorldEntity) -> f64 {

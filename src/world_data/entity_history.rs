@@ -161,8 +161,10 @@ pub fn add_to_history(
     details: &str,
     outcome: &str,
     next_marker_tick: i64,
+    max_entity_history: usize,
 ) {
     entity.add_history(action, details, outcome);
+    entity.trim_history(max_entity_history);
     if next_marker_tick <= 0 {
         // No entries were shown; do not advance the
         // marker.  Same semantics as
@@ -394,12 +396,43 @@ mod tests {
     fn test_add_to_history_appends_entry() {
         let mut entity = WorldEntity::new("character", "Hero", 0.0, 0.0);
         assert_eq!(entity.history.len(), 0);
-        add_to_history(&mut entity, "fight", "slays dragon", "wins", 0);
+        add_to_history(&mut entity, "fight", "slays dragon", "wins", 0, 100);
         assert_eq!(entity.history.len(), 1);
         let h = &entity.history[0];
         assert_eq!(h.action, "fight");
         assert_eq!(h.details, "slays dragon");
         assert_eq!(h.outcome, "wins");
+    }
+
+    #[test]
+    fn test_add_to_history_respects_cap() {
+        let mut entity = WorldEntity::new("character", "Clocky", 0.0, 0.0);
+        for i in 0..5 {
+            add_to_history(
+                &mut entity,
+                &format!("act{i}"),
+                "d",
+                "o",
+                0,
+                3,
+            );
+        }
+        assert_eq!(entity.history.len(), 3);
+        assert_eq!(entity.history[0].action, "act2");
+        assert_eq!(entity.history[2].action, "act4");
+    }
+
+    #[test]
+    fn test_trim_history_zero_is_unlimited() {
+        let mut entity = WorldEntity::new("character", "U", 0.0, 0.0);
+        for i in 0..10 {
+            entity.add_history(&format!("a{i}"), "d", "o");
+        }
+        entity.trim_history(0);
+        assert_eq!(entity.history.len(), 10);
+        entity.trim_history(4);
+        assert_eq!(entity.history.len(), 4);
+        assert_eq!(entity.history[0].action, "a6");
     }
 
     #[test]

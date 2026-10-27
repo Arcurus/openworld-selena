@@ -507,6 +507,15 @@ struct AppWorldSettings {
     name: String,
     #[serde(default)]
     description: String,
+    /// Cap on in-memory `WorldEntity.history` Vec length (last N actions).
+    /// Applied on append and on world load. 0 = unlimited.
+    /// Default: 100. settings.json → world.max_entity_history
+    #[serde(default = "default_max_entity_history")]
+    max_entity_history: u32,
+}
+
+fn default_max_entity_history() -> u32 {
+    100
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -6413,6 +6422,9 @@ async fn process_action_handler(
                 &world,
                 state.settings.llm.default_max_history_summary_chars,
             ) as usize;
+            // Cap in-memory entity.history Vec (settings.json → world.max_entity_history).
+            // Captured before the mutable entity borrow. 0 = unlimited.
+            let max_entity_history = state.settings.world.max_entity_history as usize;
             // Build the case-sensitive name → id lookup
             // table BEFORE we take a mutable borrow of the
             // entity (Rust borrow checker: we can't immutably
@@ -6596,6 +6608,7 @@ async fn process_action_handler(
                     &action_data.narrative,
                     &action_data.outcome,
                     next_marker_tick,
+                    max_entity_history,
                 );
 
                 // Build the durable JSONL entry. Deferred to AFTER
@@ -7689,7 +7702,13 @@ async fn load_world_handler(
     
     // Load world from save file
     match BinaryPersistence::load_world(&state.save_path) {
-        Ok(world) => {
+        Ok(mut world) => {
+            let hist_cap = state.settings.world.max_entity_history as usize;
+            if hist_cap > 0 {
+                for entity in world.entities.values_mut() {
+                    entity.trim_history(hist_cap);
+                }
+            }
             let entity_count = world.entity_count();
             let mut w = state.world.write().await;
             *w = world;
@@ -8031,6 +8050,7 @@ fn load_settings() -> Settings {
             world: AppWorldSettings {
                 name: "New World".to_string(),
                 description: "A new world waiting to be explored".to_string(),
+                max_entity_history: default_max_entity_history(),
             },
             llm: LlmSettings {
                 provider: "minimax-portal".to_string(),
@@ -8470,6 +8490,28 @@ async fn main() {
                     println!("🧹 Sanitized {} non-system float property repair(s):", float_repairs.len());
                     for (id, key, old, new) in &float_repairs {
                         println!("   • {} :: {} :: {} -> {}", id, key, old, new);
+                    }
+                }
+                // Cap in-memory entity.history Vec to settings.json
+                // world.max_entity_history (default 100). Durable
+                // action_history.jsonl is unchanged. Per Arcurus t199u.
+                let hist_cap = settings.world.max_entity_history as usize;
+                if hist_cap > 0 {
+                    let mut trimmed_entities = 0usize;
+                    let mut dropped_entries = 0usize;
+                    for entity in w.entities.values_mut() {
+                        let before = entity.history.len();
+                        if before > hist_cap {
+                            entity.trim_history(hist_cap);
+                            trimmed_entities += 1;
+                            dropped_entries += before - entity.history.len();
+                        }
+                    }
+                    if trimmed_entities > 0 {
+                        println!(
+                            "✂️  Trimmed entity history to last {} on {} entit(y/ies); dropped {} older entr(y/ies)",
+                            hist_cap, trimmed_entities, dropped_entries
+                        );
                     }
                 }
                 // Sync time from clock entity to world_time
