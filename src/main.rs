@@ -2857,7 +2857,7 @@ async fn entity_action(
                 Err(e) => {
                     success_json(serde_json::json!({
                         "success": false,
-                        "error": format!("Failed to parse LLM response: {}", e),
+                        "error": format_llm_response_failure(&e),
                         "raw_response": raw_response,
                         "debug": {
                             "entity_id": id.to_string(),
@@ -5460,6 +5460,26 @@ fn parse_llm_action_response(raw: &str) -> Result<(LlmActionResponse, Option<Str
                 ))));
             }
 
+            // -- fixup #8 — a response that carries NO ACTION at all
+            // is not a malformation: it is the model DECLINING.
+            //
+            // The world server asks the LLM for an action even for
+            // entities it may not write (a `meta` / system entity such
+            // as the World Clock). The model then refuses, in prose
+            // ("I cannot generate an action for this entity…") or in
+            // an error envelope (`{"error": "…"}`,
+            // `{"type":"error","error":"…"}`).
+            //
+            // Those responses used to be reported as "JSON parse
+            // error: expected value at line 1 column 1", which makes
+            // the parser look broken when it is not — and it buries
+            // the real signal (the model declined) in the shape of a
+            // syntax error. They are recognised here and reported
+            // as what they are.
+            if let Some(reason) = classify_llm_decline(raw) {
+                return Err(reason);
+            }
+
             // No fixup produced a parseable string. Surface the
             // most useful error.
             if repaired3 != candidate2 {
@@ -5493,6 +5513,131 @@ fn parse_llm_action_response(raw: &str) -> Result<(LlmActionResponse, Option<Str
                 Err(format!("JSON parse error: {} - Input: {}", e, json_str))
             }
         }
+    }
+}
+
+/// Recognise a response that carries no action because the model
+/// DECLINED to act (or answered with nothing at all), as opposed to a
+/// response that is malformed JSON.
+///
+/// Returns the reason when the payload provably carries no action,
+/// `None` when the payload is a real response that the repair path
+/// should try to fix.
+///
+/// The rules are deliberately conservative — a false "decline" would
+/// hide a genuine parser bug:
+///
+///   * an empty response is an empty response;
+///   * a response that parses as a JSON object and carries a non-empty
+///     `action` is a real response (never a decline);
+///   * a response that parses as a JSON object WITHOUT an `action` is a
+///     decline when it carries an error-ish key (`error`, `errors`,
+///     `reason`, or `type: "error"`), and an empty response when the
+///     object is empty;
+///   * a response that parses as a JSON array of `[key, value]` pairs
+///     without an `action` pair carries no action either;
+///   * a response that does NOT parse as JSON and holds no JSON at all
+///     is prose: it is a decline only when it says so in the words the
+///     models actually use. A malformed JSON response is never a
+///     decline — that would hide a genuine parser bug.
+fn classify_llm_decline(raw: &str) -> Option<String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Some("LLM returned an empty response".to_string());
+    }
+
+    // -- 1) the JSON value of the response. The object is sliced the
+    //       same way the parser slices it (first `{` .. last `}`), so
+    //       a fenced or prefixed JSON body is read too.
+    let mut value: Option<serde_json::Value> = None;
+    if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) {
+        if start <= end {
+            value = serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok();
+        }
+    }
+    if value.is_none() {
+        value = serde_json::from_str::<serde_json::Value>(text).ok();
+    }
+
+    if let Some(value) = value {
+        if let Some(obj) = value.as_object() {
+            if let Some(action) = obj.get("action").and_then(|v| v.as_str()) {
+                if !action.is_empty() {
+                    return None; // a real response
+                }
+            }
+            let errorish = obj.contains_key("error")
+                || obj.contains_key("errors")
+                || obj.contains_key("reason")
+                || obj.get("type").and_then(|v| v.as_str()) == Some("error");
+            if errorish {
+                let detail = obj
+                    .get("error")
+                    .or_else(|| obj.get("errors"))
+                    .or_else(|| obj.get("reason"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("the model reported an error instead of an action");
+                return Some(format!("LLM declined to act: {}", detail));
+            }
+            if obj.is_empty() {
+                return Some("LLM returned an empty JSON object".to_string());
+            }
+            return None;
+        }
+        if value.is_array() {
+            // A pair array: usable only if one of the pairs is the
+            // action.
+            let has_action = value.as_array().map(|pairs| {
+                pairs.iter().any(|pair| {
+                    pair.as_array()
+                        .map(|p| p.len() == 2 && p[0].as_str() == Some("action"))
+                        .unwrap_or(false)
+                })
+            });
+            if has_action == Some(true) {
+                return None;
+            }
+            return Some("LLM returned a JSON array of pairs without an action".to_string());
+        }
+        return None;
+    }
+
+    // -- 2) prose: only when the response holds no JSON at all. A
+    //    malformed JSON response must never be reported as a decline
+    //    — that would hide a genuine parser bug.
+    if text.contains('{') || text.contains('[') {
+        return None;
+    }
+    let low = text.to_lowercase();
+    const MARKERS: [&str; 8] = [
+        "cannot generate an action",
+        "cannot generate a valid action",
+        "can't generate an action",
+        "cannot generate",
+        "cannot suggest action",
+        "cannot be written",
+        "action blocked",
+        "is tagged as",
+    ];
+    if MARKERS.iter().any(|m| low.contains(m)) {
+        let head: String = text.chars().take(200).collect();
+        return Some(format!("LLM declined to act: {}", head));
+    }
+    None
+}
+
+/// Render a parser failure for the operator logs and the HTTP
+/// response.
+///
+/// A decline is not a parse failure: the world server asked for an
+/// action, the model declined, and there is nothing to repair. It gets
+/// its own wording so it does not read like a parser bug in the
+/// error-log.
+fn format_llm_response_failure(e: &str) -> String {
+    if e.starts_with("LLM declined to act: ") || e.starts_with("LLM returned ") {
+        e.to_string()
+    } else {
+        format!("Failed to parse LLM response: {}", e)
     }
 }
 
@@ -7020,7 +7165,7 @@ async fn process_action_handler(
         }
         Err(e) => {
             // Log to error log and LLM log
-            let err_msg = format!("Failed to parse LLM response: {}", e);
+            let err_msg = format_llm_response_failure(&e);
             if let Ok(mut logger) = state.logger.lock() {
                 logger.ensure_today(&PathBuf::from("logs"));
                 logger.log_error(&err_msg);
@@ -11516,6 +11661,133 @@ mod history_summary_replace_tests {
         );
     }
 
+    // -- the CORPUS fixture: several verbatim payloads per
+    //    malformation class.
+    //
+    //    `llm_parse_regression.json` pins ONE payload per class — the
+    //    shape of the damage. This pins several payloads per class,
+    //    because in the wild the classes overlap: a truncated response
+    //    can also carry a trailing comma AND a control character, and
+    //    every combination needs its own repair path.
+    //
+    //    The payloads are the ones the world server actually DROPPED
+    //    (verbatim from `logs/error-log-*.log`), minus the responses
+    //    that carry no action at all (a refusal such as "I cannot
+    //    generate an action for this entity", or an `{"error": …}`
+    //    envelope) — those have nothing to recover.
+    //
+    //    Regenerate with:
+    //      python3 scripts/build_parse_corpus_fixture.py
+    #[test]
+    fn real_production_corpus_all_parse() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/llm_parse_regression_corpus.json");
+        let text = std::fs::read_to_string(&path).expect("corpus fixture file must exist");
+        let cases: Vec<String> =
+            serde_json::from_str(&text).expect("corpus fixture must be a JSON array of strings");
+        assert!(
+            cases.len() >= 10,
+            "the corpus fixture must keep several payloads per class, got {}",
+            cases.len()
+        );
+
+        let mut failures: Vec<String> = Vec::new();
+        for raw in &cases {
+            match parse_llm_action_response(raw) {
+                Ok((parsed, _warning)) => {
+                    if parsed.action.is_empty() {
+                        failures.push(format!(
+                            "recovered without an action name — input starts: {:?}",
+                            raw.chars().take(120).collect::<String>()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let head: String = raw.chars().take(120).collect();
+                    failures.push(format!("{:?} — input starts: {}", e, head));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "these real production payloads still fail to parse:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    // -- corpus probe: run the parser over a whole corpus of
+    //    production responses and report what still fails.
+    //
+    //    The fixture test above pins ONE payload per malformation
+    //    class. This probe measures the whole population: it takes
+    //    the path of a JSON array of response strings from the
+    //    `OW_PARSE_PROBE_FILE` environment variable, runs the real
+    //    parser over every entry, and prints how many were
+    //    recovered and how many still fail (grouped by the error
+    //    the parser reports).
+    //
+    //    It is `#[ignore]`d because it needs an external corpus
+    //    file that is not part of the repository. Run it with:
+    //
+    //      OW_PARSE_PROBE_FILE=/tmp/corpus.json \
+    //        cargo test -- --ignored --nocapture parse_probe_over_corpus
+    //
+    //    The corpus is produced by `scripts/collect_llm_responses.py`
+    //    (llm-logs) or `scripts/mine_parse_failures.py` (error-logs).
+    #[test]
+    #[ignore]
+    fn parse_probe_over_corpus() {
+        let path = std::env::var("OW_PARSE_PROBE_FILE").unwrap_or_else(|_| {
+            panic!("OW_PARSE_PROBE_FILE must point at a JSON array of response strings")
+        });
+        let text = std::fs::read_to_string(&path).expect("probe corpus file must exist");
+        let cases: Vec<String> =
+            serde_json::from_str(&text).expect("probe corpus must be a JSON array of strings");
+        assert!(!cases.is_empty(), "probe corpus must not be empty");
+
+        let mut recovered = 0usize;
+        let mut without_action = 0usize;
+        let mut failed: Vec<(String, String)> = Vec::new();
+        for raw in &cases {
+            match parse_llm_action_response(raw) {
+                Ok((parsed, _warning)) => {
+                    if parsed.action.is_empty() {
+                        without_action += 1;
+                    } else {
+                        recovered += 1;
+                    }
+                }
+                Err(e) => {
+                    // Keep the head of the error only: the tail
+                    // repeats the whole payload.
+                    let head: String = e.chars().take(90).collect();
+                    failed.push((head, raw.chars().take(70).collect()));
+                }
+            }
+        }
+
+        let mut classes: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (err, _raw) in &failed {
+            *classes.entry(err.clone()).or_insert(0) += 1;
+        }
+
+        println!(
+            "PROBE {}: total={} recovered={} no_action={} failed={}",
+            path,
+            cases.len(),
+            recovered,
+            without_action,
+            failed.len()
+        );
+        for (cls, n) in &classes {
+            println!("  FAIL {:4}  {}", n, cls);
+        }
+        for (err, raw) in failed.iter().take(20) {
+            println!("    · {:?} — input starts: {:?}", err, raw);
+        }
+    }
+
     // -- fixup #4: trailing content after the JSON object is ignored
     //    and the first complete value is used.
     //
@@ -12457,6 +12729,186 @@ mod parse_llm_action_response_repair_warning_tests {
         let garbage = r#"this is not json at all"#;
         let result = parse_llm_action_response(garbage);
         assert!(result.is_err(), "unparseable input must error");
+    }
+}
+
+#[cfg(test)]
+mod llm_decline_classification_tests {
+    //! Tests for `classify_llm_decline` and `format_llm_response_failure`.
+    //!
+    //! The world server asks the LLM for an action even for entities it
+    //! may not write (a `meta` / system entity such as the World
+    //! Clock). The model then DECLINES. Those responses carry no
+    //! action, so there is nothing for the parser to recover — but
+    //! they used to be reported as "JSON parse error: expected value at
+    //! line 1 column 1", which made the parser look broken.
+    //!
+    //! The classification must be conservative: a real (malformed)
+    //! response must never be mistaken for a decline, or a genuine
+    //! parser bug would be hidden.
+
+    use super::{classify_llm_decline, format_llm_response_failure, parse_llm_action_response};
+
+    #[test]
+    fn prose_refusal_is_a_decline() {
+        let raw = "I cannot generate an action for this entity. The World Clock is a system entity tagged `meta`.";
+        let reason = classify_llm_decline(raw).expect("prose refusal must be classified");
+        assert!(
+            reason.starts_with("LLM declined to act:"),
+            "unexpected reason: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn error_envelope_is_a_decline() {
+        let raw = r#"{"error": "Entity 'World Clock' is tagged 'meta' and cannot be written to."}"#;
+        let reason = classify_llm_decline(raw).expect("error envelope must be classified");
+        assert!(
+            reason.starts_with("LLM declined to act:"),
+            "unexpected reason: {}",
+            reason
+        );
+        assert!(
+            reason.contains("cannot be written"),
+            "the reason must carry the model's own words: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn typed_error_envelope_is_a_decline() {
+        let raw = r#"{"type":"error","error":"meta entities cannot act"}"#;
+        assert!(classify_llm_decline(raw).is_some());
+    }
+
+    #[test]
+    fn empty_response_is_not_a_parse_error() {
+        let reason = classify_llm_decline("   \n ").expect("empty response must be classified");
+        assert_eq!(reason, "LLM returned an empty response");
+    }
+
+    #[test]
+    fn empty_object_is_classified() {
+        let reason = classify_llm_decline("{}").expect("empty object must be classified");
+        assert_eq!(reason, "LLM returned an empty JSON object");
+    }
+
+    #[test]
+    fn pair_array_without_action_is_classified() {
+        let raw = r#"[["!ALL!","a long narrative"]]"#;
+        let reason = classify_llm_decline(raw).expect("pair array must be classified");
+        assert!(reason.contains("without an action"), "unexpected reason: {}", reason);
+    }
+
+    #[test]
+    fn a_real_response_is_never_a_decline() {
+        let raw = r#"{"action":"do_a_thing","outcome":"fine","effects":{},"narrative":"narr"}"#;
+        assert!(
+            classify_llm_decline(raw).is_none(),
+            "a response with an action must not be classified as a decline"
+        );
+    }
+
+    #[test]
+    fn a_malformed_response_is_never_a_decline() {
+        // Broken JSON: the repair path owns this one. Classifying it
+        // as a decline would hide a genuine parser bug.
+        let raw = r#"{"action": "do_a_thing", "outcome": "fine", "effects": {"self.x": 1,}}"#;
+        assert!(
+            classify_llm_decline(raw).is_none(),
+            "a malformed response must not be classified as a decline"
+        );
+    }
+
+    #[test]
+    fn prose_that_is_not_a_refusal_is_not_a_decline() {
+        let raw = "The dragon awakens and the valley trembles.";
+        assert!(classify_llm_decline(raw).is_none());
+    }
+
+    #[test]
+    fn a_fenced_json_response_is_never_a_decline() {
+        // The narrative of a real response can contain the words of a
+        // refusal ("cannot be written"). The response itself carries
+        // an action, so it must never be reported as a decline.
+        let raw = "```json\n{\"action\":\"acknowledge_meta_guard\",\"outcome\":\"The ancient World Clock cannot be written to, and stays.\",\"effects\":{},\"narrative\":\"n\"}\n```";
+        assert!(
+            classify_llm_decline(raw).is_none(),
+            "a fenced JSON response must not be classified as a decline"
+        );
+    }
+
+    #[test]
+    fn a_malformed_json_response_is_never_a_decline_even_with_refusal_words() {
+        let raw = "{\"action\":\"acknowledge\",\"outcome\":\"cannot be written\",\"effects\":{\"self.x\":1,}}";
+        assert!(
+            classify_llm_decline(raw).is_none(),
+            "a malformed response must not be classified as a decline"
+        );
+    }
+
+    #[test]
+    fn parser_reports_a_decline_as_a_decline() {
+        let raw = r#"{"error": "Action blocked: World Clock is tagged 'meta'"}"#;
+        let err = parse_llm_action_response(raw)
+            .expect_err("a refusal carries no action and must not parse");
+        assert!(
+            err.starts_with("LLM declined to act:"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            !err.contains("JSON parse error"),
+            "a decline must not be reported as a JSON syntax error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn the_operator_message_separates_declines_from_parse_errors() {
+        let decline = "LLM declined to act: Entity 'World Clock' is tagged 'meta'.";
+        assert_eq!(format_llm_response_failure(decline), decline);
+
+        let parse_error = "JSON parse error: expected value at line 1 column 1";
+        assert_eq!(
+            format_llm_response_failure(parse_error),
+            format!("Failed to parse LLM response: {}", parse_error)
+        );
+    }
+
+    // -- the real production refusals, verbatim.
+    #[test]
+    fn real_production_refusals_are_classified_as_declines() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/llm_parse_refusals.json");
+        let text = std::fs::read_to_string(&path).expect("refusal fixture file must exist");
+        let cases: Vec<String> =
+            serde_json::from_str(&text).expect("refusal fixture must be a JSON array of strings");
+        assert!(!cases.is_empty(), "refusal fixture must not be empty");
+
+        let mut failures: Vec<String> = Vec::new();
+        for raw in &cases {
+            match parse_llm_action_response(raw) {
+                Ok(_) => failures.push(format!(
+                    "a refusal must not parse into an action — input starts: {:?}",
+                    raw.chars().take(90).collect::<String>()
+                )),
+                Err(e) => {
+                    if e.contains("JSON parse error") {
+                        failures.push(format!(
+                            "a refusal must not be reported as a JSON syntax error: {}",
+                            e
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "these production refusals are not classified correctly:\n{}",
+            failures.join("\n")
+        );
     }
 }
 
