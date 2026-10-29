@@ -198,9 +198,40 @@ pub fn entity_power(entity: &Value) -> u64 {
         .unwrap_or(0)
 }
 
+/// True if the entity JSON describes a system entity (the World Clock
+/// or anything tagged "meta").
+///
+/// This mirrors `WorldEntity::is_system_entity()` (src/world_data/
+/// WorldEntity.rs) EXACTLY — all three conditions. Do NOT narrow it
+/// to `entity_type == "world_clock"`: the live clock's entity_type is
+/// "abstract" (the "world_clock" string is only the legacy alias), so
+/// a two-condition filter fails OPEN on exactly the entity we are
+/// trying to exclude (todo 4f7d9b6e, measured 2026-10-29).
+pub fn is_system_entity_json(entity: &Value) -> bool {
+    let entity_type = entity.get("entity_type").and_then(|v| v.as_str()).unwrap_or("");
+    if entity_type == "abstract" || entity_type == "world_clock" {
+        return true;
+    }
+    entity
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|tags| tags.iter().any(|t| t.as_str() == Some("meta")))
+        .unwrap_or(false)
+}
+
 /// Port of `pick_entities_weighted` from selena-project's
 /// scheduled_actions.py. Weights: `(power_i + 1) * idle_seconds_i`.
 /// Weighted sample without replacement (successive CDF draws).
+///
+/// Defence in depth (todo 4f7d9b6e, 2026-10-29): system entities are
+/// removed from the pool BEFORE weighting. The World Clock has the
+/// highest power in the world and never acts (its history is write
+/// protected), so its idle_seconds stays at the 7-day default and it
+/// dominated BOTH weight factors — it was picked on 100% of scheduler
+/// cycles, and every one of those LLM calls was refused by the
+/// server-side write guard. The API now also filters with
+/// `include_system=false`, but this filter keeps the lane correct even
+/// if the API default changes.
 pub fn pick_entities_weighted(
     entities: &[Value],
     k: u32,
@@ -209,6 +240,16 @@ pub fn pick_entities_weighted(
     if entities.is_empty() || k == 0 {
         return vec![];
     }
+    // Drop system entities from the pool (todo 4f7d9b6e).
+    let eligible: Vec<Value> = entities
+        .iter()
+        .filter(|e| !is_system_entity_json(e))
+        .cloned()
+        .collect();
+    if eligible.is_empty() {
+        return vec![];
+    }
+    let entities = &eligible[..];
     let weights: Vec<u64> = entities
         .iter()
         .map(|e| {
@@ -588,7 +629,12 @@ fn apply_budget_throttle(
 
 async fn fetch_entities(url: &str, client: &reqwest::Client) -> Result<Vec<Value>, String> {
     let resp = client
-        .get(format!("{url}/api/entities?limit=100"))
+        // `include_system=false` excludes the World Clock / meta-tagged
+        // entities from the pool (todo 4f7d9b6e). The endpoint already
+        // honours the flag (EntityQuery.include_system, applied in
+        // list_entities); without it the scheduler kept picking the
+        // clock on every single cycle.
+        .get(format!("{url}/api/entities?limit=100&include_system=false"))
         .header("Cookie", AUTH_COOKIE)
         .send()
         .await
@@ -753,6 +799,90 @@ mod tests {
         assert_eq!(entity_power(&e), 0);
         let e2 = json!({"id": "y", "name": "Y", "properties_int": {}});
         assert_eq!(entity_power(&e2), 0);
+    }
+
+    // ---- todo 4f7d9b6e: system entities must never be picked ----
+
+    /// The live World Clock as the API serialises it: entity_type
+    /// "abstract" (NOT "world_clock") + the "meta" tag, with the
+    /// highest power in the world (64 181) and a 7-day idle default.
+    fn world_clock_json() -> Value {
+        json!({
+            "id": "clock-id",
+            "name": "World Clock",
+            "entity_type": "abstract",
+            "tags": ["meta"],
+            "properties_int": { "power": 64181 },
+        })
+    }
+
+    #[test]
+    fn system_entity_json_detects_abstract_type() {
+        assert!(is_system_entity_json(&world_clock_json()));
+    }
+
+    #[test]
+    fn system_entity_json_detects_legacy_world_clock_type() {
+        // Backward-compat: pre-migration save files carry the
+        // "world_clock" entity_type. Both must be treated as system.
+        let e = json!({"id": "c", "entity_type": "world_clock"});
+        assert!(is_system_entity_json(&e));
+    }
+
+    #[test]
+    fn system_entity_json_detects_meta_tag() {
+        // A non-abstract entity tagged "meta" is still a system entity.
+        let e = json!({"id": "m", "entity_type": "character", "tags": ["meta", "npc"]});
+        assert!(is_system_entity_json(&e));
+    }
+
+    #[test]
+    fn system_entity_json_allows_normal_entities() {
+        let e = json!({"id": "a", "entity_type": "character", "tags": ["hero"]});
+        assert!(!is_system_entity_json(&e));
+        let e2 = json!({"id": "b", "entity_type": "location"});
+        assert!(!is_system_entity_json(&e2));
+        // Missing fields must not panic and must not classify as system.
+        let e3 = json!({"id": "c"});
+        assert!(!is_system_entity_json(&e3));
+    }
+
+    #[test]
+    fn pick_weighted_never_returns_the_world_clock() {
+        // The regression that matters: the clock dominates BOTH weight
+        // factors (highest power + never acts => 7-day idle default),
+        // so before the fix it was picked on 100% of cycles.
+        let entities = vec![world_clock_json(), ent("a", "A", 10), ent("b", "B", 20)];
+        for _ in 0..50 {
+            let picks = pick_entities_weighted(&entities, 1, &HashMap::new());
+            assert_eq!(picks.len(), 1);
+            let id = picks[0].get("id").and_then(|v| v.as_str()).unwrap_or("");
+            assert_ne!(id, "clock-id", "the World Clock must never be picked");
+        }
+    }
+
+    #[test]
+    fn pick_weighted_never_returns_a_meta_tagged_entity() {
+        let meta = json!({
+            "id": "meta-id",
+            "name": "Meta NPC",
+            "entity_type": "character",
+            "tags": ["meta"],
+            "properties_int": { "power": 999999 },
+        });
+        let entities = vec![meta, ent("a", "A", 10)];
+        for _ in 0..50 {
+            let picks = pick_entities_weighted(&entities, 1, &HashMap::new());
+            let id = picks[0].get("id").and_then(|v| v.as_str()).unwrap_or("");
+            assert_ne!(id, "meta-id", "meta-tagged entities must never be picked");
+        }
+    }
+
+    #[test]
+    fn pick_weighted_returns_empty_when_only_system_entities() {
+        let entities = vec![world_clock_json()];
+        let picks = pick_entities_weighted(&entities, 1, &HashMap::new());
+        assert!(picks.is_empty());
     }
 
     #[test]

@@ -2285,6 +2285,34 @@ fn llm_rate_limit_status(state: &AppState) -> LlmRateLimitStatus {
     }
 }
 
+/// Layer A guard (todo 4f7d9b6e, 2026-10-29): refuse to act FOR a
+/// system entity — the World Clock, anything tagged "meta", anything
+/// with entity_type abstract/world_clock.
+///
+/// The server used to ask the model to act for such an entity even
+/// though every write to it is blocked, so the model always declined
+/// and the LLM call was pure waste (measured: 100% of the automated
+/// lane, ~385 wasted calls/day for 44 days).
+///
+/// Returns `Some(response)` when the entity is a system entity and the
+/// request must be refused BEFORE any provider request is made.
+/// The predicate is `WorldEntity::is_system_entity()` — call it, do
+/// not re-implement it (the "world_clock" type alone is not enough:
+/// the live clock's entity_type is "abstract").
+fn system_entity_actor_guard(entity: &WorldEntity) -> Option<Response> {
+    if !entity.is_system_entity() {
+        return None;
+    }
+    Some(error_json(
+        StatusCode::BAD_REQUEST,
+        &format!(
+            "Entity '{}' is a system entity (type=abstract/world_clock or tagged 'meta'); \
+             system entities cannot be acted for and no LLM call was made.",
+            entity.name
+        ),
+    ))
+}
+
 // Call LLM with provided context (Step 2)
 async fn action_llm_handler(
     State(state): State<AppState>,
@@ -2300,14 +2328,6 @@ async fn action_llm_handler(
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
 
-    // Rate-limit gate: block if disabled or hourly cap reached.
-    if let Some(resp) = enforce_llm_rate_limit(
-        &state.llm_rate_limiter,
-        &format!("action_llm_handler entity={}", id),
-    ) {
-        return resp;
-    }
-
     // Check if entity exists
     let entity_name = {
         let world = state.world.read().await;
@@ -2316,6 +2336,37 @@ async fn action_llm_handler(
             None => return error_json(StatusCode::NOT_FOUND, "Entity not found"),
         }
     };
+
+    // Layer A guard (todo 4f7d9b6e, 2026-10-29): never spend an LLM
+    // call on a system entity (World Clock, anything tagged "meta",
+    // entity_type abstract/world_clock).  The server asks the model to
+    // act for an entity whose writes are blocked, so the model always
+    // declines and the call is pure waste.  This check MUST sit BEFORE
+    // the provider request and BEFORE the rate-limit gate, so a refused
+    // system-entity request costs neither tokens nor a quota slot.
+    let system_guard = {
+        let world = state.world.read().await;
+        world.entities.get(&id).and_then(system_entity_actor_guard)
+    };
+    if let Some(resp) = system_guard {
+        let err = format!(
+            "Refused LLM action for system entity '{}' (no provider call made).",
+            entity_name
+        );
+        if let Ok(mut logger) = state.logger.lock() {
+            logger.ensure_today(&PathBuf::from("logs"));
+            logger.log_error(&err);
+        }
+        return resp;
+    }
+
+    // Rate-limit gate: block if disabled or hourly cap reached.
+    if let Some(resp) = enforce_llm_rate_limit(
+        &state.llm_rate_limiter,
+        &format!("action_llm_handler entity={}", id),
+    ) {
+        return resp;
+    }
 
     // Check if LLM is configured
     let api_key = read_env_var(&state.env_path, &state.settings.llm.api_key_name);
@@ -12918,4 +12969,140 @@ mod test_load_only {
     use std::process::Command;
     // We can't easily test the load function in isolation from within the binary,
     // but we can use the existing test infrastructure.
+}
+
+/// Layer A regression tests (todo 4f7d9b6e, 2026-10-29).
+///
+/// The world server used to ask the LLM to act FOR a system entity
+/// (the World Clock, anything tagged "meta", anything with entity_type
+/// abstract/world_clock). Every such write is blocked by the server
+/// anyway, so the model always declined and the call was pure waste —
+/// measured: 100 % of the automated lane, ~385 wasted calls/day for
+/// 44 days.
+///
+/// `action_llm_handler` must refuse such an id BEFORE the provider
+/// request. "No provider request was made" is proven by the ORDER of
+/// the checks inside the handler: the guard runs before the rate-limit
+/// gate and before the "is the LLM configured?" branch, so a refusal
+/// that is neither of those two proves the provider was never
+/// reached.
+#[cfg(test)]
+mod system_entity_actor_guard_tests {
+    use super::*;
+
+    /// A world with the auto-created World Clock (a system entity).
+    fn guard_world() -> (World, Uuid) {
+        let mut world = World::new("test");
+        let clock_id = world
+            .entities
+            .values()
+            .find(|e| e.is_system_entity())
+            .expect("World::new must create the World Clock")
+            .id;
+        (world, clock_id)
+    }
+
+    fn guard_state(world: World) -> AppState {
+        let settings = load_settings();
+        AppState {
+            world: Arc::new(RwLock::new(world)),
+            settings,
+            save_path: std::env::temp_dir()
+                .join("open-world-guard-tests-save.owbl")
+                .to_string_lossy()
+                .to_string(),
+            // A path that does not exist: `read_env_var` reads the env
+            // FILE only (no process-env fallback), so the handler can
+            // never reach a provider from a test.
+            env_path: std::env::temp_dir()
+                .join("open-world-guard-tests-nonexistent.env")
+                .to_string_lossy()
+                .to_string(),
+            // A temp dir, NOT the production `logs/`: `ensure_today` is
+            // a no-op on the same date, so the handler's log_error lands
+            // here instead of in logs/error-log-<date>.log.
+            logger: Arc::new(std::sync::Mutex::new(DailyLogger::new(
+                std::env::temp_dir().join("open-world-guard-tests-logs"),
+            ))),
+            llm_rate_limiter: Arc::new(std::sync::Mutex::new(LlmRateLimiter::new(true, 100))),
+        }
+    }
+
+    fn auth_headers(state: &AppState) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("{}=1", state.settings.security.cookie_name)
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn guard_refuses_abstract_meta_and_legacy_clock_entities() {
+        // The live clock's entity_type is "abstract" ("world_clock" is
+        // only the legacy alias) — a filter that only knew the legacy
+        // string would fail OPEN on exactly the entity we want to stop.
+        let clock = WorldEntity::new("abstract", "World Clock", 0.0, 0.0);
+        assert!(
+            system_entity_actor_guard(&clock).is_some(),
+            "an abstract entity is a system entity"
+        );
+
+        let mut meta = WorldEntity::new("character", "Meta NPC", 0.0, 0.0);
+        meta.tags.push("meta".to_string());
+        assert!(
+            system_entity_actor_guard(&meta).is_some(),
+            "a meta-tagged entity is a system entity"
+        );
+
+        let legacy = WorldEntity::new("world_clock", "Old Clock", 0.0, 0.0);
+        assert!(
+            system_entity_actor_guard(&legacy).is_some(),
+            "the legacy world_clock type is a system entity"
+        );
+    }
+
+    #[test]
+    fn guard_does_not_refuse_normal_entities() {
+        let hero = WorldEntity::new("hero", "Kira Dawnblade", 0.0, 0.0);
+        assert!(
+            system_entity_actor_guard(&hero).is_none(),
+            "a normal entity must pass the guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_llm_refuses_the_world_clock_without_calling_the_provider() {
+        let (world, clock_id) = guard_world();
+        let state = guard_state(world);
+        let headers = auth_headers(&state);
+
+        let resp = action_llm_handler(
+            State(state),
+            headers,
+            AxumPath(clock_id),
+            Json(CallLlmRequest {
+                context: "Entity: World Clock (abstract) Tags: meta".to_string(),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("system entity"),
+            "the refusal must name the system entity: {text}"
+        );
+        // Neither the rate-limit gate nor the "LLM not configured"
+        // branch answered => the provider was never reached.
+        assert!(
+            !text.contains("rate limit") && !text.contains("not configured"),
+            "the guard must short-circuit before the provider stage: {text}"
+        );
+    }
 }
