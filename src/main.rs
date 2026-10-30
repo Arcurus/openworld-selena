@@ -1,5 +1,6 @@
 mod world_data;
 mod scheduler;
+mod session_auth;
 use crate::world_data::default_true;
 
 // ---------------------------------------------------------------------------
@@ -782,6 +783,10 @@ struct AppState {
     /// Sliding 1-hour LLM-call limiter. Shared across handlers so all
     /// LLM-touching endpoints count against the same budget.
     llm_rate_limiter: Arc<std::sync::Mutex<LlmRateLimiter>>,
+    /// In-memory session tokens. Shared across handlers (and the
+    /// in-process scheduler) so a login on one request is visible to
+    /// the next. Single process: no session file.
+    sessions: Arc<session_auth::SessionStore>,
 }
 
 // ============================================================================
@@ -1186,7 +1191,7 @@ async fn update_world_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -1276,7 +1281,7 @@ async fn llm_config_update_handler(
     // Require authentication
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
 
@@ -1558,7 +1563,7 @@ async fn add_world_event(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -1591,7 +1596,7 @@ async fn update_world_event(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -1631,7 +1636,7 @@ async fn delete_world_event(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -1737,7 +1742,7 @@ async fn get_entity_history(
 ) -> Response {
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     let limit: usize = params
@@ -1798,7 +1803,7 @@ async fn get_entity_history_from_others(
 ) -> Response {
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     let limit: usize = params
@@ -1933,7 +1938,7 @@ async fn history_summary_replace_handler(
 ) -> Response {
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
 
@@ -2073,7 +2078,7 @@ async fn create_entity(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -2118,7 +2123,7 @@ async fn update_entity(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -2180,7 +2185,7 @@ async fn delete_entity(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -2218,7 +2223,7 @@ async fn action_context_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -2324,7 +2329,7 @@ async fn action_llm_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
 
@@ -2677,7 +2682,7 @@ async fn entity_action(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -6596,7 +6601,7 @@ async fn process_action_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7278,7 +7283,7 @@ async fn set_int_property(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7312,7 +7317,7 @@ async fn set_float_property(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7346,7 +7351,7 @@ async fn set_string_property(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7380,7 +7385,7 @@ async fn delete_int_property(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7408,7 +7413,7 @@ async fn delete_float_property(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7436,7 +7441,7 @@ async fn delete_string_property(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7478,7 +7483,7 @@ async fn create_backup_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7571,7 +7576,7 @@ async fn delete_backup_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7610,7 +7615,7 @@ async fn download_backup_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required to download backup");
     }
     
@@ -7647,7 +7652,7 @@ async fn download_save_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required to download save file");
     }
     
@@ -7680,7 +7685,7 @@ async fn download_project_file_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required to download file");
     }
     
@@ -7820,7 +7825,7 @@ async fn save_world_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7892,7 +7897,7 @@ async fn load_world_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -7929,7 +7934,7 @@ async fn create_world_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
 
@@ -7979,7 +7984,7 @@ async fn backup_world_handler(
 ) -> Response {
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     match snapshot_save("manual") {
@@ -8002,7 +8007,7 @@ async fn list_backups_handler(
 ) -> Response {
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     let dir = std::path::Path::new("world_data/backups");
@@ -8062,7 +8067,7 @@ async fn list_logs_handler(
 ) -> Response {
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     let dir = std::path::Path::new("logs");
@@ -8129,7 +8134,7 @@ async fn get_log_file_tail_handler(
 ) -> Response {
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     if filename.contains('/') || filename.contains('\\') || filename.contains("..")
@@ -8349,18 +8354,15 @@ fn write_env_var(env_path: &str, var_name: &str, value: &str) -> Result<(), Stri
 // Authentication helper
 // ============================================================================
 
-fn verify_auth_cookie(cookies_header: Option<&str>, cookie_name: &str) -> bool {
-    if let Some(cookies) = cookies_header {
-        for cookie in cookies.split(';') {
-            let cookie = cookie.trim();
-            if let Some((name, value)) = cookie.split_once('=') {
-                if name == cookie_name && value == "1" {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+fn verify_auth_cookie(
+    cookies_header: Option<&str>,
+    cookie_name: &str,
+    sessions: &session_auth::SessionStore,
+) -> bool {
+    // Rejects the legacy forgeable value "1". A real token stored by
+    // `sessions` is required. When both the old cookie and a real one
+    // are present (browsers can send two paths), the real one wins.
+    session_auth::header_grants(cookies_header, cookie_name, sessions)
 }
 
 fn require_auth(state: &AppState, request: &axum::http::Request<axum::body::Body>) -> Option<Response> {
@@ -8369,7 +8371,7 @@ fn require_auth(state: &AppState, request: &axum::http::Request<axum::body::Body
         .get("cookie")
         .and_then(|v| v.to_str().ok());
     
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return Some(error_json(StatusCode::UNAUTHORIZED, "Authentication required"));
     }
     None
@@ -8412,7 +8414,7 @@ async fn env_status_handler(
     // Check if user is currently authenticated (has valid cookie)
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    let is_authenticated = verify_auth_cookie(cookies, cookie_name);
+    let is_authenticated = verify_auth_cookie(cookies, cookie_name, &state.sessions);
     
     success_json(serde_json::json!({
         "success": true,
@@ -8443,7 +8445,7 @@ async fn configure_env_handler(
     if password_is_set {
         let cookies = headers.get("cookie")
             .and_then(|v| v.to_str().ok());
-        if !verify_auth_cookie(cookies, cookie_name) {
+        if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
             return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
         }
     }
@@ -8483,19 +8485,29 @@ async fn verify_password_handler(
 ) -> Response {
     let password_var_name = &state.settings.security.password_var_name;
     let cookie_name = &state.settings.security.cookie_name;
-    let cookie_duration = state.settings.security.cookie_duration_secs;
-    
+    let ttl = session_auth::session_ttl_secs(state.settings.security.cookie_duration_secs);
+
     let stored_password = read_env_var(&state.env_path, password_var_name);
-    
+
     match stored_password {
-        Some(stored) if stored == req.password => {
-            // Password correct - return success with cookie info
-            success_json(serde_json::json!({
+        Some(stored) if session_auth::constant_time_eq(stored.as_bytes(), req.password.as_bytes()) => {
+            // Same password source as before (WEB_PASSWORD in .env).
+            // The session cookie is set here so it can be HttpOnly;
+            // the token is not echoed in the JSON body.
+            let token = state.sessions.issue(ttl);
+            let cookie = session_auth::set_cookie_value(cookie_name, &token, ttl);
+            let Ok(cookie_hv) = axum::http::HeaderValue::from_str(&cookie) else {
+                state.sessions.revoke(&token);
+                return error_json(StatusCode::INTERNAL_SERVER_ERROR, "Failed to set session cookie");
+            };
+            let mut resp = success_json(serde_json::json!({
                 "success": true,
                 "verified": true,
                 "cookie_name": cookie_name,
-                "cookie_max_age": cookie_duration
-            })).into_response()
+                "cookie_max_age": ttl
+            })).into_response();
+            resp.headers_mut().insert(axum::http::header::SET_COOKIE, cookie_hv);
+            resp
         }
         Some(_) => {
             error_json(StatusCode::UNAUTHORIZED, "Invalid password")
@@ -8506,8 +8518,43 @@ async fn verify_password_handler(
     }
 }
 
+/// Drop the presented session and clear both the scoped cookie and a
+/// legacy Path=/ cookie left by the old client.
+async fn logout_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    for value in session_auth::cookie_values(cookies, cookie_name) {
+        state.sessions.revoke(value);
+    }
+    let mut resp = success_json(serde_json::json!({
+        "success": true,
+        "logged_out": true
+    })).into_response();
+    for path in [session_auth::COOKIE_PATH, "/"] {
+        let raw = session_auth::clear_cookie_value(cookie_name, path);
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&raw) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, hv);
+        }
+    }
+    resp
+}
+
 /// Get .env variables (for authenticated users)
-async fn get_env_variables_handler(State(state): State<AppState>) -> Response {
+async fn get_env_variables_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Documented as authenticated. The cookie used to be optional here;
+    // a masked env dump still should not be anonymous.
+    let cookie_name = &state.settings.security.cookie_name;
+    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok());
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
+        return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+
     // Read all variables from .env
     let mut variables = std::collections::HashMap::new();
     
@@ -8549,7 +8596,7 @@ async fn update_env_variables_handler(
     let cookie_name = &state.settings.security.cookie_name;
     let cookies = headers.get("cookie")
         .and_then(|v| v.to_str().ok());
-    if !verify_auth_cookie(cookies, cookie_name) {
+    if !verify_auth_cookie(cookies, cookie_name, &state.sessions) {
         return error_json(StatusCode::UNAUTHORIZED, "Authentication required");
     }
     
@@ -8764,6 +8811,7 @@ async fn main() {
             settings.llm.calls_per_hour_enabled,
             settings.llm.max_calls_per_hour,
         ))),
+        sessions: Arc::new(session_auth::SessionStore::new()),
     };
 
     // Spawn the in-process world scheduler (added 2026-06-08 per
@@ -8773,7 +8821,11 @@ async fn main() {
     // selena-project.  The scheduler is self-driving and uses
     // HTTP calls to its own endpoints (matching the old Python
     // design).  See src/scheduler.rs for the full design.
-    scheduler::start();
+    scheduler::start(
+        state.sessions.clone(),
+        state.settings.security.cookie_name.clone(),
+        session_auth::session_ttl_secs(state.settings.security.cookie_duration_secs),
+    );
     println!("🕒  In-process scheduler spawned (src/scheduler.rs)");
 
     println!(
@@ -8845,6 +8897,7 @@ async fn main() {
         .route("/api/env/status", get(env_status_handler))
         .route("/api/env/configure", post(configure_env_handler))
         .route("/api/env/verify-password", post(verify_password_handler))
+        .route("/api/auth/logout", post(logout_handler))
         .route("/api/env/variables", get(get_env_variables_handler))
         .route("/api/env/variables", put(update_env_variables_handler))
         // Serve web client (fallback for SPA)
@@ -13025,14 +13078,17 @@ mod system_entity_actor_guard_tests {
                 std::env::temp_dir().join("open-world-guard-tests-logs"),
             ))),
             llm_rate_limiter: Arc::new(std::sync::Mutex::new(LlmRateLimiter::new(true, 100))),
+            sessions: Arc::new(session_auth::SessionStore::new()),
         }
     }
 
     fn auth_headers(state: &AppState) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
+        let ttl = session_auth::session_ttl_secs(state.settings.security.cookie_duration_secs);
+        let token = state.sessions.issue(ttl);
         headers.insert(
             axum::http::header::COOKIE,
-            format!("{}=1", state.settings.security.cookie_name)
+            format!("{}={}", state.settings.security.cookie_name, token)
                 .parse()
                 .unwrap(),
         );
@@ -13104,5 +13160,192 @@ mod system_entity_actor_guard_tests {
             !text.contains("rate limit") && !text.contains("not configured"),
             "the guard must short-circuit before the provider stage: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_http_tests {
+    use super::*;
+
+    const FIXTURE_PASSWORD: &str = "t324-fixture-password";
+
+    fn session_state() -> AppState {
+        let settings = load_settings();
+        let env_path = std::env::temp_dir()
+            .join(format!("ow-t324-env-{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let pw_var = settings.security.password_var_name.clone();
+        std::fs::write(&env_path, format!("{pw_var}={FIXTURE_PASSWORD}\n")).unwrap();
+        let save_path = std::env::temp_dir()
+            .join(format!("ow-t324-save-{}.owbl", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        // Never point a test at the live world.
+        assert!(
+            !save_path.contains("/open-world-selena/world_data/"),
+            "test save path must stay out of the live world"
+        );
+        AppState {
+            world: Arc::new(RwLock::new(World::new("t324-session-test"))),
+            settings,
+            save_path,
+            env_path,
+            logger: Arc::new(std::sync::Mutex::new(DailyLogger::new(
+                std::env::temp_dir().join("ow-t324-session-logs"),
+            ))),
+            llm_rate_limiter: Arc::new(std::sync::Mutex::new(LlmRateLimiter::new(true, 100))),
+            sessions: Arc::new(session_auth::SessionStore::new()),
+        }
+    }
+
+    fn cookie_hdr(value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            value.parse().unwrap(),
+        );
+        headers
+    }
+
+    fn token_from_set_cookie(resp: &Response) -> String {
+        let hv = resp
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("login sets a cookie");
+        let s = hv.to_str().unwrap();
+        assert!(s.contains("HttpOnly"), "cookie must be HttpOnly");
+        assert!(s.contains("Secure"), "cookie must be Secure");
+        assert!(s.contains("SameSite=Lax"), "cookie must be SameSite=Lax");
+        assert!(s.contains("Path=/open-world/"), "cookie path must be /open-world/");
+        let pair = s.split(';').next().unwrap();
+        let (name, value) = pair.split_once('=').unwrap();
+        assert_eq!(name, "openworld_auth");
+        assert_ne!(value, "1");
+        assert!(value.len() >= 40);
+        value.to_string()
+    }
+
+    #[tokio::test]
+    async fn forged_cookie_rejected_on_save_create_and_delete() {
+        let state = session_state();
+        let headers = cookie_hdr("openworld_auth=1");
+
+        let save = save_world_handler(State(state.clone()), headers.clone()).await;
+        assert_eq!(save.status(), StatusCode::UNAUTHORIZED);
+
+        let created = create_world_handler(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateWorldRequest {
+                name: "should-not-run".into(),
+                description: None,
+                generate_sample: false,
+            }),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::UNAUTHORIZED);
+
+        let deleted = delete_entity(
+            State(state.clone()),
+            headers,
+            AxumPath(Uuid::new_v4()),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::UNAUTHORIZED);
+
+        // Auth returned before create_world's snapshot of world_data/save.owbl.
+        let _ = std::fs::remove_file(&state.env_path);
+        let _ = std::fs::remove_file(&state.save_path);
+    }
+
+    #[tokio::test]
+    async fn login_sets_session_save_works_then_expiry_and_logout_fail() {
+        let state = session_state();
+
+        let bad = verify_password_handler(
+            State(state.clone()),
+            Json(VerifyPasswordRequest {
+                password: "not-the-fixture".into(),
+            }),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+        assert!(bad.headers().get(axum::http::header::SET_COOKIE).is_none());
+
+        let login = verify_password_handler(
+            State(state.clone()),
+            Json(VerifyPasswordRequest {
+                password: FIXTURE_PASSWORD.into(),
+            }),
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let token = token_from_set_cookie(&login);
+        let body = axum::body::to_bytes(login.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(!body_text.contains(&token), "token must not be in the JSON body");
+        assert!(body_text.contains("\"verified\":true"));
+
+        // Forged flag still fails while a real session exists.
+        let forged = save_world_handler(State(state.clone()), cookie_hdr("openworld_auth=1")).await;
+        assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+
+        let authed = save_world_handler(
+            State(state.clone()),
+            cookie_hdr(&format!("openworld_auth={token}")),
+        )
+        .await;
+        assert_eq!(authed.status(), StatusCode::OK);
+
+        // Both cookies: the real one is accepted, the flag is ignored.
+        let both = save_world_handler(
+            State(state.clone()),
+            cookie_hdr(&format!("openworld_auth=1; openworld_auth={token}")),
+        )
+        .await;
+        assert_eq!(both.status(), StatusCode::OK);
+
+        state.sessions.expire_token(&token);
+        let expired = save_world_handler(
+            State(state.clone()),
+            cookie_hdr(&format!("openworld_auth={token}")),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+
+        // Fresh login, then logout invalidates that token only.
+        let login2 = verify_password_handler(
+            State(state.clone()),
+            Json(VerifyPasswordRequest {
+                password: FIXTURE_PASSWORD.into(),
+            }),
+        )
+        .await;
+        assert_eq!(login2.status(), StatusCode::OK);
+        let token2 = token_from_set_cookie(&login2);
+        let svc = state
+            .sessions
+            .service_cookie("openworld_auth", session_auth::SESSION_TTL_FLOOR_SECS);
+        let svc_token = svc.split_once('=').unwrap().1.to_string();
+
+        let bye = logout_handler(
+            State(state.clone()),
+            cookie_hdr(&format!("openworld_auth={token2}")),
+        )
+        .await;
+        assert_eq!(bye.status(), StatusCode::OK);
+        let after = save_world_handler(
+            State(state.clone()),
+            cookie_hdr(&format!("openworld_auth={token2}")),
+        )
+        .await;
+        assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+        assert!(state.sessions.validate(&svc_token));
+
+        let _ = std::fs::remove_file(&state.env_path);
+        let _ = std::fs::remove_file(&state.save_path);
     }
 }

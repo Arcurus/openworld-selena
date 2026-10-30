@@ -298,13 +298,21 @@ pub fn pick_entities_weighted(
 /// Public entry point. Spawns the scheduler as a detached tokio task
 /// so the world binary's main flow is not blocked. Errors are logged
 /// to stderr; the scheduler never panics and never returns.
-pub fn start() {
+pub fn start(
+    sessions: std::sync::Arc<crate::session_auth::SessionStore>,
+    cookie_name: String,
+    ttl_secs: u64,
+) {
     tokio::spawn(async move {
-        scheduler_loop().await;
+        scheduler_loop(sessions, cookie_name, ttl_secs).await;
     });
 }
 
-async fn scheduler_loop() {
+async fn scheduler_loop(
+    sessions: std::sync::Arc<crate::session_auth::SessionStore>,
+    cookie_name: String,
+    ttl_secs: u64,
+) {
     let url = std::env::var("OPEN_WORLD_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string());
     let client = match reqwest::Client::builder()
@@ -369,17 +377,18 @@ async fn scheduler_loop() {
             sleep(Duration::from_secs(60)).await;
             continue;
         }
-        execute_cycle(&url, &client, cfg.actions_per_cycle).await;
+        let cookie = sessions.service_cookie(&cookie_name, ttl_secs);
+        execute_cycle(&url, &client, cfg.actions_per_cycle, &cookie).await;
         sleep(Duration::from_secs(effective_interval)).await;
     }
 }
 
-async fn execute_cycle(url: &str, client: &reqwest::Client, actions_per_cycle: u32) {
+async fn execute_cycle(url: &str, client: &reqwest::Client, actions_per_cycle: u32, cookie: &str) {
     eprintln!(
         "[scheduler] === cycle start ({} actions) ===",
         actions_per_cycle
     );
-    let entities = match fetch_entities(url, client).await {
+    let entities = match fetch_entities(url, client, cookie).await {
         Ok(e) => e,
         Err(e) => {
             eprintln!("[scheduler] fetch entities failed: {e}");
@@ -425,7 +434,7 @@ async fn execute_cycle(url: &str, client: &reqwest::Client, actions_per_cycle: u
             (power + 1) * idle_s
         );
         // Step 1: get the LLM prompt context.
-        let context = match get_action_context(url, client, &entity_id).await {
+        let context = match get_action_context(url, client, &entity_id, cookie).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[scheduler]     context error: {e}");
@@ -446,7 +455,7 @@ async fn execute_cycle(url: &str, client: &reqwest::Client, actions_per_cycle: u
             .unwrap_or("")
             .to_string();
         // Step 2: call the LLM.
-        let llm = match call_llm(url, client, &entity_id, &prompt).await {
+        let llm = match call_llm(url, client, &entity_id, &prompt, cookie).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[scheduler]     LLM failed: {e}");
@@ -471,7 +480,7 @@ async fn execute_cycle(url: &str, client: &reqwest::Client, actions_per_cycle: u
             continue;
         }
         // Step 3: process and apply effects.
-        let proc = match process_action(url, client, &entity_id, &raw_response).await {
+        let proc = match process_action(url, client, &entity_id, &raw_response, cookie).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[scheduler]     process error: {e}");
@@ -507,11 +516,9 @@ async fn execute_cycle(url: &str, client: &reqwest::Client, actions_per_cycle: u
 
 // --- HTTP helpers --------------------------------------------------------
 
-/// Auth: the world's auth cookie is just `name=1` (see
-/// `verify_auth_cookie` in main.rs). Setting it directly is safe
-/// for in-process clients; a future refactor could move to a
-/// proper token, but this matches the existing model.
-const AUTH_COOKIE: &str = "openworld_auth=1";
+/// Auth: the scheduler presents a real session token minted by
+/// `SessionStore::service_cookie`. The legacy cookie value `1` is
+/// rejected by `verify_auth_cookie`.
 
 // --- Budget gate (added 2026-06-10 per Arcurus #cost-tracker) -----------
 //
@@ -627,7 +634,7 @@ fn apply_budget_throttle(
     }
 }
 
-async fn fetch_entities(url: &str, client: &reqwest::Client) -> Result<Vec<Value>, String> {
+async fn fetch_entities(url: &str, client: &reqwest::Client, cookie: &str) -> Result<Vec<Value>, String> {
     let resp = client
         // `include_system=false` excludes the World Clock / meta-tagged
         // entities from the pool (todo 4f7d9b6e). The endpoint already
@@ -635,7 +642,7 @@ async fn fetch_entities(url: &str, client: &reqwest::Client) -> Result<Vec<Value
         // list_entities); without it the scheduler kept picking the
         // clock on every single cycle.
         .get(format!("{url}/api/entities?limit=100&include_system=false"))
-        .header("Cookie", AUTH_COOKIE)
+        .header("Cookie", cookie)
         .send()
         .await
         .map_err(|e| format!("fetch_entities HTTP error: {e}"))?;
@@ -661,10 +668,11 @@ async fn get_action_context(
     url: &str,
     client: &reqwest::Client,
     entity_id: &str,
+    cookie: &str,
 ) -> Result<Value, String> {
     let resp = client
         .get(format!("{url}/api/entities/{entity_id}/action/context"))
-        .header("Cookie", AUTH_COOKIE)
+        .header("Cookie", cookie)
         .send()
         .await
         .map_err(|e| format!("get_action_context HTTP error: {e}"))?;
@@ -684,10 +692,11 @@ async fn call_llm(
     client: &reqwest::Client,
     entity_id: &str,
     prompt: &str,
+    cookie: &str,
 ) -> Result<Value, String> {
     let resp = client
         .post(format!("{url}/api/entities/{entity_id}/action/llm"))
-        .header("Cookie", AUTH_COOKIE)
+        .header("Cookie", cookie)
         .json(&json!({ "context": prompt }))
         .send()
         .await
@@ -708,10 +717,11 @@ async fn process_action(
     client: &reqwest::Client,
     entity_id: &str,
     raw_response: &str,
+    cookie: &str,
 ) -> Result<Value, String> {
     let resp = client
         .post(format!("{url}/api/entities/{entity_id}/action/process"))
-        .header("Cookie", AUTH_COOKIE)
+        .header("Cookie", cookie)
         .json(&json!({
             "entity_id": entity_id,
             "raw_response": raw_response,

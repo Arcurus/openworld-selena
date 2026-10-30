@@ -1771,7 +1771,7 @@
                 const data = await res.json();
                 
                 if (data.success) {
-                    if (data.has_password && !isAuthenticated()) {
+                    if (data.has_password && !data.is_authenticated) {
                         // Show password dialog
                         document.getElementById('passwordUnlockModal').style.display = 'flex';
                         document.getElementById('unlockPasswordInput').focus();
@@ -3654,8 +3654,18 @@
                 
                 let html = '';
                 
-                // Fetch .env variables if authenticated
-                if (isAuthenticated()) {
+                // Fetch .env variables if authenticated. The session
+                // cookie is HttpOnly, so ask the server.
+                let authed = false;
+                try {
+                    const statusRes = await fetch('api/env/status', { credentials: 'same-origin' });
+                    const statusData = await statusRes.json();
+                    authed = !!(statusData && statusData.is_authenticated);
+                    window._owAuthenticated = authed;
+                } catch (e) {
+                    authed = false;
+                }
+                if (authed) {
                     try {
                         const envRes = await fetch('api/env/variables');
                         const envData = await envRes.json();
@@ -4067,14 +4077,16 @@
             try {
                 const res = await fetch('api/env/verify-password', {
                     method: 'POST',
+                    credentials: 'same-origin',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ password })
                 });
                 const data = await res.json();
                 
                 if (data.success && data.verified) {
-                    // Set auth cookie
-                    setAuthCookie(data.cookie_name, '1', data.cookie_max_age);
+                    // The server set an HttpOnly session cookie. Do not
+                    // write a client cookie; the old value "1" was forgeable.
+                    window._owAuthenticated = true;
                     showNotification('Access granted!', 'success');
                     closePasswordUnlockModal();
                     document.getElementById('unlockPasswordInput').value = '';
@@ -4093,28 +4105,29 @@
             }
         }
         
-        function setAuthCookie(name, value, maxAge) {
-            const expires = new Date();
-            expires.setTime(expires.getTime() + maxAge * 1000);
-            document.cookie = name + '=' + value + ';expires=' + expires.toUTCString() + ';path=/;SameSite=Strict';
+        function setAuthCookie(_name, _value, _maxAge) {
+            // t324: the session cookie is HttpOnly and set by the server.
+            // Writing document.cookie here cannot see it and must not
+            // recreate the forgeable value "1".
         }
-        
+
         function isAuthenticated() {
-            // Check if auth cookie exists
-            const cookies = document.cookie.split(';');
-            for (let c of cookies) {
-                c = c.trim();
-                if (c.startsWith('openworld_auth=')) {
-                    return c.split('=')[1] === '1';
-                }
+            // HttpOnly cookies are invisible to document.cookie.
+            // Callers that need a synchronous hint can read the flag set
+            // after a successful login; the source of truth is
+            // /api/env/status is_authenticated.
+            return window._owAuthenticated === true;
+        }
+
+        async function clearAuthCookie() {
+            try {
+                await fetch('api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+            } catch (e) {
+                console.error('Logout failed', e);
             }
-            return false;
+            window._owAuthenticated = false;
         }
-        
-        function clearAuthCookie() {
-            document.cookie = 'openworld_auth=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/';
-        }
-        
+
         function editEnvField(key) {
             // Replace the "Set" display with an input field
             const parent = document.querySelector(`#env_${key}`).parentElement;
