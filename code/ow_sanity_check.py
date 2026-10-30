@@ -407,6 +407,57 @@ def scan_llm_log(log_path: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 3) Other worth-reporting signals
 # ---------------------------------------------------------------------------
+def is_system_entity(e: Dict[str, Any]) -> bool:
+    """Mirror of the server's WorldEntity::is_system_entity().
+
+    The scheduler picks actors from the NON-system pool only
+    (src/scheduler.rs:246 filters with the same predicate), so an entity
+    that is system/meta can never be an actor.
+    """
+    if (e.get("entity_type") or "").lower() in ("world_clock", "abstract"):
+        return True
+    tags = e.get("tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    return "meta" in [str(t).lower() for t in tags]
+
+
+def scan_cast_viability(entities: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Can the automated lane act at all?
+
+    THE 2026-09-07 BLIND SPOT
+    --------------------------
+    The world lost its 49 entities on 2026-09-07 and has run with only the
+    World Clock since. Every automated LLM actor was the clock, every write
+    was refused ("Entity is a system entity … LLM effect writes blocked"),
+    and the world did not evolve — for SEVEN WEEKS, with nobody noticing.
+
+    The scheduler log said "no entities found" every 600 s. That was the
+    only signal, and nobody was reading it. This scan turns the silent
+    condition into an explicit, reportable finding: a world with zero
+    non-system entities is a DEAD world, and the scheduler will never do
+    anything again until that is fixed.
+
+    Fields:
+      n_total       — entities returned by the API
+      n_system      — system/meta entities (World Clock & co)
+      n_eligible    — entities the scheduler could actually pick as actors
+      viable        — True iff there is at least one eligible actor
+      eligible_examples — up to 10 eligible entity names
+      system_examples   — up to 5 system entity names
+    """
+    system = [e for e in entities if is_system_entity(e)]
+    eligible = [e for e in entities if not is_system_entity(e)]
+    return {
+        "n_total": len(entities),
+        "n_system": len(system),
+        "n_eligible": len(eligible),
+        "viable": len(eligible) > 0,
+        "eligible_examples": [e.get("name") for e in eligible[:10]],
+        "system_examples": [e.get("name") for e in system[:5]],
+    }
+
+
 def scan_summary_lengths(entities: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Distribution of summary lengths + any over the hard cap."""
     lengths = [(e.get("name"), e.get("entity_type"),
@@ -485,10 +536,31 @@ def fetch_entities(api_url: str) -> List[Dict[str, Any]]:
 def render_report(rels: List[Dict[str, Any]],
                   log_stats: Dict[str, Any],
                   lengths: Dict[str, Any],
-                  stale: List[Dict[str, Any]]) -> str:
+                  stale: List[Dict[str, Any]],
+                  viability: Optional[Dict[str, Any]] = None) -> str:
     parts: List[str] = []
     parts.append(f"🛡️ **open-world sanity check** — {_dt.datetime.now().isoformat(timespec='seconds')}")
     parts.append("")
+
+    # === Cast viability (is the automated lane able to act at all?) ===
+    if viability:
+        if viability.get("viable"):
+            parts.append(f"✅ **Cast viable**: **{viability['n_eligible']}** eligible actors "
+                         f"of {viability['n_total']} entities "
+                         f"({viability['n_system']} system/meta excluded)")
+        else:
+            parts.append(f"🚨 **DEAD WORLD — 0 eligible actors**: "
+                         f"{viability['n_total']} entities, "
+                         f"{viability['n_system']} system/meta, "
+                         f"**{viability['n_eligible']} eligible**")
+            if viability.get("system_examples"):
+                parts.append(f"  • only system entities present: "
+                             f"{', '.join(str(x) for x in viability['system_examples'])}")
+            parts.append("  • the scheduler picks from the NON-system pool only "
+                         "(src/scheduler.rs) — with 0 eligible actors it will never act again")
+            parts.append("  • this is the 2026-09-07 signature: 49 entities lost, world ran "
+                         "clock-only for 7 weeks unnoticed")
+        parts.append("")
 
     # === Duplicate relations ===
     if rels:
@@ -659,6 +731,7 @@ def main() -> int:
     rel_findings = scan_duplicate_relations(entities)
     lengths = scan_summary_lengths(entities)
     stale = scan_stale_entities(entities)
+    viability = scan_cast_viability(entities)
 
     # === Scan 2: LLM call counts ===
     log_stats = scan_llm_log(log_path)
@@ -670,10 +743,11 @@ def main() -> int:
             "llm_log": log_stats,
             "summary_lengths": lengths,
             "stale_entities": stale,
+            "cast_viability": viability,
         }
         print(json.dumps(out, indent=2))
     else:
-        report = render_report(rel_findings, log_stats, lengths, stale)
+        report = render_report(rel_findings, log_stats, lengths, stale, viability)
         print(report)
 
     # === Post to Discord ===
@@ -681,7 +755,7 @@ def main() -> int:
         if args.json:
             print("\n--post is not supported with --json; print the report first.", file=sys.stderr)
             return 1
-        report = render_report(rel_findings, log_stats, lengths, stale)
+        report = render_report(rel_findings, log_stats, lengths, stale, viability)
         result = _discord_post(OPENWORLD_LOG_CHANNEL_ID, report)
         if "error" in result:
             print(f"\nDiscord post FAILED: {result['error']}", file=sys.stderr)
@@ -693,6 +767,8 @@ def main() -> int:
 
     # Exit code: 0 if no findings, 1 if findings (still non-fatal)
     has_findings = bool(rel_findings) or bool(stale)
+    if viability and not viability.get("viable"):
+        has_findings = True  # a dead world is a finding
     if "error" in log_stats:
         has_findings = True
     return 1 if has_findings else 0
