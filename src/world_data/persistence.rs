@@ -4,7 +4,7 @@
 use super::{WorldEntity, World, Path, HistoryEntry};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write, BufReader, BufWriter};
+use std::io::{Read, Write, BufReader};
 
 /// Binary file format:
 /// [4 bytes: magic "OWBL"]
@@ -42,35 +42,106 @@ const ENTITY_VERSION: u32 = 2;
 pub struct BinaryPersistence;
 
 impl BinaryPersistence {
-    /// Save world to binary file
+    /// Save world to a binary file using an atomic replace.
+    ///
+    /// The new save is written to `{path}.tmp` in the same directory
+    /// and fsynced. If `{path}` already exists it is kept as
+    /// `{path}.bak` with `rename` (not `fs::copy`). The temp file is
+    /// then renamed into place. `fs::copy` is avoided because on
+    /// Linux it `fchmod`s the destination; that returns EPERM when
+    /// the process can write the file via ACL but does not own it,
+    /// and it already truncated the `.bak` by then.
+    ///
+    /// On error the existing save and `.bak` are left untouched
+    /// (or, if the save was already renamed to `.bak` and the final
+    /// rename fails, the previous save is renamed back). The temp
+    /// file is removed. Existing files are never opened for truncate.
     pub fn save_world(world: &World, path: &str) -> Result<(), String> {
-        // Create backup first
+        let dest = std::path::Path::new(path);
         let bak_path = format!("{}.bak", path);
-        if std::path::Path::new(path).exists() {
-            fs::copy(path, &bak_path).map_err(|e| format!("Failed to create backup: {}", e))?;
+        let tmp_path = format!("{}.tmp", path);
+
+        let world_data = Self::serialize_world(world);
+        let mut payload = Vec::with_capacity(16 + world_data.len());
+        payload.extend_from_slice(MAGIC);
+        payload.extend_from_slice(&VERSION.to_le_bytes());
+        let class_bytes = b"World";
+        payload.extend_from_slice(&(class_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(class_bytes);
+        payload.extend_from_slice(&(world_data.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&world_data);
+
+        Self::atomic_replace_with_backup(dest, &bak_path, &tmp_path, &payload)
+    }
+
+    /// Write `payload` to `tmp_path`, fsync it, then rename the
+    /// existing dest to `bak_path` and the temp file to dest.
+    fn atomic_replace_with_backup(
+        dest: &std::path::Path,
+        bak_path: &str,
+        tmp_path: &str,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        if let Err(e) = Self::write_tmp_fsynced(tmp_path, payload) {
+            let _ = fs::remove_file(tmp_path);
+            return Err(format!(
+                "Failed to write temporary save {}: {}",
+                tmp_path, e
+            ));
         }
 
-        let file = File::create(path).map_err(|e| format!("Failed to create file: {}", e))?;
-        let mut writer = BufWriter::new(file);
+        let dest_existed = dest.exists();
+        if dest_existed {
+            if let Err(e) = fs::rename(dest, bak_path) {
+                let _ = fs::remove_file(tmp_path);
+                return Err(format!(
+                    "Failed to keep previous save as {}: {}",
+                    bak_path, e
+                ));
+            }
+        }
 
-        // Write magic
-        writer.write_all(MAGIC).map_err(|e| e.to_string())?;
+        if let Err(e) = fs::rename(tmp_path, dest) {
+            if dest_existed {
+                if let Err(rb) = fs::rename(bak_path, dest) {
+                    let _ = fs::remove_file(tmp_path);
+                    return Err(format!(
+                        "Failed to install new save at {}: {}; also failed to restore previous save from {}: {}",
+                        dest.display(),
+                        e,
+                        bak_path,
+                        rb
+                    ));
+                }
+            }
+            let _ = fs::remove_file(tmp_path);
+            return Err(format!(
+                "Failed to install new save at {}: {}",
+                dest.display(),
+                e
+            ));
+        }
 
-        // Write version
-        writer.write_all(&VERSION.to_le_bytes()).map_err(|e| e.to_string())?;
+        // Best-effort fsync of the directory so the renames survive a crash.
+        if let Some(dir) = dest.parent() {
+            let dir = if dir.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                dir
+            };
+            if let Ok(dirf) = File::open(dir) {
+                let _ = dirf.sync_all();
+            }
+        }
+        Ok(())
+    }
 
-        // Write class name
-        let class_name = "World";
-        let class_bytes = class_name.as_bytes();
-        writer.write_all(&(class_bytes.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-        writer.write_all(class_bytes).map_err(|e| e.to_string())?;
-
-        // Serialize world data
-        let world_data = Self::serialize_world(world);
-        writer.write_all(&(world_data.len() as u32).to_le_bytes()).map_err(|e| e.to_string())?;
-        writer.write_all(&world_data).map_err(|e| e.to_string())?;
-
-        writer.flush().map_err(|e| e.to_string())?;
+    fn write_tmp_fsynced(tmp_path: &str, payload: &[u8]) -> Result<(), String> {
+        let mut file = File::create(tmp_path)
+            .map_err(|e| format!("create: {}", e))?;
+        file.write_all(payload)
+            .map_err(|e| format!("write: {}", e))?;
+        file.sync_all().map_err(|e| format!("fsync: {}", e))?;
         Ok(())
     }
 
@@ -792,7 +863,10 @@ mod tests {
     //!   * save_exists before/after a save.
     //!   * load_world error paths: missing file, invalid magic,
     //!     unsupported future version.
-    //!   * .bak creation when the target save already exists.
+    //!   * .bak creation when the target save already exists
+    //!     (previous save moved aside by rename, not copied).
+    //!   * Existing save/.bak are not truncated when the temp
+    //!     write cannot be completed.
     //!
     //! Fields NOT covered by the binary format (description,
     //! active_events, world_time) are intentionally skipped; the
@@ -829,6 +903,9 @@ mod tests {
         let mut bak = path.to_path_buf();
         bak.set_extension("bin.bak");
         let _ = std::fs::remove_file(&bak);
+        let tmp = format!("{}.tmp", path.display());
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir(&tmp);
     }
 
     #[test]
@@ -1119,6 +1196,55 @@ mod tests {
             !bak.exists(),
             "a fresh-path save must not produce a .bak"
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_does_not_truncate_existing_save_or_bak_when_tmp_cannot_be_written() {
+        // If the temp file cannot be created, the current save and
+        // the existing .bak must stay intact. We force that failure
+        // by putting a directory at `{path}.tmp`, which works even
+        // when the test runs as root (chmod on the parent would not).
+        let world1 = World::new("Keep World v1");
+        let world2 = World::new("Keep World v2");
+        let world3 = World::new("Keep World v3");
+        let path = tmp_path("no_truncate");
+        let path_str = path.to_string_lossy().to_string();
+        let mut bak = path.clone();
+        bak.set_extension("bin.bak");
+        let tmp = format!("{}.tmp", path.display());
+
+        BinaryPersistence::save_world(&world1, &path_str).expect("first save ok");
+        BinaryPersistence::save_world(&world2, &path_str).expect("second save ok");
+        let save_before = std::fs::read(&path).expect("read save");
+        let bak_before = std::fs::read(&bak).expect("read bak");
+
+        std::fs::create_dir(&tmp).expect("mkdir tmp blocker");
+        let err = BinaryPersistence::save_world(&world3, &path_str)
+            .expect_err("save must fail when tmp is a directory");
+        assert!(
+            err.contains("temporary save") || err.contains("create:"),
+            "error should mention the temp write, got: {}",
+            err
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read save after fail"),
+            save_before,
+            "save.owbl must not change when the temp write fails"
+        );
+        assert_eq!(
+            std::fs::read(&bak).expect("read bak after fail"),
+            bak_before,
+            ".bak must not change when the temp write fails"
+        );
+        let from_main =
+            BinaryPersistence::load_world(&path_str).expect("load main after fail");
+        let from_bak = BinaryPersistence::load_world(&bak.to_string_lossy())
+            .expect("load bak after fail");
+        assert_eq!(from_main.name, "Keep World v2");
+        assert_eq!(from_bak.name, "Keep World v1");
+
+        let _ = std::fs::remove_dir(&tmp);
         cleanup(&path);
     }
 
